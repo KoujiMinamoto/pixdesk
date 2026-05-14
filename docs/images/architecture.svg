@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="560" viewBox="0 0 1120 560" role="img" aria-labelledby="title desc">
+  <title id="title">PixDesk architecture</title>
+  <desc id="desc">Discord, Slack, and Telegram connect through mautrix bridges into Synapse, Element, Postgres, and an AI agent.</desc>
+  <defs>
+    <style>
+      .bg { fill: #f7f8fb; }
+      .panel { fill: #ffffff; stroke: #cfd7e6; stroke-width: 2; }
+      .platform { fill: #e9f2ff; stroke: #8bb9f0; stroke-width: 2; }
+      .bridge { fill: #eef7ef; stroke: #86c995; stroke-width: 2; }
+      .core { fill: #fff4df; stroke: #e3b45f; stroke-width: 2; }
+      .agent { fill: #f3edff; stroke: #b49be8; stroke-width: 2; }
+      .title { font: 700 26px Arial, sans-serif; fill: #1f2937; }
+      .label { font: 700 18px Arial, sans-serif; fill: #1f2937; }
+      .small { font: 14px Arial, sans-serif; fill: #4b5563; }
+      .arrow { stroke: #64748b; stroke-width: 3; fill: none; marker-end: url(#arrow); }
+    </style>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/>
+    </marker>
+  </defs>
+  <rect class="bg" width="1120" height="560"/>
+  <text class="title" x="40" y="52">PixDesk: Matrix Bridge Inbox + Agent Store</text>
+
+  <rect class="panel" x="36" y="88" width="250" height="360" rx="10"/>
+  <text class="label" x="66" y="128">Chat Platforms</text>
+  <rect class="platform" x="66" y="160" width="180" height="58" rx="8"/>
+  <text class="label" x="104" y="196">Discord</text>
+  <rect class="platform" x="66" y="244" width="180" height="58" rx="8"/>
+  <text class="label" x="116" y="280">Slack</text>
+  <rect class="platform" x="66" y="328" width="180" height="58" rx="8"/>
+  <text class="label" x="98" y="364">Telegram</text>
+
+  <rect class="panel" x="360" y="88" width="250" height="360" rx="10"/>
+  <text class="label" x="390" y="128">mautrix Bridges</text>
+  <rect class="bridge" x="390" y="160" width="180" height="58" rx="8"/>
+  <text class="label" x="414" y="196">mautrix-discord</text>
+  <rect class="bridge" x="390" y="244" width="180" height="58" rx="8"/>
+  <text class="label" x="426" y="280">mautrix-slack</text>
+  <rect class="bridge" x="390" y="328" width="180" height="58" rx="8"/>
+  <text class="label" x="404" y="364">mautrix-telegram</text>
+
+  <rect class="panel" x="684" y="88" width="250" height="360" rx="10"/>
+  <text class="label" x="714" y="128">Matrix Core</text>
+  <rect class="core" x="714" y="160" width="180" height="62" rx="8"/>
+  <text class="label" x="768" y="196">Synapse</text>
+  <rect class="core" x="714" y="250" width="180" height="62" rx="8"/>
+  <text class="label" x="772" y="286">Element</text>
+  <rect class="core" x="714" y="340" width="180" height="62" rx="8"/>
+  <text class="label" x="760" y="376">Postgres</text>
+
+  <rect class="agent" x="956" y="220" width="128" height="96" rx="10"/>
+  <text class="label" x="994" y="258">Agent</text>
+  <text class="small" x="980" y="284">analyze</text>
+  <text class="small" x="982" y="304">reply</text>
+
+  <path class="arrow" d="M246 189 H386"/>
+  <path class="arrow" d="M246 273 H386"/>
+  <path class="arrow" d="M246 357 H386"/>
+  <path class="arrow" d="M570 189 H710"/>
+  <path class="arrow" d="M570 273 H710"/>
+  <path class="arrow" d="M570 357 H710"/>
+  <path class="arrow" d="M894 371 C930 370 948 324 978 310"/>
+  <path class="arrow" d="M978 225 C940 210 930 190 894 190"/>
+
+  <text class="small" x="705" y="470">Element is the operator UI. Postgres stores imported history for agents.</text>
+  <text class="small" x="705" y="494">Element 是人工操作界面；Postgres 保存导入历史，供 Agent 分析。</text>
+</svg>

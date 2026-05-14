@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="360" viewBox="0 0 1120 360" role="img" aria-labelledby="title desc">
+  <title id="title">PixDesk deployment flow</title>
+  <desc id="desc">Deployment steps from environment configuration to bridge login and agent history import.</desc>
+  <defs>
+    <style>
+      .bg { fill: #fbfcfe; }
+      .step { fill: #ffffff; stroke: #cbd5e1; stroke-width: 2; }
+      .num { fill: #2563eb; font: 700 18px Arial, sans-serif; }
+      .label { fill: #111827; font: 700 17px Arial, sans-serif; }
+      .small { fill: #4b5563; font: 13px Arial, sans-serif; }
+      .arrow { stroke: #64748b; stroke-width: 3; fill: none; marker-end: url(#arrow); }
+    </style>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/>
+    </marker>
+  </defs>
+  <rect class="bg" width="1120" height="360"/>
+  <text class="label" x="40" y="50">Deployment Flow / 部署流程</text>
+
+  <rect class="step" x="40" y="96" width="150" height="128" rx="10"/>
+  <text class="num" x="62" y="132">1</text>
+  <text class="label" x="62" y="162">Configure</text>
+  <text class="small" x="62" y="187">.env + domain</text>
+  <text class="small" x="62" y="207">配置域名和密钥</text>
+
+  <path class="arrow" d="M190 160 H234"/>
+  <rect class="step" x="234" y="96" width="150" height="128" rx="10"/>
+  <text class="num" x="256" y="132">2</text>
+  <text class="label" x="256" y="162">Core</text>
+  <text class="small" x="256" y="187">Synapse + Element</text>
+  <text class="small" x="256" y="207">启动核心服务</text>
+
+  <path class="arrow" d="M384 160 H428"/>
+  <rect class="step" x="428" y="96" width="150" height="128" rx="10"/>
+  <text class="num" x="450" y="132">3</text>
+  <text class="label" x="450" y="162">Database</text>
+  <text class="small" x="450" y="187">agent schema</text>
+  <text class="small" x="450" y="207">初始化分析表</text>
+
+  <path class="arrow" d="M578 160 H622"/>
+  <rect class="step" x="622" y="96" width="150" height="128" rx="10"/>
+  <text class="num" x="644" y="132">4</text>
+  <text class="label" x="644" y="162">Bridges</text>
+  <text class="small" x="644" y="187">mautrix configs</text>
+  <text class="small" x="644" y="207">生成并安装桥</text>
+
+  <path class="arrow" d="M772 160 H816"/>
+  <rect class="step" x="816" y="96" width="150" height="128" rx="10"/>
+  <text class="num" x="838" y="132">5</text>
+  <text class="label" x="838" y="162">Login</text>
+  <text class="small" x="838" y="187">Discord/Slack</text>
+  <text class="small" x="838" y="207">登录平台账号</text>
+
+  <path class="arrow" d="M966 160 H1010"/>
+  <rect class="step" x="1010" y="96" width="78" height="128" rx="10"/>
+  <text class="num" x="1032" y="132">6</text>
+  <text class="label" x="1025" y="162">Agent</text>
+  <text class="small" x="1025" y="187">import</text>
+  <text class="small" x="1025" y="207">分析</text>
+
+  <text class="small" x="40" y="286">Recommended order: choose server name once, initialize, enable bridges, then import history.</text>
+  <text class="small" x="40" y="312">建议顺序：先确定 Matrix server name，再初始化、启用桥、最后导入历史。</text>
+</svg>

@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="460" viewBox="0 0 1120 460" role="img" aria-labelledby="title desc">
+  <title id="title">PixDesk agent database schema</title>
+  <desc id="desc">Agent schema with channels and messages tables.</desc>
+  <defs>
+    <style>
+      .bg { fill: #f8fafc; }
+      .table { fill: #ffffff; stroke: #cbd5e1; stroke-width: 2; }
+      .head { fill: #e0f2fe; stroke: #38bdf8; stroke-width: 2; }
+      .title { font: 700 24px Arial, sans-serif; fill: #111827; }
+      .label { font: 700 18px Arial, sans-serif; fill: #111827; }
+      .field { font: 14px Menlo, Consolas, monospace; fill: #374151; }
+      .note { font: 14px Arial, sans-serif; fill: #4b5563; }
+      .link { stroke: #64748b; stroke-width: 3; fill: none; marker-end: url(#arrow); }
+    </style>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/>
+    </marker>
+  </defs>
+  <rect class="bg" width="1120" height="460"/>
+  <text class="title" x="40" y="50">Agent Database / Agent 数据库</text>
+
+  <rect class="table" x="70" y="96" width="430" height="270" rx="10"/>
+  <rect class="head" x="70" y="96" width="430" height="54" rx="10"/>
+  <text class="label" x="94" y="130">agent.channels</text>
+  <text class="field" x="100" y="182">platform text</text>
+  <text class="field" x="100" y="210">workspace_id text</text>
+  <text class="field" x="100" y="238">channel_id text</text>
+  <text class="field" x="100" y="266">channel_name text</text>
+  <text class="field" x="100" y="294">matrix_room_id text</text>
+  <text class="field" x="100" y="322">raw jsonb</text>
+  <text class="field" x="100" y="350">updated_at timestamptz</text>
+
+  <rect class="table" x="620" y="96" width="430" height="300" rx="10"/>
+  <rect class="head" x="620" y="96" width="430" height="54" rx="10"/>
+  <text class="label" x="644" y="130">agent.messages</text>
+  <text class="field" x="650" y="182">platform text</text>
+  <text class="field" x="650" y="210">workspace_id text</text>
+  <text class="field" x="650" y="238">channel_id text</text>
+  <text class="field" x="650" y="266">message_id text</text>
+  <text class="field" x="650" y="294">sender_name text</text>
+  <text class="field" x="650" y="322">text text</text>
+  <text class="field" x="650" y="350">ts timestamptz</text>
+  <text class="field" x="650" y="378">raw jsonb</text>
+
+  <path class="link" d="M500 232 H620"/>
+  <text class="note" x="512" y="218">platform + workspace_id + channel_id</text>
+
+  <text class="note" x="70" y="420">Raw platform payloads are kept in JSONB for future reprocessing.</text>
+  <text class="note" x="70" y="442">原始平台数据保存在 JSONB 中，方便后续重新解析和 Agent 分析。</text>
+</svg>
