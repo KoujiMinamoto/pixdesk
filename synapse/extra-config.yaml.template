@@ -1,0 +1,21 @@
+public_baseurl: "__MATRIX_PUBLIC_BASEURL__"
+
+database:
+  name: psycopg2
+  args:
+    user: synapse
+    password: "__POSTGRES_PASSWORD__"
+    database: synapse
+    host: postgres
+    port: 5432
+    cp_min: 5
+    cp_max: 10
+
+registration_shared_secret: "__SYNAPSE_REGISTRATION_SHARED_SECRET__"
+enable_registration: false
+
+app_service_config_files:
+  - /data/appservices/mautrix-telegram.yaml
+  - /data/appservices/mautrix-discord.yaml
+  - /data/appservices/mautrix-slack.yaml
+

@@ -1,0 +1,77 @@
+services:
+  postgres:
+    image: postgres:${POSTGRES_TAG:-16-alpine}
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: synapse
+      POSTGRES_USER: synapse
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_INITDB_ARGS: --encoding=UTF8 --locale=C
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U synapse -d synapse"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  synapse:
+    image: matrixdotorg/synapse:${SYNAPSE_TAG:-latest}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      SYNAPSE_SERVER_NAME: ${MATRIX_SERVER_NAME:?set MATRIX_SERVER_NAME in .env}
+      SYNAPSE_REPORT_STATS: ${SYNAPSE_REPORT_STATS:-no}
+      SYNAPSE_CONFIG_DIR: /data
+      SYNAPSE_CONFIG_PATH: /data/homeserver.yaml
+    command:
+      - run
+      - --config-path
+      - /data/homeserver.yaml
+      - --config-path
+      - /data/extra-config.yaml
+    ports:
+      - "8008:8008"
+    volumes:
+      - ./data/synapse:/data
+      - ./data/appservices:/data/appservices:ro
+
+  element:
+    image: vectorim/element-web:${ELEMENT_TAG:-latest}
+    restart: unless-stopped
+    depends_on:
+      - synapse
+    ports:
+      - "8080:80"
+    volumes:
+      - ./element/config.json:/app/config.json:ro
+
+  mautrix-telegram:
+    image: dock.mau.dev/mautrix/telegram:${MAUTRIX_TELEGRAM_TAG:-latest}
+    restart: unless-stopped
+    depends_on:
+      - synapse
+    profiles: ["bridges"]
+    volumes:
+      - ./data/mautrix-telegram:/data
+
+  mautrix-discord:
+    image: dock.mau.dev/mautrix/discord:${MAUTRIX_DISCORD_TAG:-latest}
+    restart: unless-stopped
+    depends_on:
+      - synapse
+    profiles: ["bridges"]
+    volumes:
+      - ./data/mautrix-discord:/data
+
+  mautrix-slack:
+    image: dock.mau.dev/mautrix/slack:${MAUTRIX_SLACK_TAG:-latest}
+    restart: unless-stopped
+    depends_on:
+      - synapse
+    profiles: ["bridges"]
+    volumes:
+      - ./data/mautrix-slack:/data
+

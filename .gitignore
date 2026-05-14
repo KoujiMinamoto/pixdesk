@@ -1,0 +1,20 @@
+.DS_Store
+
+# Local secrets and deployment-specific settings
+.env
+.env.*
+!.env.example
+
+# Runtime state. This contains Synapse signing keys, appservice tokens,
+# bridge SQLite databases, Postgres files, media, uploaded attachments, etc.
+data/
+caddy/
+
+# Python/cache/log output
+__pycache__/
+*.py[cod]
+*.log
+
+# Local editor state
+.idea/
+.vscode/
