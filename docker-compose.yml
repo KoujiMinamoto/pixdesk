@@ -59,6 +59,17 @@ services:
 
   mautrix-discord:
     image: dock.mau.dev/mautrix/discord:${MAUTRIX_DISCORD_TAG:-latest}
+    extra_hosts:
+      # Some cloud DNS routes Discord/Discord media domains to blocked IPs.
+      # These pins are pragmatic defaults from the validated deployment.
+      - "discord.com:104.23.124.189"
+      - "discordapp.com:104.23.124.189"
+      - "gateway.discord.gg:104.23.124.189"
+      - "cdn.discordapp.com:104.23.124.189"
+      - "media.discordapp.net:104.23.124.189"
+      - "images-ext-1.discordapp.net:128.121.243.75"
+      - "media.tenor.com:192.133.77.133"
+      - "remote-auth-gateway.discord.gg:162.125.2.6"
     restart: unless-stopped
     depends_on:
       - synapse
@@ -74,4 +85,3 @@ services:
     profiles: ["bridges"]
     volumes:
       - ./data/mautrix-slack:/data
-

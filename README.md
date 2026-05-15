@@ -261,6 +261,22 @@ bridge:
 
 If some group DMs have blank names, set the Matrix room name from Discord recipients. The rooms are valid even when Discord returns an empty channel name.
 
+If images, GIFs, or Tenor videos fail with `connect: connection refused`, check DNS from inside the `mautrix-discord` container. The Compose file includes validated `extra_hosts` pins for Discord media domains, but those IPs may need updating over time.
+
+If Element shows `Failed to bridge media` or cannot open `mxc://` images, keep Synapse media compatible with legacy Element media endpoints:
+
+```yaml
+enable_authenticated_media: false
+```
+
+For an existing deployment that already stored authenticated local media, update old rows once:
+
+```sql
+update local_media_repository
+set authenticated = false
+where authenticated = true;
+```
+
 **中文**
 
 这个项目里已经验证过 Discord user-token 登录。QR 登录可能被 Discord CAPTCHA 阻断，而 mautrix-discord 不能处理 CAPTCHA。
@@ -295,6 +311,22 @@ bridge:
 ```
 
 如果有些 group DM 显示为空名，可以用 Discord recipients 拼接后写入 Matrix room name。即使名字为空，房间本身也是有效的。
+
+如果图片、GIF 或 Tenor 视频出现 `connect: connection refused`，先进入 `mautrix-discord` 容器检查 DNS。当前 Compose 已经包含验证过的 Discord 媒体域名 `extra_hosts` 固定 IP，但这些 IP 未来可能需要更新。
+
+如果 Element 显示 `Failed to bridge media` 或无法打开 `mxc://` 图片，建议保持 Synapse media 与旧版 Element media endpoint 兼容：
+
+```yaml
+enable_authenticated_media: false
+```
+
+已有部署如果已经把本地媒体存成 authenticated，可以一次性更新旧数据：
+
+```sql
+update local_media_repository
+set authenticated = false
+where authenticated = true;
+```
 
 ## Slack Setup / Slack 配置
 

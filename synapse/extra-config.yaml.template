@@ -1,5 +1,9 @@
 public_baseurl: "__MATRIX_PUBLIC_BASEURL__"
 
+# Keep media compatible with Element clients that still use the legacy
+# /_matrix/media endpoints without authenticated media headers.
+enable_authenticated_media: false
+
 database:
   name: psycopg2
   args:
@@ -18,4 +22,3 @@ app_service_config_files:
   - /data/appservices/mautrix-telegram.yaml
   - /data/appservices/mautrix-discord.yaml
   - /data/appservices/mautrix-slack.yaml
-
