@@ -1,6 +1,6 @@
 SHELL := /bin/bash
 
-.PHONY: init start-core create-admin init-agent-db bridge-init install-registrations start-bridges restart-synapse logs down clean
+.PHONY: init start-core create-admin init-agent-db migrate-agent-db bridge-init install-registrations start-bridges restart-synapse start-agent create-agent logs down clean
 
 init:
 	./scripts/init.sh
@@ -17,6 +17,19 @@ create-admin:
 
 init-agent-db:
 	docker compose exec -T postgres psql -U synapse -d synapse -v ON_ERROR_STOP=1 < sql/agent_schema.sql
+
+migrate-agent-db:
+	docker compose exec -T postgres psql -U synapse -d synapse -v ON_ERROR_STOP=1 < sql/agent_schema_v2.sql
+
+create-agent:
+	@if [[ -z "$(AGENT_PASS)" ]]; then \
+		echo "Usage: make create-agent AGENT_PASS='strong-password'"; \
+		exit 1; \
+	fi
+	docker compose exec synapse register_new_matrix_user http://localhost:8008 -c /data/extra-config.yaml -u agent -p "$(AGENT_PASS)" --exists-ok
+
+start-agent:
+	docker compose --profile agent up -d pixdesk-listener pixdesk-sender
 
 bridge-init:
 	@mkdir -p data/mautrix-telegram data/mautrix-discord data/mautrix-slack

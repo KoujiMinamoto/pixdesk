@@ -85,3 +85,35 @@ services:
     profiles: ["bridges"]
     volumes:
       - ./data/mautrix-slack:/data
+
+  pixdesk-listener:
+    build: ./services/listener
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      synapse:
+        condition: service_started
+    profiles: ["agent"]
+    environment:
+      MATRIX_HOMESERVER: http://synapse:8008
+      MATRIX_USER_ID: "@agent:${MATRIX_SERVER_NAME}"
+      MATRIX_ACCESS_TOKEN: "${AGENT_ACCESS_TOKEN}"
+      DATABASE_URL: "postgresql://synapse:${POSTGRES_PASSWORD}@postgres:5432/synapse"
+    volumes:
+      - ./data/listener:/data
+
+  pixdesk-sender:
+    build: ./services/sender
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      synapse:
+        condition: service_started
+    profiles: ["agent"]
+    environment:
+      MATRIX_HOMESERVER: http://synapse:8008
+      MATRIX_USER_ID: "@agent:${MATRIX_SERVER_NAME}"
+      MATRIX_ACCESS_TOKEN: "${AGENT_ACCESS_TOKEN}"
+      DATABASE_URL: "postgresql://synapse:${POSTGRES_PASSWORD}@postgres:5432/synapse"
