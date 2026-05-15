@@ -22,3 +22,8 @@ app_service_config_files:
   - /data/appservices/mautrix-telegram.yaml
   - /data/appservices/mautrix-discord.yaml
   - /data/appservices/mautrix-slack.yaml
+
+auto_accept_invites:
+  enabled: true
+  only_for_direct_messages: false
+  only_from_local_users: false
