@@ -198,6 +198,8 @@ def import_history(channel_name, limit, max_pages):
     cursor = None
     total = 0
     pages = 0
+    thread_parents = []
+
     while total < limit and pages < max_pages:
         page_limit = min(200, limit - total)
         params = {"channel": channel["channel_id"], "limit": page_limit, "inclusive": "true"}
@@ -209,10 +211,43 @@ def import_history(channel_name, limit, max_pages):
         total += inserted
         pages += 1
         print(f"page={pages} fetched={len(messages)} upserted={inserted} total={total}")
+
+        for msg in messages:
+            if msg.get("reply_count") and msg.get("thread_ts") == msg.get("ts"):
+                thread_parents.append(msg["ts"])
+
         cursor = out.get("response_metadata", {}).get("next_cursor")
         if not cursor or not messages:
             break
         time.sleep(1)
+
+    thread_total = 0
+    for i, thread_ts in enumerate(thread_parents, 1):
+        replies_cursor = None
+        while True:
+            params = {"channel": channel["channel_id"], "ts": thread_ts, "limit": 200, "inclusive": "true"}
+            if replies_cursor:
+                params["cursor"] = replies_cursor
+            try:
+                out = slack_call(token, "conversations.replies", params, cookie_token=cookie_token)
+            except RuntimeError as e:
+                print(f"  thread {thread_ts} error: {e}")
+                break
+            replies = out.get("messages", [])
+            if len(replies) > 1:
+                inserted = insert_messages(workspace_id, channel["channel_id"], replies[1:])
+                thread_total += inserted
+            replies_cursor = out.get("response_metadata", {}).get("next_cursor")
+            if not replies_cursor or len(replies) < 200:
+                break
+            time.sleep(1)
+        if i % 10 == 0:
+            print(f"  threads: {i}/{len(thread_parents)} processed, {thread_total} replies imported")
+        time.sleep(1)
+
+    total += thread_total
+    if thread_parents:
+        print(f"threads: {len(thread_parents)} threads, {thread_total} replies imported")
 
     print(
         json.dumps(
@@ -222,6 +257,7 @@ def import_history(channel_name, limit, max_pages):
                 "channel_name": channel["name"],
                 "matrix_room_id": channel["mxid"],
                 "imported": total,
+                "thread_replies": thread_total,
             },
             ensure_ascii=False,
         )
