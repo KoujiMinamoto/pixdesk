@@ -117,3 +117,21 @@ services:
       MATRIX_USER_ID: "@agent:${MATRIX_SERVER_NAME}"
       MATRIX_ACCESS_TOKEN: "${AGENT_ACCESS_TOKEN}"
       DATABASE_URL: "postgresql://synapse:${POSTGRES_PASSWORD}@postgres:5432/synapse"
+
+  pixdesk-auth-relay:
+    build: ./services/auth-relay
+    restart: unless-stopped
+    depends_on:
+      synapse:
+        condition: service_started
+    profiles: ["auth"]
+    environment:
+      MATRIX_HOMESERVER: http://synapse:8008
+      MATRIX_ADMIN_USER_ID: "@admin:${MATRIX_SERVER_NAME}"
+      MATRIX_ADMIN_ACCESS_TOKEN: "${ADMIN_ACCESS_TOKEN:?set ADMIN_ACCESS_TOKEN in .env}"
+      DISCORD_BOT_MXID: "@discordbot:${MATRIX_SERVER_NAME}"
+      SLACK_BOT_MXID: "@slackbot:${MATRIX_SERVER_NAME}"
+      TELEGRAM_BOT_MXID: "@telegrambot:${MATRIX_SERVER_NAME}"
+      RELAY_SHARED_SECRET: "${RELAY_SHARED_SECRET:?set RELAY_SHARED_SECRET in .env}"
+    ports:
+      - "127.0.0.1:8765:8765"

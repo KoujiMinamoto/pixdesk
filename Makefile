@@ -1,6 +1,6 @@
 SHELL := /bin/bash
 
-.PHONY: init start-core create-admin init-agent-db migrate-agent-db bridge-init install-registrations start-bridges restart-synapse start-agent create-agent logs down clean
+.PHONY: init start-core create-admin init-agent-db migrate-agent-db bridge-init install-registrations start-bridges restart-synapse start-agent create-agent start-auth-relay logs down clean
 
 init:
 	./scripts/init.sh
@@ -30,6 +30,9 @@ create-agent:
 
 start-agent:
 	docker compose --profile agent up -d pixdesk-listener pixdesk-sender
+
+start-auth-relay:
+	docker compose --profile auth up -d pixdesk-auth-relay
 
 bridge-init:
 	@mkdir -p data/mautrix-telegram data/mautrix-discord data/mautrix-slack
