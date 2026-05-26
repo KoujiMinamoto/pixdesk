@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy"
+    content="default-src 'self'; img-src 'self' data: https:; style-src 'self' 'unsafe-inline'" />
+  <title>PixDesk</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <div class="header-left">
+      <h1>PixDesk</h1>
+    </div>
+    <div class="header-right">
+      <div id="health-bar">
+        <span id="health-dot" class="dot dot-unknown"></span>
+        <span id="health-text">Checking relay…</span>
+      </div>
+      <button id="settings-open" class="icon-btn" title="Settings" aria-label="Settings">⚙</button>
+    </div>
+  </header>
+
+  <main id="chat-panel">
+    <div id="chat-empty" class="chat-empty">Loading chat…</div>
+    <webview id="chat-webview" partition="persist:matrix-chat" allowpopups
+      useragent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+      hidden></webview>
+  </main>
+
+  <div id="settings-overlay" class="overlay" hidden>
+    <aside id="settings-panel" class="settings-panel" role="dialog" aria-label="Settings">
+      <header class="panel-header">
+        <h2>Accounts</h2>
+        <button id="settings-close" class="icon-btn" aria-label="Close">×</button>
+      </header>
+
+      <section class="panel-body">
+        <ul id="accounts-list" class="accounts-list">
+          <li class="accounts-empty">Loading accounts…</li>
+        </ul>
+
+        <pre id="login-messages" class="messages"></pre>
+      </section>
+    </aside>
+  </div>
+
+  <script src="renderer.js"></script>
+</body>
+</html>

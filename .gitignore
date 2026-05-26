@@ -18,3 +18,8 @@ __pycache__/
 # Local editor state
 .idea/
 .vscode/
+
+# Node / Electron client builds
+node_modules/
+dist/
+out/

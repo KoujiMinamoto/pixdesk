@@ -1,0 +1,314 @@
+:root {
+  color-scheme: light dark;
+  --bg: #f4f5f7;
+  --card: #ffffff;
+  --border: #e1e4e8;
+  --text: #1f2328;
+  --muted: #6e7781;
+  --accent: #2b5cff;
+  --accent-text: #ffffff;
+  --ok: #1a7f37;
+  --err: #cf222e;
+  --warn: #9a6700;
+  --shadow: 0 8px 24px rgba(0, 0, 0, 0.16);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0d1117;
+    --card: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #4d7eff;
+    --ok: #3fb950;
+    --err: #f85149;
+    --warn: #d29922;
+    --shadow: 0 8px 24px rgba(0, 0, 0, 0.6);
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 14px;
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+header {
+  padding: 8px 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--border);
+  background: var(--card);
+  flex: 0 0 auto;
+}
+
+.header-left h1 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+#health-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.dot {
+  width: 10px; height: 10px; border-radius: 50%;
+  display: inline-block;
+}
+.dot-unknown { background: var(--muted); }
+.dot-ok { background: var(--ok); }
+.dot-err { background: var(--err); }
+
+button {
+  background: var(--accent);
+  color: var(--accent-text);
+  border: 0;
+  padding: 8px 14px;
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: pointer;
+}
+button:hover { filter: brightness(1.05); }
+button:disabled { opacity: 0.5; cursor: progress; }
+
+.icon-btn {
+  background: transparent;
+  color: var(--text);
+  border: 1px solid var(--border);
+  padding: 4px 10px;
+  font-size: 16px;
+  line-height: 1;
+}
+.icon-btn:hover { background: var(--bg); }
+
+#chat-panel {
+  flex: 1 1 auto;
+  position: relative;
+  background: var(--bg);
+  min-height: 0;
+}
+
+.chat-empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  font-size: 14px;
+  pointer-events: none;
+  background: var(--bg);
+}
+.chat-empty.hidden { display: none; }
+
+#chat-webview {
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: var(--card);
+}
+
+.overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.32);
+  display: flex;
+  align-items: stretch;
+  justify-content: flex-end;
+  z-index: 100;
+}
+
+.overlay[hidden] { display: none; }
+
+.settings-panel {
+  width: 380px;
+  max-width: 100%;
+  background: var(--card);
+  display: flex;
+  flex-direction: column;
+  box-shadow: var(--shadow);
+  border-left: 1px solid var(--border);
+}
+
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+}
+.panel-header h2 { margin: 0; font-size: 15px; }
+
+.panel-body {
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow: auto;
+  flex: 1 1 auto;
+}
+
+.accounts-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.accounts-empty {
+  color: var(--muted);
+  font-size: 13px;
+  padding: 8px 4px;
+}
+
+.account-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 8px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+.account-row:hover { background: var(--bg); }
+
+.account-avatar {
+  width: 36px;
+  height: 36px;
+  border-radius: 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 600;
+  font-size: 14px;
+  color: var(--muted);
+  overflow: hidden;
+}
+.account-avatar img { width: 100%; height: 100%; object-fit: cover; }
+
+.account-info {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.account-bridge {
+  font-size: 12px;
+  color: var(--muted);
+  text-transform: capitalize;
+}
+.account-name {
+  font-size: 14px;
+  color: var(--text);
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.account-actions {
+  display: flex;
+  gap: 6px;
+}
+.account-actions button {
+  padding: 4px 8px;
+  font-size: 12px;
+  background: transparent;
+  color: var(--accent);
+  border: 1px solid var(--border);
+}
+.account-actions button.danger { color: var(--err); }
+
+.add-account {
+  margin-top: 4px;
+  background: transparent;
+  color: var(--accent);
+  border: 1px dashed var(--border);
+  padding: 10px;
+  font-size: 13px;
+  border-radius: 8px;
+}
+
+.messages {
+  margin: 0;
+  padding: 8px 10px;
+  background: var(--bg);
+  border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 200px;
+  overflow: auto;
+  display: none;
+}
+.messages.visible { display: block; }
+.messages.err { color: var(--err); }
+.messages.ok { color: var(--ok); }
+.messages.warn { color: var(--warn); }
+
+.picker {
+  margin: auto;
+  align-self: center;
+  width: 320px;
+  background: var(--card);
+  border-radius: 12px;
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+.bridge-options {
+  list-style: none;
+  margin: 0;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.bridge-options button {
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  color: var(--text);
+  border: 1px solid var(--border);
+  padding: 12px;
+  border-radius: 8px;
+  font-size: 14px;
+}
+.bridge-options button:hover { background: var(--bg); }
+
+#telegram-qr-img {
+  display: block;
+  width: 220px;
+  height: 220px;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin: 8px auto;
+  padding: 8px;
+}

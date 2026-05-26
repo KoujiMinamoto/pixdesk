@@ -1,0 +1,13 @@
+{
+  "name": "pixdesk-login-wizard",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Minimal Electron app for connecting Discord/Slack/Telegram bridges through the auth-relay.",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "31.7.7"
+  }
+}
