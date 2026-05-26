@@ -2,47 +2,131 @@
 
 [English](README.md)
 
-PixDesk 是一套可部署的 Matrix + mautrix 聚合聊天方案，用 Element 统一查看 Discord、Slack、Telegram，并用 Postgres 保存历史消息，方便后续 Agent 分析和自动回复。
+**面向组织的自托管聊天聚合平台。** PixDesk 把 Discord、Slack、Telegram
+里的对话拉到一起，统一规范化进 Postgres，再以实时与历史两种方式提供给
+内部 Agent 和分析任务。
 
 ![架构图](docs/images/architecture.svg)
 
-## 解决什么问题
+## PixDesk 是什么
 
-- 把 Discord、Slack、Telegram 聚合到一个 Matrix/Element 收件箱。
-- 用 Matrix 做统一的实时消息总线。
-- 把历史消息导入 Postgres，供搜索、统计和 AI Agent 分析。
-- Agent 通过 Matrix 发消息，再由 bridge 转发回原平台。
+组织很少只用一个聊天平台。客户成功跑在 Slack，社区在 Discord，合作伙伴
+在 Telegram。真正重要的对话——线索、升级、成单背景——分散在彼此不通
+的孤岛里，没有共享的历史、搜索或可用 API。
+
+PixDesk 是一套可部署的栈，做这几件事：
+
+- **接入** —— 通过 Matrix bridge 从 Discord、Slack、Telegram 拉取消息。
+- **规范化** —— 把消息归一进 Postgres 的 `agent.*` schema，便于 join、
+  全文搜索和下游管线消费。
+- **暴露** —— 同时给出实时 Matrix 事件流（给需要即时反应的 Agent）
+  和可查询的 SQL 历史（给批处理、RAG、分析任务）。
+- **回写** —— Agent 的回复经同样的 bridge 发回原平台，在 Slack /
+  Discord / Telegram 里看起来就是原生消息。
+
+整套自托管。数据和 bridge 凭据不离开你的基础设施。
+
+## 为什么是这个组合
+
+几个先讲清楚的设计取舍，因为它们约束了你能在上面叠什么：
+
+- **Matrix 当总线。** 每个平台的 bridge 都写到同一个 Matrix homeserver
+  （Synapse）。一条 sync 流、一套权限模型、一种事件形态——而不是同时
+  对接三套厂商 SDK。
+- **走 mautrix bridge，不直连厂商 API。** 重连、附件抓取、编辑/删除、
+  各平台的消息编辑语义，bridge 已经处理过。我们直接吃这些年的兼容性
+  工作，而不是自己重写一遍。
+- **Postgres 做分析。** Synapse 存 Matrix 事件；`agent.*` 存一份去规范化、
+  带平台信息的视图（频道 id、发送者显示名、平台原始 JSON）。Agent 查
+  SQL 就够了，不用碰 Matrix。
+- **两条读路径，一条写路径。** 实时 Agent 监听 Matrix `/sync`
+  （services/listener），秒级响应。批处理 Agent 按需查 Postgres。
+  两边都从同一份 bridge 接入派生。
+- **回复都从 bridge 走。** sender 服务往 Matrix 房间写消息；bridge
+  把消息送到 Slack / Discord / Telegram。Agent 代码里没有任何对厂商
+  API 的直接调用。
 
 ## 架构
 
-系统分四层：
+系统分五层：
 
-1. 聊天平台：Discord、Slack、Telegram。
-2. mautrix bridge：每个平台一个 bridge。
-3. Matrix 核心：Synapse + Element。
-4. Agent 存储：Postgres 中的 `agent.channels` 和 `agent.messages`。
+1. **源平台** —— Discord、Slack、Telegram。
+2. **mautrix bridge** —— 每个平台一个容器，各自持有登录账号的
+   user-token / cookie / session。
+3. **Matrix 核心** —— Synapse（homeserver）+ Element（运维用 Web 客户端）。
+4. **PixDesk 服务** —— `auth-relay`（外部工具驱动 bridge 登录）、
+   `listener`（Matrix → Postgres）、`sender`（Postgres → Matrix）。
+5. **Agent 存储** —— Postgres `agent.channels`、`agent.messages`、
+   `agent.conversations`、`agent.replies`，以及 webhook / 审计相关表。
 
-## 部署流程
+运维登录 bridge 有两条路：在 Element 里手动跟 bridge bot 发 `help`，
+或者用 **PixDesk Login Wizard**——`clients/login-wizard/` 下的小 Electron
+应用，通过内嵌 webview 抓 Discord / Slack token，再通过 `auth-relay` 推下去。
 
-![部署流程](docs/images/deploy-flow.svg)
+## 数据流
 
-建议顺序：
+```
+Discord ──┐
+Slack   ──┼─► mautrix bridge ─► Synapse ─┬─► Element（人工）
+Telegram──┘                              │
+                                         ├─► listener ─► Postgres agent.* ─► 你的 Agent ─► sender ─► Synapse ─► bridge ─► 平台
+                                         │
+                                         └─► /sync 流 ────────────────► 实时 Agent
+```
 
-1. 先确定 `MATRIX_SERVER_NAME`，不要反复修改。
-2. 初始化 Synapse 并启动核心服务。
-3. 创建 Matrix 管理员账号。
-4. 初始化 Agent 数据库 schema。
-5. 生成并安装 bridge registration。
-6. 在 Element 里登录各个平台 bridge。
-7. 把历史消息导入 Postgres。
+两层暴露是有意为之。实时 Agent 订阅 Matrix 事件，秒级响应；分析任务和
+RAG 索引器查 Postgres，完全不动消息总线。
+
+## 数据库 Schema
+
+![数据库 Schema](docs/images/database-schema.svg)
+
+`sql/` 下两份 SQL：
+
+- `agent_schema.sql`（v1）：`agent.channels`、`agent.messages` —— 每个
+  频道/DM 一行，每条消息一行，平台原始 JSON 完整保留。
+- `agent_schema_v2.sql`：增加 `agent.conversations`（工作流状态）、
+  `agent.replies`（Agent 生成消息的审计轨迹）、`agent.webhook_config`、
+  `agent.team_actions`。
+
+两份一起 apply：
+
+```bash
+make init-agent-db
+```
+
+查询示例：
+
+```sql
+select ts, sender_name, text
+from agent.messages
+where platform = 'slack'
+  and channel_id = 'C0700DDQN3E'
+  and ts > now() - interval '24 hours'
+order by ts desc;
+```
+
+## 仓库结构
+
+| 路径 | 用途 |
+|---|---|
+| `services/auth-relay/` | FastAPI 服务，外部工具（Login Wizard、脚本）通过它驱动 bridge 登录。Bearer 鉴权，捕获到的 token 以 `mode 0600` 写盘。 |
+| `services/listener/` | Matrix `/sync` → `agent.messages` 的 ingester。 |
+| `services/sender/` | 读 `agent.replies`（status `pending`）→ 写 Matrix 房间消息 → bridge 转发到平台。 |
+| `clients/login-wizard/` | Electron 应用。Discord（user-token 抓取）和 Slack（xoxc/xoxd 抓取）走内嵌 webview 登录；Telegram 走 QR 流。 |
+| `sql/` | Agent schema 文件。 |
+| `scripts/` | 历史导入、registration 安装、smoke 测试脚本。 |
+| `docs/` | 各组件文档：`auth-relay.md`、`agent-integration.md`、`bridge-config-checklist.md`。 |
+| `synapse/`、`element/` | 容器配置。 |
+| `data/` | 运行时状态（signing key、bridge 数据库、Postgres 文件）。**不入库。** |
 
 ## 环境要求
 
-- Docker Engine 或 Docker Desktop，支持 Compose v2
-- `make`、`bash`、`python3`
-- 云端部署建议准备域名和 HTTPS 反向代理
-- Discord、Slack、Telegram 的平台登录凭据或 token
-- 可选：`qrencode`，用于 Discord QR helper
+- Docker Engine 或 Docker Desktop with Compose v2
+- `make`、`bash`、`python3`（3.10+）
+- Node 18+（如果要本地跑/构建 Login Wizard）
+- 生产部署需要域名 + HTTPS 反代
+- 每个要启用的 bridge 对应平台的登录凭据（user token / session）
 
 ## 快速开始
 
@@ -52,47 +136,43 @@ cd pixdesk
 cp .env.example .env
 ```
 
-第一次初始化前先编辑 `.env`：
+编辑 `.env`：
 
 ```env
 MATRIX_SERVER_NAME=matrix.example.com
 MATRIX_PUBLIC_BASEURL=https://matrix.example.com/
-POSTGRES_PASSWORD=replace-with-strong-password
-SYNAPSE_REGISTRATION_SHARED_SECRET=replace-with-strong-secret
+POSTGRES_PASSWORD=<强密码>
+SYNAPSE_REGISTRATION_SHARED_SECRET=<强密码>
 ```
 
-启动核心服务：
+启动核心栈：
 
 ```bash
 make init
 make start-core
-make create-admin MX_USER=admin MX_PASS='replace-with-admin-password'
+make create-admin MX_USER=admin MX_PASS='<强密码>'
 make init-agent-db
 ```
 
-打开 Element：
+Element 现在可以在 `http://localhost:8080` 访问，用 `admin` 登录。
 
-```text
-http://localhost:8080
-```
+## Bridge 配置
 
-## Bridge 初始化
-
-生成 bridge 配置和 registration：
+生成各 bridge 的配置和 Synapse appservice registration：
 
 ```bash
 make bridge-init
 ```
 
-编辑生成的配置：
+在以下文件里填登录凭据和 bridge 选项：
 
-```text
+```
 data/mautrix-discord/config.yaml
 data/mautrix-slack/config.yaml
 data/mautrix-telegram/config.yaml
 ```
 
-安装 registration 并启动 bridges：
+安装 registration 并启动 bridge：
 
 ```bash
 make install-registrations
@@ -100,190 +180,189 @@ make restart-synapse
 make start-bridges
 ```
 
-在 Element 中私聊 bridge bot：
+## Bridge 登录
 
-```text
+两种方式。
+
+### 方式 A —— PixDesk Login Wizard（推荐）
+
+```bash
+cd clients/login-wizard
+npm install
+npm start
+```
+
+在 **Settings** 里配置 relay URL 和 shared secret，然后点击对应 bridge
+那一行的 **Login**。Wizard 会：
+
+- 打开伪装成普通 Chrome 的 webview，让你登 Discord / Slack。
+- 直接从 session 头（Discord 的 `Authorization`）、localStorage
+  （Slack 的 `localConfig_v2`）、cookie（Slack 的 `d` / xoxd）抓 token。
+- 把 token POST 给 `auth-relay`，由它去给 bridge bot 发消息完成登录。
+- 把元数据 JSON 写到 `~/.config/pixdesk/captured/`，文件
+  `mode 0600`、上级目录 `mode 0700`。
+- 登录过程中 bridge 邀请的 portal 房间自动 join。
+
+### 方式 B —— 在 Element 里手动登录
+
+打开 Element，跟 bridge bot 私聊：
+
+```
 @discordbot:<server_name>
 @slackbot:<server_name>
 @telegrambot:<server_name>
 ```
 
-给每个 bot 发送 `help`，按提示登录。
+发 `help`，按 bot 的提示走。
 
-## Discord 配置
+## 历史导入
 
-这个项目里已经验证过 Discord user-token 登录。QR 登录可能被 Discord CAPTCHA 阻断，而 mautrix-discord 不能处理 CAPTCHA。
-
-如果要在 Element 中显示所有已有 Discord DM，提高启动时私聊房间创建上限：
-
-```yaml
-bridge:
-  startup_private_channel_create_limit: 150
-```
-
-重启 bridge：
+bridge 登录之后，把历史消息回填进 Postgres：
 
 ```bash
-docker compose --profile bridges restart mautrix-discord
+scripts/import-discord-history.py <频道名或 id> --limit 5000 --max-pages 50
+scripts/import-slack-history.py   <频道名>      --limit 1000 --max-pages 5
 ```
 
-如果希望新创建的 Discord 房间自动回填一部分历史：
-
-```yaml
-bridge:
-  backfill:
-    forward_limits:
-      initial:
-        dm: 100
-        channel: 200
-        thread: 50
-      missed:
-        dm: 100
-        channel: 200
-        thread: 50
-```
-
-如果有些 group DM 显示为空名，可以用 Discord recipients 拼接后写入 Matrix room name。即使名字为空，房间本身也是有效的。
-
-如果图片、GIF 或 Tenor 视频出现 `connect: connection refused`，先进入 `mautrix-discord` 容器检查 DNS。当前 Compose 已经包含验证过的 Discord 媒体域名 `extra_hosts` 固定 IP，但这些 IP 未来可能需要更新。
-
-如果 Element 显示 `Failed to bridge media` 或无法打开 `mxc://` 图片，建议保持 Synapse media 与旧版 Element media endpoint 兼容：
-
-```yaml
-enable_authenticated_media: false
-```
-
-已有部署如果已经把本地媒体存成 authenticated，可以一次性更新旧数据：
-
-```sql
-update local_media_repository
-set authenticated = false
-where authenticated = true;
-```
-
-## Slack 配置
-
-mautrix-slack 支持 token 登录。如果当前工作区不方便配置 OAuth app，token 登录通常更实际。
-
-打开后续新房间的历史回填：
-
-```yaml
-bridge:
-  backfill:
-    enabled: true
-    max_initial_messages: 200
-```
-
-Slack 历史读取能力取决于登录 token/cookie 以及 workspace 权限。
-
-## Agent 数据库
-
-![数据库 Schema](docs/images/database-schema.svg)
-
-初始化 schema：
+如果安装路径不在默认位置，可以覆盖：
 
 ```bash
-make init-agent-db
+PIXDESK_PROJECT_DIR=/opt/pixdesk \
+PIXDESK_DISCORD_DB=/path/to/discord.db \
+  scripts/import-discord-history.py HyGo
 ```
 
-数据表：
+Telegram 的历史由 bridge 自己回填（在
+`data/mautrix-telegram/config.yaml` 的 `bridge.backfill` 里配）。
 
-- `agent.channels`：每个导入或桥接的频道/DM 一行
-- `agent.messages`：历史消息，包含平台原始 JSON
+## Agent 接入
 
-连接 Postgres：
+支持两种接入形态，按延迟需求选。
 
-```bash
-docker compose exec -T postgres psql -U synapse -d synapse
-```
+### 实时：Matrix `/sync`
 
-查询示例：
+用一个独立 Matrix 用户作为 Agent 身份，把它邀请到要观察的房间，然后消费：
 
-```sql
-select ts, sender_name, text
-from agent.messages
-where platform = 'discord'
-  and channel_id = '1297732407725920266'
-order by ts desc
-limit 50;
-```
+- `GET /_matrix/client/v3/sync` —— 长轮询新事件
+- `PUT /_matrix/client/v3/rooms/{roomId}/send/m.room.message/{txnId}` ——
+  发送回复（如果房间是 portal，bridge 会把消息转发到源平台）
 
-## 导入历史消息
+推荐的事件形态和安全默认值（仅分析模式、白名单、审计日志）见
+`docs/agent-integration.md`。
 
-**Discord**
+### 批处理 / RAG：Postgres
 
-```bash
-scripts/import-discord-history.py HyGo --limit 5000 --max-pages 50
-scripts/import-discord-history.py 1297732407725920266 --limit 5000 --max-pages 50
-```
+直接查 `agent.messages`。每行带：
 
-自定义路径：
+- `platform`、`workspace_id`、`channel_id`、`thread_id`
+- `ts`、`sender_id`、`sender_name`、`text`
+- `raw_json` —— 平台原始 payload（附件、reaction、编辑）
+- v2 列：`status`、`conversation_id`、`matrix_event_id`、`matrix_room_id`
 
-```bash
-PIXDESK_PROJECT_DIR=/opt/pixdesk scripts/import-discord-history.py HyGo
-PIXDESK_DISCORD_DB=/path/to/discord.db scripts/import-discord-history.py HyGo
-```
+要从批处理 Agent 发回复，向 `agent.replies` 插一行，`status` 写
+`pending`；`sender` 服务会取走、写到 Matrix，再把行更新成 `sent` 并
+回填 `matrix_event_id`。
 
-**Slack**
+## 运维注记
 
-```bash
-scripts/import-slack-history.py internal-testfeishu --limit 1000 --max-pages 5
-```
+### Discord
 
-自定义路径：
+- 验证过的登录路径是 user token。QR 登录经常被 Discord 的 CAPTCHA 拦
+  住，mautrix-discord 没法解 CAPTCHA。
+- 想把已有的 DM 都拉出来，在 bridge 配置里把
+  `bridge.startup_private_channel_create_limit` 调到 150 或更高。
+- 想让新桥接的房间带历史，按频道类型（DM / channel / thread）配
+  `bridge.backfill.forward_limits`。
+- Discord 名字为空的 group DM 会得到空房间名 —— 可以接受，房间本身
+  正常工作。
+- 容器里解析不了 Discord 媒体域名时，看一下 `docker-compose.yml` 里
+  `extra_hosts` 的固定 IP。Discord 偶尔会换 IP。
+- `mxc://` 图片报 "Failed to bridge media"，在 `homeserver.yaml` 里保持
+  `enable_authenticated_media: false`。已有部署如果已经把本地媒体存成
+  authenticated，可以一次性更新：
 
-```bash
-PIXDESK_PROJECT_DIR=/opt/pixdesk scripts/import-slack-history.py internal-testfeishu
-PIXDESK_SLACK_DB=/path/to/slack.db scripts/import-slack-history.py internal-testfeishu
-```
+  ```sql
+  update local_media_repository set authenticated = false where authenticated = true;
+  ```
 
-导入脚本会从 mautrix 的 SQLite 数据库读取登录状态，再调用平台 API 把历史消息写入 `agent.channels` 和 `agent.messages`。Element 时间线是否完整不影响 Agent 读取 Postgres 中的历史。
+### Slack
+
+- 没有 OAuth app 安装权限的工作区，走 token 登录（xoxc + xoxd cookie）
+  + Login Wizard 是最现实的路径。
+- 给新桥接房间打开回填：
+
+  ```yaml
+  bridge:
+    backfill:
+      enabled: true
+      max_initial_messages: 200
+  ```
+
+- 历史可读范围取决于登录 token 在 workspace 的权限。
+
+### Telegram
+
+- QR 登录通过 Login Wizard（`auth-relay` 的 `/login/telegram/qr`
+  + `/login/telegram/status`）。
+- 二步验证密码会被检测到，但目前会以错误抛出，详见 Roadmap。
 
 ## 云端部署检查表
 
-1. 一开始就确定 `MATRIX_SERVER_NAME`，后续修改很麻烦。
-2. `make init` 前先设置强密码和强 secret。
-3. 初始化核心服务并创建管理员账号。
-4. 给 Synapse 和 Element 配置 HTTPS。
-5. 更新 `MATRIX_PUBLIC_BASEURL` 和 `element/config.json`。
-6. 生成 bridge 配置，填写凭据，安装 registration。
-7. 在 Element 里登录 bridge bot。
-8. 把历史消息导入 Postgres 供 Agent 分析。
-9. 安全备份 `data/`。
+1. `MATRIX_SERVER_NAME` 一次性定好，之后改起来很疼。
+2. 第一次 `make init` 之前就把 `.env` secret 设强。
+3. Synapse 和 Element 放到 HTTPS 反代后面（Caddy / nginx / Traefik）。
+4. 同步更新 `MATRIX_PUBLIC_BASEURL` 和 `element/config.json`。
+5. `auth-relay` 只绑 localhost，运维机器通过 SSH tunnel 访问
+   （`ssh -L 8765:127.0.0.1:8765 …`）。
+6. 定期备份 `data/`。里面是 signing key、bridge session、Postgres
+   文件 —— 丢了就要每个 bridge 重新登录。
+7. 怀疑泄露就轮换 `SYNAPSE_REGISTRATION_SHARED_SECRET` 和 bridge 的
+   `as_token` / `hs_token`。
 
 ## 安全
 
 不要提交：
 
 - `.env`
-- `data/`
+- `data/`（Synapse signing key、bridge SQLite、Postgres 文件、上传的媒体）
 - appservice registration token
-- Synapse signing key
-- bridge SQLite 数据库
-- Slack/Discord/Telegram token
-- Postgres 运行时文件
+- 抓到的平台 token（Slack xoxc/xoxd、Discord user token、Telegram session 文件）
 
-本仓库默认已经忽略这些路径。
+仓库 `.gitignore` 默认已经覆盖了这些。
+
+Discord user-token 登录在技术上违反 Discord 的 ToS，请在自己控制的账号
+上使用，并理解相应风险。
 
 ## 常用命令
 
 ```bash
-make init
-make start-core
-make create-admin MX_USER=admin MX_PASS='strong-password'
-make init-agent-db
-make bridge-init
+make init                  # 一次性初始化 data 目录
+make start-core            # Synapse、Postgres、Element
+make create-admin MX_USER=admin MX_PASS='<强密码>'
+make init-agent-db         # apply agent_schema.sql + v2
+make bridge-init           # 生成 bridge 配置 + registration
 make install-registrations
 make restart-synapse
 make start-bridges
-make logs
-make down
+make logs                  # 实时 tail 所有容器
+make down                  # 停掉一切（数据保留）
 ```
 
-`make clean` 不会自动删除运行数据。如果要重置测试环境，手动执行：
+`make clean` **不会**删 `data/`。要重置实验环境，手动删：
 
 ```bash
 rm -rf data
 ```
 
-只有确认要删除本地 Matrix、bridge、数据库状态时才执行。
+只有确认要丢掉所有 Matrix、bridge、Agent 状态时才执行。
+
+## Roadmap
+
+- Login Wizard 里捕获 Telegram 二步验证密码
+- 用 electron-builder 打包 Login Wizard 的可分发二进制
+- 各 bridge 的接入指标通过 Prometheus 暴露
+- `agent.messages` 可选同步到向量库，作为 embedding pipeline 的来源
+
+## License
+
+见 `LICENSE`（如还未附上请联系维护者）。
