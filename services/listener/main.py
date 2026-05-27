@@ -29,6 +29,22 @@ SLACK_DB = os.environ.get("SLACK_DB", "/bridges/slack/slack.db")
 DISCORD_DB = os.environ.get("DISCORD_DB", "/bridges/discord/discord.db")
 CONVERSATION_GAP_SECONDS = int(os.environ.get("CONVERSATION_GAP_SECONDS", "1800"))
 
+# Auto-accept invites from bridge bots and puppet ghosts so newly-bridged
+# rooms (channels, DMs from a Discord/Slack/Telegram user) show up without
+# manual intervention.
+BRIDGE_BOT_LOCALPARTS = {"slackbot", "discordbot", "telegrambot"}
+BRIDGE_PUPPET_PREFIXES = ("slack_", "discord_", "telegram_")
+
+
+def is_bridge_inviter(sender):
+    """True if `sender` is a bridge bot or platform puppet ghost."""
+    if not sender:
+        return False
+    localpart = sender.split(":")[0].lstrip("@")
+    if localpart in BRIDGE_BOT_LOCALPARTS:
+        return True
+    return any(localpart.startswith(p) for p in BRIDGE_PUPPET_PREFIXES)
+
 
 def matrix_request(method, path, data=None):
     url = HOMESERVER + path
@@ -273,6 +289,82 @@ def process_event(db, slack_db, discord_db, room_id, event):
     store_message(db, platform, room_id, event, info, conversation_id)
 
 
+def join_room(room_id):
+    try:
+        matrix_request(
+            "POST",
+            f"/_matrix/client/v3/rooms/{urllib.parse.quote(room_id)}/join",
+            data={},
+        )
+        return True
+    except Exception as e:
+        print(f"join {room_id} failed: {e}", file=sys.stderr, flush=True)
+        return False
+
+
+def handle_invite(room_id, invite_data):
+    """Auto-accept invites from known bridge bots and puppet ghosts.
+
+    Matrix delivers invites in rooms.invite[].invite_state.events. We scan
+    for the m.room.member event addressed to our user and check the
+    inviter against the bridge namespace.
+    """
+    events = ((invite_data or {}).get("invite_state") or {}).get("events", [])
+    for ev in events:
+        if ev.get("type") != "m.room.member":
+            continue
+        if ev.get("state_key") != USER_ID:
+            continue
+        if (ev.get("content") or {}).get("membership") != "invite":
+            continue
+        sender = ev.get("sender", "")
+        if not is_bridge_inviter(sender):
+            print(
+                f"invite to {room_id} from {sender}; not a bridge sender, skipping",
+                file=sys.stderr, flush=True,
+            )
+            return
+        if join_room(room_id):
+            print(f"auto-joined {room_id} (invited by {sender})", flush=True)
+        return
+
+
+def drain_pending_invites():
+    """Fetch a fresh /sync (no since) at startup just to enumerate invites
+    that arrived while the listener was offline. The response is discarded
+    apart from the invite section; the persisted next_batch token still
+    drives the main loop.
+    """
+    try:
+        params = {
+            "filter": json.dumps({
+                "room": {
+                    "timeline": {"limit": 0},
+                    "state": {"types": ["m.room.member"]},
+                    "ephemeral": {"types": []},
+                    "account_data": {"types": []},
+                },
+                "presence": {"types": []},
+                "account_data": {"types": []},
+            }),
+        }
+        resp = matrix_request(
+            "GET", "/_matrix/client/v3/sync?" + urllib.parse.urlencode(params),
+        )
+    except Exception as e:
+        print(f"startup invite drain failed: {e}", file=sys.stderr, flush=True)
+        return
+    invites = resp.get("rooms", {}).get("invite", {})
+    if not invites:
+        return
+    print(f"draining {len(invites)} pending invite(s) at startup", flush=True)
+    for room_id, invite_data in invites.items():
+        try:
+            handle_invite(room_id, invite_data)
+        except Exception as e:
+            print(f"invite drain error for {room_id}: {e}", file=sys.stderr, flush=True)
+
+
 def get_pg():
     conn = psycopg2.connect(DATABASE_URL)
     conn.autocommit = True
@@ -290,6 +382,7 @@ def sync_loop():
         f"discord_db={'yes' if discord_db else 'no'}",
         flush=True,
     )
+    drain_pending_invites()
 
     while True:
         try:
@@ -298,7 +391,7 @@ def sync_loop():
                 "filter": json.dumps({
                     "room": {
                         "timeline": {"limit": 50},
-                        "state": {"types": []},
+                        "state": {"types": ["m.room.member"]},
                         "ephemeral": {"types": []},
                         "account_data": {"types": []},
                     },
@@ -314,6 +407,12 @@ def sync_loop():
             since = resp.get("next_batch")
             if since:
                 save_sync_token(since)
+            invites = resp.get("rooms", {}).get("invite", {})
+            for room_id, invite_data in invites.items():
+                try:
+                    handle_invite(room_id, invite_data)
+                except Exception as e:
+                    print(f"invite error for {room_id}: {e}", file=sys.stderr, flush=True)
             rooms = resp.get("rooms", {}).get("join", {})
             for room_id, room_data in rooms.items():
                 events = (room_data.get("timeline") or {}).get("events", [])
