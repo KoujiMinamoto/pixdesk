@@ -84,6 +84,23 @@ def open_bridge_db(path):
     return con
 
 
+def discord_login_dcid(discord_db):
+    """Cache the logged-in Discord user's dcid. Used to label group DMs
+    (type=3) with no guild and no receiver, matching the import script's
+    `direct:{login.discord_id}` rule.
+    """
+    if discord_db is None:
+        return ""
+    try:
+        row = discord_db.execute(
+            'select dcid from "user" where discord_token is not null limit 1'
+        ).fetchone()
+        return row["dcid"] if row and row["dcid"] else ""
+    except Exception as e:
+        print(f"discord login lookup failed: {e}", file=sys.stderr, flush=True)
+        return ""
+
+
 def detect_platform(sender):
     if sender == USER_ID:
         return None
@@ -144,18 +161,21 @@ def lookup_slack(slack_db, event_id):
     }
 
 
-def lookup_discord(discord_db, event_id):
+def lookup_discord(discord_db, event_id, login_dcid=""):
     """Look up a Matrix event in mautrix-discord's message table.
 
     Discord puppet table has discord-side display names. portal joins
-    channel_id back to its parent guild for workspace_id.
+    channel_id back to its parent guild for workspace_id. Group DMs
+    (type=3) have neither guild nor receiver — fall back to
+    `direct:{login_dcid}` to match the import script.
     """
     if discord_db is None:
         return None
     cur = discord_db.execute(
         """
         select m.dcid, m.dc_chan_id, m.dc_sender, m.timestamp, m.dc_thread_id,
-               p.dc_guild_id, p.name as channel_name,
+               p.dc_guild_id, p.receiver as portal_receiver,
+               p.name as channel_name,
                pu.name as puppet_name, pu.username
         from message m
         left join portal p on p.dcid = m.dc_chan_id and p.receiver = m.dc_chan_receiver
@@ -167,8 +187,11 @@ def lookup_discord(discord_db, event_id):
     row = cur.fetchone()
     if not row:
         return None
+    workspace_id = row["dc_guild_id"] or row["portal_receiver"] or ""
+    if not workspace_id and login_dcid:
+        workspace_id = f"direct:{login_dcid}"
     return {
-        "workspace_id": row["dc_guild_id"] or "",
+        "workspace_id": workspace_id,
         "channel_id": row["dc_chan_id"] or "",
         "message_id": row["dcid"] or "",
         "thread_id": row["dc_thread_id"] or None,
@@ -251,7 +274,27 @@ def store_message(db, platform, room_id, event, info, conversation_id):
         return bool(result and result[0])
 
 
-def process_event(db, slack_db, discord_db, room_id, event):
+def lookup_with_retry(platform, slack_db, discord_db, event_id, login_dcid):
+    """The bridge writes its SQLite row asynchronously around the same time
+    Matrix delivers the event. Most rows are visible on the first try; for
+    the rest, a brief backoff catches them.
+    """
+    delays = (0, 0.5, 1.5, 4.0)
+    for delay in delays:
+        if delay:
+            time.sleep(delay)
+        if platform == "slack":
+            info = lookup_slack(slack_db, event_id)
+        elif platform == "discord":
+            info = lookup_discord(discord_db, event_id, login_dcid)
+        else:
+            return None
+        if info:
+            return info
+    return None
+
+
+def process_event(db, slack_db, discord_db, login_dcid, room_id, event):
     if event.get("type") != "m.room.message":
         return
     sender = event.get("sender", "")
@@ -262,16 +305,11 @@ def process_event(db, slack_db, discord_db, room_id, event):
     if not event_id:
         return
 
-    if platform == "slack":
-        info = lookup_slack(slack_db, event_id)
-    elif platform == "discord":
-        info = lookup_discord(discord_db, event_id)
-    else:
-        info = None
+    info = lookup_with_retry(platform, slack_db, discord_db, event_id, login_dcid)
     if not info:
-        # Bridge hasn't committed its row yet, or this is a Telegram event we
-        # can't yet map. Re-tick will pick it up on a later /sync round only if
-        # we leave `since` un-advanced; we don't want that, so log and drop.
+        # Row never appeared after backoff. Either Telegram (no lookup yet)
+        # or the bridge dropped the event upstream. Logging keeps it visible
+        # without re-driving sync.
         print(
             f"no bridge row for {platform} event {event_id} in {room_id}; dropping",
             file=sys.stderr,
@@ -375,11 +413,13 @@ def sync_loop():
     pg = get_pg()
     slack_db = open_bridge_db(SLACK_DB)
     discord_db = open_bridge_db(DISCORD_DB)
+    login_dcid = discord_login_dcid(discord_db)
     since = load_sync_token()
     print(
         f"listener started, user={USER_ID}, since={since}, "
         f"slack_db={'yes' if slack_db else 'no'}, "
-        f"discord_db={'yes' if discord_db else 'no'}",
+        f"discord_db={'yes' if discord_db else 'no'}, "
+        f"discord_login={login_dcid or 'none'}",
         flush=True,
     )
     drain_pending_invites()
@@ -418,7 +458,7 @@ def sync_loop():
                 events = (room_data.get("timeline") or {}).get("events", [])
                 for event in events:
                     try:
-                        process_event(pg, slack_db, discord_db, room_id, event)
+                        process_event(pg, slack_db, discord_db, login_dcid, room_id, event)
                     except Exception as e:
                         print(f"event error: {e}", file=sys.stderr, flush=True)
         except urllib.error.URLError as e:
