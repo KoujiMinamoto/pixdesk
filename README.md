@@ -279,6 +279,58 @@ To send a reply from a batch agent, insert into `agent.replies` with
 `status = 'pending'`; the `sender` service picks it up, writes to Matrix,
 and updates the row to `sent` with the resulting `matrix_event_id`.
 
+## Public Postgres Mirror (optional)
+
+A common pain point: the PixDesk core lives on a private network, but
+the agents and analytics workloads that need `agent.*` data live in a
+cloud VM that can't reach into the LAN. Rather than poking holes through
+the corporate firewall, run a **logical-replication subscriber** on the
+public host. The internal Postgres stays the source of truth; the
+public mirror is read-mostly and trails by seconds.
+
+```
+[internal LAN]                      [public host]
+                                    pixdesk-pg container (subscriber)
+postgres (publisher) ─┐                 ▲
+  publication agent_pub │ replication ── localhost:5433
+                       └─► autossh -R 5433 ──► socat 172.18.0.1:5433
+                          (185 dials out)         (sidecar)
+```
+
+Internal side (`wal_level = logical`, role `replicator`, publication
+covering schema `agent`) writes WAL out through a reverse SSH tunnel
+opened by an `autossh` systemd unit on the LAN host — no inbound LAN
+ports are exposed. The public host runs a small `socat` sidecar so the
+subscriber container can reach the tunneled port over the docker bridge
+gateway. The subscription's initial copy backfills history, then
+streams INSERT/UPDATE/DELETE in real time.
+
+On the public host, lock down access in `pg_hba.conf`:
+
+- `synapse` (superuser, bootstrapped from `POSTGRES_USER`): allow only
+  from your operator IP. Never expose to the world.
+- `agent_rw` (least-privilege role): `SELECT` on all of `agent.*`,
+  `INSERT`/`UPDATE` on `agent.replies` only. Open to whoever needs to
+  query (`0.0.0.0/0` is the simplest, paired with scram-sha-256 + a
+  strong password). This is the role you hand to external agents.
+
+Reply path is unchanged: an external agent inserts into
+`agent.replies` (status `pending`) on the mirror; the row replicates
+back through the tunnel to the internal Postgres; the internal `sender`
+service picks it up and forwards to Matrix → bridge → platform.
+Replication is bidirectional in effect, even though there's only one
+publisher direction at the WAL level.
+
+A short connection string is enough for a cloud-hosted agent — no LAN
+access, no SSH key:
+
+```bash
+PIXDESK_PG_URL=postgresql://agent_rw:<password>@127.0.0.1:5432/synapse
+```
+
+(If the agent runs in a container on the same host, use the docker
+bridge gateway IP instead of `127.0.0.1`.)
+
 ## Operational Notes
 
 ### Discord

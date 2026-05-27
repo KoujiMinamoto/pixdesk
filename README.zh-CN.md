@@ -263,6 +263,52 @@ Telegram 的历史由 bridge 自己回填（在
 `pending`；`sender` 服务会取走、写到 Matrix，再把行更新成 `sent` 并
 回填 `matrix_event_id`。
 
+## 公网 Postgres 镜像（可选）
+
+很常见的痛点：PixDesk 核心跑在内网，但要消费 `agent.*` 数据的 agent
+和分析任务在公网云上，钻不进 LAN。与其在公司防火墙上开洞，不如在
+公网机器上跑一个 **logical replication subscriber**。内网 Postgres
+依然是 single source of truth；公网那份是只读为主、几秒级追平。
+
+```
+[内网]                              [公网]
+                                    pixdesk-pg container（subscriber）
+postgres（publisher）─┐                 ▲
+  publication agent_pub │ 复制流 ── localhost:5433
+                       └─► autossh -R 5433 ──► socat 172.18.0.1:5433
+                          （185 主动外拨）       （sidecar）
+```
+
+内网那一侧（`wal_level = logical`，`replicator` 角色，覆盖 `agent`
+schema 的 publication）通过 LAN 上一个 `autossh` systemd unit 主动外拨
+出 SSH 反向 tunnel，把 WAL 推出来——LAN 上**不开任何入站端口**。公网
+机器上跑一个小 `socat` sidecar，让 subscriber 容器能从 docker bridge
+gateway 进到 tunnel 端口。subscription 第一次跑会把历史数据拉一遍，
+之后实时同步 INSERT/UPDATE/DELETE。
+
+公网这边 `pg_hba.conf` 收紧：
+
+- `synapse`（容器初始化出来的超管）：只允许你的运维 IP，**不要**对
+  公网开。
+- `agent_rw`（最小权限角色）：对 `agent.*` 全部 `SELECT`，仅对
+  `agent.replies` `INSERT`/`UPDATE`。开给外部需要查的地方
+  （最简单是 `0.0.0.0/0` + scram-sha-256 + 强密码）。这是真正给到
+  外部 agent 的账号。
+
+回复路径不变：外部 agent 把 `agent.replies` 插一行（status `pending`）
+进公网镜像；这行通过 tunnel 反向同步回内网 Postgres；内网 `sender`
+服务捡走，写 Matrix → bridge → 原平台。虽然 WAL 层面是单向 publisher
+→ subscriber，整条链路看起来是双向的。
+
+云上的 agent 拿一行连接串就够，不用 LAN 访问、不用 SSH key：
+
+```bash
+PIXDESK_PG_URL=postgresql://agent_rw:<password>@127.0.0.1:5432/synapse
+```
+
+（agent 跑在同一台主机的容器里时，把 `127.0.0.1` 换成 docker bridge
+gateway IP。）
+
 ## 运维注记
 
 ### Discord
