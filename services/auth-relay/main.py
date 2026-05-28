@@ -683,3 +683,160 @@ async def bridge_logout(bridge: str) -> BridgeLogoutReply:
         log.warning("portal evacuation for %s failed: %s", bridge, exc)
 
     return BridgeLogoutReply(ok=ok, bridge=bridge, messages=bodies, rooms_left=rooms_left)
+
+
+# ---------------------------------------------------------------------------
+# Gmail OAuth (separate from bridge logins; talks to Google directly)
+# ---------------------------------------------------------------------------
+
+GMAIL_CLIENT_ID = os.environ.get("GMAIL_CLIENT_ID", "")
+GMAIL_CLIENT_SECRET = os.environ.get("GMAIL_CLIENT_SECRET", "")
+GMAIL_REDIRECT_URI = os.environ.get("GMAIL_REDIRECT_URI", "http://127.0.0.1:8765/login/gmail/callback")
+GMAIL_TOKEN_DIR = os.environ.get("GMAIL_TOKEN_DIR", "/data/gmail")
+GMAIL_SCOPES = "https://www.googleapis.com/auth/gmail.modify"
+GMAIL_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+GMAIL_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GMAIL_REVOKE_URL = "https://oauth2.googleapis.com/revoke"
+GMAIL_PROFILE_URL = "https://gmail.googleapis.com/gmail/v1/users/me/profile"
+
+
+def _gmail_token_path() -> str:
+    return os.path.join(GMAIL_TOKEN_DIR, "tokens.json")
+
+
+def _gmail_persist(payload: dict[str, Any]) -> None:
+    """Write tokens to disk with mode 0600. Parent dir to 0700."""
+    os.makedirs(GMAIL_TOKEN_DIR, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(GMAIL_TOKEN_DIR, 0o700)
+    except OSError:
+        pass
+    path = _gmail_token_path()
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(payload, f)
+    os.replace(tmp, path)
+
+
+def _gmail_load() -> Optional[dict[str, Any]]:
+    try:
+        with open(_gmail_token_path()) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        log.warning("gmail token load failed: %s", exc)
+        return None
+
+
+class GmailStartReply(BaseModel):
+    auth_url: str = Field(...)
+    redirect_uri: str
+    scopes: str
+
+
+class GmailCallbackReq(BaseModel):
+    code: str
+    redirect_uri: Optional[str] = None
+
+
+class GmailCallbackReply(BaseModel):
+    ok: bool
+    email: Optional[str] = None
+    detail: Optional[str] = None
+
+
+class GmailStatusReply(BaseModel):
+    logged_in: bool
+    email: Optional[str] = None
+    captured_at: Optional[str] = None
+
+
+@app.get("/login/gmail/start", response_model=GmailStartReply, dependencies=[Depends(require_secret)])
+async def gmail_start(redirect_uri: Optional[str] = None) -> GmailStartReply:
+    if not GMAIL_CLIENT_ID:
+        raise HTTPException(status_code=503, detail="GMAIL_CLIENT_ID not configured")
+    rd = redirect_uri or GMAIL_REDIRECT_URI
+    params = {
+        "client_id": GMAIL_CLIENT_ID,
+        "redirect_uri": rd,
+        "response_type": "code",
+        "scope": GMAIL_SCOPES,
+        "access_type": "offline",
+        "prompt": "consent",
+        "include_granted_scopes": "true",
+    }
+    return GmailStartReply(
+        auth_url=f"{GMAIL_AUTH_URL}?{urllib.parse.urlencode(params)}",
+        redirect_uri=rd,
+        scopes=GMAIL_SCOPES,
+    )
+
+
+@app.post("/login/gmail/callback", response_model=GmailCallbackReply, dependencies=[Depends(require_secret)])
+async def gmail_callback(req: GmailCallbackReq) -> GmailCallbackReply:
+    if not GMAIL_CLIENT_ID or not GMAIL_CLIENT_SECRET:
+        raise HTTPException(status_code=503, detail="GMAIL_CLIENT_ID/SECRET not configured")
+    rd = req.redirect_uri or GMAIL_REDIRECT_URI
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        token_resp = await client.post(
+            GMAIL_TOKEN_URL,
+            data={
+                "code": req.code,
+                "client_id": GMAIL_CLIENT_ID,
+                "client_secret": GMAIL_CLIENT_SECRET,
+                "redirect_uri": rd,
+                "grant_type": "authorization_code",
+            },
+        )
+        if token_resp.status_code >= 400:
+            return GmailCallbackReply(ok=False, detail=f"token exchange failed: {token_resp.text[:300]}")
+        tok = token_resp.json()
+        if "refresh_token" not in tok:
+            return GmailCallbackReply(ok=False, detail="no refresh_token returned (need prompt=consent)")
+        access = tok.get("access_token", "")
+        prof_resp = await client.get(
+            GMAIL_PROFILE_URL,
+            headers={"Authorization": f"Bearer {access}"},
+        )
+        email = ""
+        if prof_resp.status_code < 400:
+            email = (prof_resp.json() or {}).get("emailAddress", "")
+    payload = {
+        "email": email,
+        "refresh_token": tok["refresh_token"],
+        "scopes": GMAIL_SCOPES,
+        "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    _gmail_persist(payload)
+    return GmailCallbackReply(ok=True, email=email or None)
+
+
+@app.get("/status/gmail", response_model=GmailStatusReply, dependencies=[Depends(require_secret)])
+async def gmail_status() -> GmailStatusReply:
+    data = _gmail_load()
+    if not data or not data.get("refresh_token"):
+        return GmailStatusReply(logged_in=False)
+    return GmailStatusReply(
+        logged_in=True,
+        email=data.get("email") or None,
+        captured_at=data.get("captured_at") or None,
+    )
+
+
+@app.post("/logout/gmail", response_model=GmailCallbackReply, dependencies=[Depends(require_secret)])
+async def gmail_logout() -> GmailCallbackReply:
+    data = _gmail_load()
+    if not data or not data.get("refresh_token"):
+        return GmailCallbackReply(ok=True, detail="not logged in")
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            await client.post(GMAIL_REVOKE_URL, params={"token": data["refresh_token"]})
+        except Exception as exc:
+            log.warning("gmail revoke failed: %s", exc)
+    try:
+        os.remove(_gmail_token_path())
+    except FileNotFoundError:
+        pass
+    return GmailCallbackReply(ok=True, email=data.get("email") or None)

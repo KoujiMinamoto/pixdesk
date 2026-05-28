@@ -2,6 +2,8 @@ services:
   postgres:
     image: postgres:${POSTGRES_TAG:-16-alpine}
     restart: unless-stopped
+    ports:
+      - "127.0.0.1:5432:5432"
     environment:
       POSTGRES_DB: synapse
       POSTGRES_USER: synapse
@@ -97,11 +99,15 @@ services:
     profiles: ["agent"]
     environment:
       MATRIX_HOMESERVER: http://synapse:8008
-      MATRIX_USER_ID: "@agent:${MATRIX_SERVER_NAME}"
-      MATRIX_ACCESS_TOKEN: "${AGENT_ACCESS_TOKEN}"
+      MATRIX_USER_ID: "@admin:${MATRIX_SERVER_NAME}"
+      MATRIX_ACCESS_TOKEN: "${AGENT_ACCESS_TOKEN:?set AGENT_ACCESS_TOKEN in .env}"
       DATABASE_URL: "postgresql://synapse:${POSTGRES_PASSWORD}@postgres:5432/synapse"
+      SLACK_DB: /bridges/slack/slack.db
+      DISCORD_DB: /bridges/discord/discord.db
     volumes:
       - ./data/listener:/data
+      - ./data/mautrix-slack:/bridges/slack:ro
+      - ./data/mautrix-discord:/bridges/discord:ro
 
   pixdesk-sender:
     build: ./services/sender
@@ -133,5 +139,47 @@ services:
       SLACK_BOT_MXID: "@slackbot:${MATRIX_SERVER_NAME}"
       TELEGRAM_BOT_MXID: "@telegrambot:${MATRIX_SERVER_NAME}"
       RELAY_SHARED_SECRET: "${RELAY_SHARED_SECRET:?set RELAY_SHARED_SECRET in .env}"
+      GMAIL_CLIENT_ID: "${GMAIL_CLIENT_ID:-}"
+      GMAIL_CLIENT_SECRET: "${GMAIL_CLIENT_SECRET:-}"
+      GMAIL_REDIRECT_URI: "${GMAIL_REDIRECT_URI:-http://127.0.0.1:8765/login/gmail/callback}"
+      GMAIL_TOKEN_DIR: /data/gmail
     ports:
       - "127.0.0.1:8765:8765"
+    volumes:
+      - ./data/gmail:/data/gmail
+
+  pixdesk-gmail-ingester:
+    build: ./services/gmail-ingester
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles: ["gmail"]
+    environment:
+      DATABASE_URL: "postgresql://synapse:${POSTGRES_PASSWORD}@postgres:5432/synapse"
+      GMAIL_CLIENT_ID: "${GMAIL_CLIENT_ID:-}"
+      GMAIL_CLIENT_SECRET: "${GMAIL_CLIENT_SECRET:-}"
+      GMAIL_TOKEN_DIR: /data/gmail
+      GMAIL_STATE_DIR: /data/gmail-ingester
+      POLL_SECONDS: "${GMAIL_POLL_SECONDS:-30}"
+      COLD_START_LIMIT: "${GMAIL_COLD_START_LIMIT:-200}"
+      COLD_START_QUERY: "${GMAIL_COLD_START_QUERY:-newer_than:30d}"
+    volumes:
+      - ./data/gmail:/data/gmail:ro
+      - ./data/gmail-ingester:/data/gmail-ingester
+
+  pixdesk-gmail-sender:
+    build: ./services/gmail-sender
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles: ["gmail"]
+    environment:
+      DATABASE_URL: "postgresql://synapse:${POSTGRES_PASSWORD}@postgres:5432/synapse"
+      GMAIL_CLIENT_ID: "${GMAIL_CLIENT_ID:-}"
+      GMAIL_CLIENT_SECRET: "${GMAIL_CLIENT_SECRET:-}"
+      GMAIL_TOKEN_DIR: /data/gmail
+      POLL_SECONDS: "${GMAIL_SENDER_POLL_SECONDS:-10}"
+    volumes:
+      - ./data/gmail:/data/gmail:ro
