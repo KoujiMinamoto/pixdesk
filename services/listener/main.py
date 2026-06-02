@@ -129,9 +129,11 @@ def lookup_slack(slack_db, event_id):
                m.sender_id as ghost_id,
                m.timestamp as ts_ns,
                m.thread_root_id,
-               g.name as ghost_name
+               g.name as ghost_name,
+               p.name as channel_name
         from message m
         left join ghost g on g.id = m.sender_id
+        left join portal p on p.id = m.room_id and p.receiver = m.room_receiver
         where m.mxid = ?
         """,
         (event_id,),
@@ -157,6 +159,7 @@ def lookup_slack(slack_db, event_id):
         "thread_id": thread_id,
         "sender_id": sender_id,
         "sender_name": row["ghost_name"] or "",
+        "channel_name": row["channel_name"] or "",
         "ts": (row["ts_ns"] or 0) / 1_000_000_000.0,
     }
 
@@ -197,8 +200,40 @@ def lookup_discord(discord_db, event_id, login_dcid=""):
         "thread_id": row["dc_thread_id"] or None,
         "sender_id": row["dc_sender"] or "",
         "sender_name": row["puppet_name"] or row["username"] or "",
+        "channel_name": row["channel_name"] or "",
         "ts": (row["timestamp"] or 0) / 1000.0,
     }
+
+
+# Cache of (channel_name, matrix_room_id) we've already pushed to agent.channels,
+# keyed by (platform, workspace_id, channel_id). Skips redundant writes when a
+# channel's name and room mapping haven't changed since we last saw it.
+_channel_cache = {}
+
+
+def upsert_channel(db, platform, workspace_id, channel_id, channel_name, room_id):
+    if not channel_id:
+        return
+    key = (platform, workspace_id, channel_id)
+    desired = (channel_name or "", room_id or "")
+    if _channel_cache.get(key) == desired:
+        return
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            insert into agent.channels
+              (platform, workspace_id, channel_id, channel_name, matrix_room_id, updated_at)
+            values (%s, %s, %s, %s, %s, now())
+            on conflict (platform, workspace_id, channel_id) do update set
+              channel_name = coalesce(nullif(excluded.channel_name, ''), agent.channels.channel_name),
+              matrix_room_id = coalesce(excluded.matrix_room_id, agent.channels.matrix_room_id),
+              updated_at = now()
+            where agent.channels.channel_name is distinct from coalesce(nullif(excluded.channel_name, ''), agent.channels.channel_name)
+               or agent.channels.matrix_room_id is distinct from coalesce(excluded.matrix_room_id, agent.channels.matrix_room_id)
+            """,
+            (platform, workspace_id, channel_id, channel_name or "", room_id),
+        )
+    _channel_cache[key] = desired
 
 
 def find_or_create_conversation(db, platform, workspace_id, channel_id, thread_id, room_id):
@@ -323,6 +358,10 @@ def process_event(db, slack_db, discord_db, login_dcid, room_id, event):
     conversation_id = find_or_create_conversation(
         db, platform, info["workspace_id"], info["channel_id"],
         info["thread_id"], room_id,
+    )
+    upsert_channel(
+        db, platform, info["workspace_id"], info["channel_id"],
+        info.get("channel_name", ""), room_id,
     )
     store_message(db, platform, room_id, event, info, conversation_id)
 
