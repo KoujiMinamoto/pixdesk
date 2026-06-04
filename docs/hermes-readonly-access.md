@@ -66,6 +66,33 @@ PGPASSWORD='<PASSWORD>' \
 
 Hermes 大概率只关心 `messages` + `channels` + `conversations` 三张。
 
+工单系统(`ticket.*` schema)也已经接进同一份镜像,`agent_ro` 也有 SELECT
+权限。要做工单分析时关心:
+
+| 表 | 作用 |
+|---|---|
+| `ticket.tickets` | 工单主体(状态、优先级、受理人、客户绑定) |
+| `ticket.ticket_comments` | 评论(`is_internal` 区分内外) |
+| `ticket.ticket_history` | 字段级审计流水 |
+| `ticket.ticket_attachments` | 附件元数据(实际 blob 不在镜像里) |
+| `ticket.ticket_messages` | 工单 ↔ `agent.messages` 多对多(钉的关键证据) |
+
+「客户」字段在 `ticket.tickets` 上没有冗余存,通过 `conversation_id`
+关联到 `agent.conversations` 派生:
+
+```sql
+SELECT t.code, t.subject, t.status, t.priority,
+       c.platform, c.workspace_id, ch.channel_name
+FROM ticket.tickets t
+JOIN agent.conversations c ON c.id = t.conversation_id
+LEFT JOIN agent.channels ch
+  ON  ch.platform     = c.platform
+  AND ch.workspace_id = c.workspace_id
+  AND ch.channel_id   = c.channel_id
+WHERE t.status NOT IN ('resolved','closed')
+ORDER BY t.opened_at DESC;
+```
+
 ## 5. 关键字段语义
 
 ### 5.1 `agent.messages`(主表)

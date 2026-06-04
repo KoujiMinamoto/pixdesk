@@ -183,3 +183,22 @@ services:
       POLL_SECONDS: "${GMAIL_SENDER_POLL_SECONDS:-10}"
     volumes:
       - ./data/gmail:/data/gmail:ro
+
+  pixdesk-ticket-api:
+    build: ./services/ticket-api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles: ["tickets"]
+    environment:
+      DATABASE_URL: "postgresql://synapse:${POSTGRES_PASSWORD}@postgres:5432/synapse"
+      TICKET_API_SHARED_SECRET: "${TICKET_API_SHARED_SECRET:?set TICKET_API_SHARED_SECRET in .env}"
+      ATTACHMENT_DIR: /data/tickets
+      MAX_ATTACHMENT_BYTES: "${TICKET_MAX_ATTACHMENT_BYTES:-52428800}"
+      MAX_TOTAL_ATTACHMENT_BYTES_PER_TICKET: "${TICKET_MAX_TOTAL_BYTES:-52428800}"
+    ports:
+      - "127.0.0.1:8766:8766"
+    volumes:
+      - ./data/tickets:/data/tickets
+
