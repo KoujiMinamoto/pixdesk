@@ -9,6 +9,11 @@
   "disable_guests": true,
   "disable_login_language_selector": false,
   "brand": "Matrix mautrix lab",
-  "default_theme": "light"
+  "default_theme": "light",
+  "settingDefaults": {
+    "permittedWidgets": {
+      "http://192.168.72.185:8767": true
+    }
+  }
 }
 

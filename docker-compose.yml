@@ -202,3 +202,23 @@ services:
     volumes:
       - ./data/tickets:/data/tickets
 
+  pixdesk-ticket-widget:
+    build: ./services/ticket-widget
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      pixdesk-ticket-api:
+        condition: service_started
+    profiles: ["tickets"]
+    environment:
+      DATABASE_URL: "postgresql://synapse:${POSTGRES_PASSWORD}@postgres:5432/synapse"
+      MATRIX_HOMESERVER: http://synapse:8008
+      MATRIX_ADMIN_ACCESS_TOKEN: "${ADMIN_ACCESS_TOKEN:?set ADMIN_ACCESS_TOKEN in .env}"
+      TICKET_API_URL: http://pixdesk-ticket-api:8766
+      TICKET_API_SHARED_SECRET: "${TICKET_API_SHARED_SECRET}"
+      WIDGET_COOKIE_SECRET: "${WIDGET_COOKIE_SECRET:?set WIDGET_COOKIE_SECRET in .env}"
+      PUBLIC_BASE_URL: "${WIDGET_PUBLIC_BASE_URL:-http://192.168.72.185:8767}"
+      ELEMENT_ORIGIN: "${ELEMENT_ORIGIN:-http://192.168.72.185:8080}"
+    ports:
+      - "0.0.0.0:8767:8767"
