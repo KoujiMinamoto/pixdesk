@@ -1,0 +1,20 @@
+[Unit]
+Description=Beeper Matrix Discord logout watcher (alerts on session logout)
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/beeper-matrix
+# Provides ADMIN_ACCESS_TOKEN (long-lived admin token). Do NOT switch to
+# password /login — a crash-loop of logins trips Synapse's M_LIMIT_EXCEEDED.
+EnvironmentFile=/opt/beeper-matrix/.env
+Environment=MATRIX_BASE_URL=http://127.0.0.1:8008
+Environment=ALERT_ROOM=!tamUeVfRRugKCTyYto:192.168.72.185
+Environment=DISCORD_CONTAINER=beeper-matrix-mautrix-discord-1
+ExecStart=/usr/bin/python3 /opt/beeper-matrix/scripts/discord-logout-watcher.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
