@@ -222,3 +222,31 @@ services:
       ELEMENT_ORIGIN: "${ELEMENT_ORIGIN:-http://192.168.72.185:8080}"
     ports:
       - "0.0.0.0:8767:8767"
+
+  pixdesk-issue-engine:
+    build: ./services/issue-engine
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles: ["issues"]
+    environment:
+      DATABASE_URL: "postgresql://synapse:${POSTGRES_PASSWORD}@postgres:5432/synapse"
+      MATRIX_SERVER_NAME: "${MATRIX_SERVER_NAME}"
+      ISSUE_API_SHARED_SECRET: "${ISSUE_API_SHARED_SECRET:?set ISSUE_API_SHARED_SECRET in .env}"
+      # Detection cadence / SLA (decision: 2h unanswered, 7x24, no business hours).
+      ISSUE_POLL_SECONDS: "${ISSUE_POLL_SECONDS:-30}"
+      ISSUE_SLA_UNANSWERED_SECONDS: "${ISSUE_SLA_UNANSWERED_SECONDS:-7200}"
+      ISSUE_CLOSURE_GRACE_SECONDS: "${ISSUE_CLOSURE_GRACE_SECONDS:-259200}"
+      ISSUE_AGENT_SENDERS: "${ISSUE_AGENT_SENDERS:-}"
+      # One-shot historical backfill: set ISSUE_BACKFILL=1 for the first run.
+      ISSUE_BACKFILL: "${ISSUE_BACKFILL:-}"
+      ISSUE_BACKFILL_SINCE: "${ISSUE_BACKFILL_SINCE:-}"
+      # LLM (decision: external API only; default none = pure heuristics, zero egress).
+      ISSUE_LLM_BACKEND: "${ISSUE_LLM_BACKEND:-none}"
+      ISSUE_LLM_BASE_URL: "${ISSUE_LLM_BASE_URL:-}"
+      ISSUE_LLM_API_KEY: "${ISSUE_LLM_API_KEY:-}"
+      ISSUE_LLM_MODEL: "${ISSUE_LLM_MODEL:-}"
+      ISSUE_LLM_DAILY_BUDGET_CNY: "${ISSUE_LLM_DAILY_BUDGET_CNY:-0}"
+    ports:
+      - "127.0.0.1:8768:8768"
