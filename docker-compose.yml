@@ -220,6 +220,11 @@ services:
       WIDGET_COOKIE_SECRET: "${WIDGET_COOKIE_SECRET:?set WIDGET_COOKIE_SECRET in .env}"
       PUBLIC_BASE_URL: "${WIDGET_PUBLIC_BASE_URL:-http://192.168.72.185:8767}"
       ELEMENT_ORIGIN: "${ELEMENT_ORIGIN:-http://192.168.72.185:8080}"
+      # Closed-Loop Engine dashboard wiring (P2). Reviewer allowlist gates the
+      # cross-customer dashboard; if empty, the dashboard is disabled (403).
+      ISSUE_API_URL: http://pixdesk-issue-engine:8768
+      ISSUE_API_SHARED_SECRET: "${ISSUE_API_SHARED_SECRET:-}"
+      REVIEWER_ALLOWLIST: "${REVIEWER_ALLOWLIST:-}"
     ports:
       - "0.0.0.0:8767:8767"
 

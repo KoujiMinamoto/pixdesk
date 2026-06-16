@@ -1,0 +1,47 @@
+/* Closed-Loop Engine dashboard — layered on top of the widget's style.css.
+   Reuses the widget's typography, chips and buttons; adds dashboard layout. */
+
+#app { max-width: 1100px; margin: 0 auto; }
+
+.dash-header { position: sticky; top: 0; background: #fff; padding-bottom: 8px;
+  border-bottom: 1px solid #d0d7de; z-index: 5; }
+.dash-header h1 { font-size: 18px; margin: 4px 0 10px; }
+
+.dash-tabs { display: flex; gap: 6px; margin-bottom: 6px; }
+.tab { background: #f6f8fa; color: #1f2328; border: 1px solid #d0d7de; }
+.tab.active { background: #1f6feb; color: #fff; border-color: #1f6feb; }
+
+table.dash { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 8px; }
+table.dash th, table.dash td { text-align: left; padding: 7px 8px;
+  border-bottom: 1px solid #eaecef; vertical-align: top; }
+table.dash th { color: #6b7280; font-weight: 600; font-size: 12px; }
+table.dash tr.clickable:hover { background: #f6f8fa; cursor: pointer; }
+
+.reason { font-size: 11px; padding: 2px 6px; border-radius: 10px; white-space: nowrap; }
+.reason.unanswered_customer { background: #ffebe9; color: #cf222e; }
+.reason.idle_open { background: #fff4e5; color: #bc4c00; }
+.reason.awaiting_customer_stale { background: #fff8c5; color: #7d4e00; }
+.reason.reopened { background: #ffe3e3; color: #a40e26; }
+
+.state { font-size: 11px; color: #57606a; }
+.stale { font-variant-numeric: tabular-nums; color: #cf222e; font-weight: 600; }
+.muted { color: #8b949e; }
+
+.drawer-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.3); z-index: 10; }
+.drawer { position: fixed; top: 0; right: 0; width: min(560px, 92vw); height: 100vh;
+  background: #fff; box-shadow: -2px 0 12px rgba(0,0,0,.15); z-index: 11;
+  overflow-y: auto; padding: 16px; }
+.drawer h2 { font-size: 15px; margin: 0 0 4px; }
+.drawer .actions { display: flex; gap: 6px; flex-wrap: wrap; margin: 12px 0; }
+.transcript { border: 1px solid #eaecef; border-radius: 6px; padding: 8px; margin-top: 8px; }
+.turn { padding: 4px 0; border-bottom: 1px dashed #eaecef; font-size: 12px; }
+.turn:last-child { border-bottom: 0; }
+.turn .who { font-weight: 600; }
+.turn.customer .who { color: #cf222e; }
+.turn.agent .who { color: #1a7f37; }
+.turn.bot .who, .turn.system .who { color: #8b949e; }
+.timeline { margin-top: 10px; font-size: 12px; }
+.timeline li { margin: 2px 0; color: #57606a; }
+.empty { color: #8b949e; padding: 20px; text-align: center; }
+.warn-banner { background: #fff8c5; border: 1px solid #eac54f; border-radius: 6px;
+  padding: 6px 10px; font-size: 12px; margin: 8px 0; }

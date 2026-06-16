@@ -15,20 +15,26 @@ from __future__ import annotations
 
 import logging
 import threading
+import logging
+import re
+import threading
 import time
 from typing import Any, Optional
 
 import psycopg2
 import psycopg2.extras
+import psycopg2.pool
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 import config
 import detector
-import psycopg2.pool
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("issue-engine")
+
+MXID_RE = re.compile(r"^@[A-Za-z0-9._=/+-]+:[A-Za-z0-9.-]+$")
 
 app = FastAPI(title="PixDesk Issue Engine", version="0.1.0")
 
@@ -76,6 +82,14 @@ def require_secret(authorization: str = Header(default="")) -> None:
         return
     if authorization != f"Bearer {config.ISSUE_API_SHARED_SECRET}":
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid bearer token")
+
+
+def require_actor(x_actor_mxid: str = Header(default="")) -> str:
+    """The human who triggered the action — recorded in issue_history.actor_mxid.
+    The BFF injects this from the signed session cookie; the engine trusts it."""
+    if not x_actor_mxid or not MXID_RE.match(x_actor_mxid):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "X-Actor-Mxid header required (@user:server)")
+    return x_actor_mxid
 
 
 # ---------------------------------------------------------------------------
@@ -278,3 +292,180 @@ def issue_detail(issue_id: str) -> Any:
             )
             item["history"] = _rows(cur)
     return item
+
+
+# ---------------------------------------------------------------------------
+# Write endpoints (human-in-the-loop). Require bearer + X-Actor-Mxid. Each
+# borrows a pooled connection and commits/rolls back explicitly; every action
+# writes an issue_history row stamped with the human actor (not the system
+# actor). The lifecycle transition graph is enforced for state-changing actions.
+# ---------------------------------------------------------------------------
+
+def _history(cur, issue_id: str, field: str, old: Any, new: Any, actor: str) -> None:
+    if old == new:
+        return
+    cur.execute(
+        """INSERT INTO issue.issue_history (issue_id, field, old_value, new_value, actor_mxid)
+           VALUES (%s, %s, %s, %s, %s)""",
+        (issue_id, field,
+         psycopg2.extras.Json(old) if old is not None else None,
+         psycopg2.extras.Json(new) if new is not None else None,
+         actor),
+    )
+
+
+def _fetch_issue(cur, issue_id: str) -> Optional[dict]:
+    cur.execute(
+        "SELECT id, lifecycle_state, review_state, ticket_id FROM issue.issues WHERE id = %s",
+        (issue_id,),
+    )
+    row = cur.fetchone()
+    return dict(row) if row else None
+
+
+class ReviewBody(BaseModel):
+    action: str            # confirm | reject | dismiss
+    note: Optional[str] = None
+
+
+@app.post("/v1/issues/{issue_id}/review", dependencies=[Depends(require_secret)])
+def review_issue(issue_id: str, body: ReviewBody, actor: str = Depends(require_actor)) -> Any:
+    """Human verdict on a detected issue.
+      confirm  -> review_state=confirmed (it's a real tracked problem; lifecycle
+                  unchanged so it stays on the unclosed list until truly closed).
+      reject/dismiss -> review_state=rejected, lifecycle_state=dismissed,
+                  nonclosure cleared (it leaves every dashboard).
+    """
+    if body.action not in ("confirm", "reject", "dismiss"):
+        raise HTTPException(400, "action must be confirm | reject | dismiss")
+    with _PooledConn() as conn:
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                issue = _fetch_issue(cur, issue_id)
+                if issue is None:
+                    raise HTTPException(404, "issue not found")
+                old_review = issue["review_state"]
+                old_life = issue["lifecycle_state"]
+                if body.action == "confirm":
+                    cur.execute(
+                        """UPDATE issue.issues
+                           SET review_state='confirmed', reviewed_by_mxid=%s, reviewed_at=now()
+                           WHERE id=%s""",
+                        (actor, issue_id),
+                    )
+                    _history(cur, issue_id, "review_confirmed",
+                             {"review_state": old_review}, {"review_state": "confirmed"}, actor)
+                else:  # reject | dismiss
+                    cur.execute(
+                        """UPDATE issue.issues
+                           SET review_state='rejected', lifecycle_state='dismissed',
+                               nonclosure_reason=NULL, reviewed_by_mxid=%s, reviewed_at=now(),
+                               closed_at=now()
+                           WHERE id=%s""",
+                        (actor, issue_id),
+                    )
+                    _history(cur, issue_id, "dismissed",
+                             {"lifecycle_state": old_life, "review_state": old_review},
+                             {"lifecycle_state": "dismissed", "review_state": "rejected",
+                              "note": body.note}, actor)
+            conn.commit()
+            return {"ok": True, "issue_id": issue_id, "action": body.action}
+        except HTTPException:
+            conn.rollback(); raise
+        except Exception as exc:
+            conn.rollback()
+            log.exception("review_issue failed")
+            raise HTTPException(500, f"review failed: {exc}")
+
+
+class MergeBody(BaseModel):
+    into_issue_id: str     # the survivor; this issue is merged into it
+
+
+@app.post("/v1/issues/{issue_id}/merge", dependencies=[Depends(require_secret)])
+def merge_issue(issue_id: str, body: MergeBody, actor: str = Depends(require_actor)) -> Any:
+    """Merge a duplicate/over-segmented issue into another. The source is
+    dismissed (review_state=merged, merged_into_issue_id set); its evidence
+    messages are repointed to the survivor (skipping any that would collide)."""
+    target = body.into_issue_id
+    if target == issue_id:
+        raise HTTPException(400, "cannot merge an issue into itself")
+    with _PooledConn() as conn:
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                src = _fetch_issue(cur, issue_id)
+                dst = _fetch_issue(cur, target)
+                if src is None or dst is None:
+                    raise HTTPException(404, "issue or target not found")
+                # Repoint evidence rows that don't already exist on the target.
+                cur.execute(
+                    """UPDATE issue.issue_messages m
+                       SET issue_id = %s
+                       WHERE m.issue_id = %s
+                         AND NOT EXISTS (
+                           SELECT 1 FROM issue.issue_messages t
+                           WHERE t.issue_id = %s AND t.platform = m.platform
+                             AND t.workspace_id = m.workspace_id
+                             AND t.channel_id = m.channel_id
+                             AND t.message_id = m.message_id)""",
+                    (target, issue_id, target),
+                )
+                cur.execute(
+                    """UPDATE issue.issues
+                       SET review_state='merged', lifecycle_state='dismissed',
+                           merged_into_issue_id=%s, nonclosure_reason=NULL,
+                           reviewed_by_mxid=%s, reviewed_at=now(), closed_at=now()
+                       WHERE id=%s""",
+                    (target, actor, issue_id),
+                )
+                cur.execute(
+                    """INSERT INTO issue.merge_links (kept_issue_id, merged_issue_id, actor_mxid)
+                       VALUES (%s, %s, %s)""",
+                    (target, issue_id, actor),
+                )
+                _history(cur, issue_id, "merged", None, {"into": target}, actor)
+                _history(cur, target, "merged_from", None, {"from": issue_id}, actor)
+            conn.commit()
+            return {"ok": True, "merged": issue_id, "into": target}
+        except HTTPException:
+            conn.rollback(); raise
+        except Exception as exc:
+            conn.rollback()
+            log.exception("merge_issue failed")
+            raise HTTPException(500, f"merge failed: {exc}")
+
+
+class PromoteBody(BaseModel):
+    ticket_id: str         # the ticket.tickets row the BFF already created
+
+
+@app.post("/v1/issues/{issue_id}/promote", dependencies=[Depends(require_secret)])
+def promote_issue(issue_id: str, body: PromoteBody, actor: str = Depends(require_actor)) -> Any:
+    """Link an issue to a ticket the caller (BFF) has already created via
+    ticket-api. The engine only records the link + review_state=promoted; it
+    does NOT create the ticket itself (keeps the ticket write path solely in
+    ticket-api). Lifecycle keeps tracking the chat so reopen still works."""
+    with _PooledConn() as conn:
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                issue = _fetch_issue(cur, issue_id)
+                if issue is None:
+                    raise HTTPException(404, "issue not found")
+                cur.execute(
+                    """UPDATE issue.issues
+                       SET review_state='promoted', ticket_id=%s,
+                           reviewed_by_mxid=%s, reviewed_at=now()
+                       WHERE id=%s""",
+                    (body.ticket_id, actor, issue_id),
+                )
+                _history(cur, issue_id, "promoted",
+                         {"review_state": issue["review_state"]},
+                         {"review_state": "promoted", "ticket_id": body.ticket_id}, actor)
+            conn.commit()
+            return {"ok": True, "issue_id": issue_id, "ticket_id": body.ticket_id}
+        except HTTPException:
+            conn.rollback(); raise
+        except Exception as exc:
+            conn.rollback()
+            log.exception("promote_issue failed")
+            raise HTTPException(500, f"promote failed: {exc}")

@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>客户问题闭环看板</title>
+  <link rel="stylesheet" href="style.css" />
+  <link rel="stylesheet" href="dashboard.css" />
+  <script src="lib/matrix-widget-api.js"></script>
+</head>
+<body>
+  <div id="app">
+    <header class="dash-header">
+      <h1>客户问题闭环看板</h1>
+      <div class="dash-tabs">
+        <button class="tab" data-tab="unclosed">未闭环</button>
+        <button class="tab" data-tab="rollup">按客户</button>
+        <button class="tab" data-tab="queue">审核队列</button>
+      </div>
+      <div id="status" class="status"></div>
+    </header>
+    <div id="view"></div>
+  </div>
+  <script src="dashboard.js"></script>
+</body>
+</html>

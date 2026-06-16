@@ -50,6 +50,19 @@ COOKIE_SECRET = os.environ["WIDGET_COOKIE_SECRET"]
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "http://192.168.72.185:8767")
 ELEMENT_ORIGIN = os.environ.get("ELEMENT_ORIGIN", "http://192.168.72.185:8080")
 
+# Issue engine (Closed-Loop Engine dashboard). The dashboard is cross-customer,
+# so unlike the room-scoped ticket views it is gated by a reviewer allowlist
+# rather than per-room membership.
+ISSUE_API_URL = os.environ.get("ISSUE_API_URL", "http://pixdesk-issue-engine:8768")
+ISSUE_API_SECRET = os.environ.get("ISSUE_API_SHARED_SECRET", "")
+# Comma-separated mxids allowed to use the dashboard. If empty, the dashboard
+# is DISABLED (403) — fail closed, since it exposes every customer's issues.
+# This is the single swap-point for the still-TBD reviewer-authz decision: to
+# switch to "members of a staff room", replace _is_reviewer's body.
+REVIEWER_ALLOWLIST = tuple(
+    s.strip() for s in os.environ.get("REVIEWER_ALLOWLIST", "").split(",") if s.strip()
+)
+
 COOKIE_NAME = "pixdesk_ticket_session"
 COOKIE_TTL_SECONDS = 50 * 60  # < OpenID 1h ceiling
 MEMBERSHIP_CACHE_TTL = 30  # seconds
@@ -322,6 +335,36 @@ async def _require_room_membership(mxid: str, room_id: str, *, write: bool = Fal
         raise HTTPException(403, f"{mxid} is not a member of {room_id}")
 
 
+def _is_reviewer(mxid: str) -> bool:
+    """Single swap-point for the (still-TBD) dashboard authorization policy.
+    Default: explicit allowlist. To switch to staff-room membership, replace the
+    body with an _is_room_member check against a configured staff room id."""
+    return bool(REVIEWER_ALLOWLIST) and mxid in REVIEWER_ALLOWLIST
+
+
+def require_reviewer(mxid: str = Depends(require_session)) -> str:
+    """Gate the cross-customer dashboard. Fails closed: if no allowlist is
+    configured, nobody gets in (the dashboard exposes every customer's issues)."""
+    if not _is_reviewer(mxid):
+        raise HTTPException(403, "not authorized for the issue dashboard")
+    return mxid
+
+
+async def _issue_proxy(
+    method: str, path: str, mxid: str,
+    *, params: Optional[dict] = None, json_body: Any = None,
+) -> httpx.Response:
+    """Proxy to the issue-engine with bearer + actor headers injected (actor from
+    the signed cookie, never the client)."""
+    assert _http is not None
+    headers = {"X-Actor-Mxid": mxid}
+    if ISSUE_API_SECRET:
+        headers["Authorization"] = f"Bearer {ISSUE_API_SECRET}"
+    return await _http.request(
+        method, f"{ISSUE_API_URL}{path}", params=params, json=json_body, headers=headers,
+    )
+
+
 def _require_ticket_in_room(ticket_id: str, room_id: str) -> None:
     if not _ticket_belongs_to_room(ticket_id, room_id):
         raise HTTPException(403, "ticket does not belong to this room")
@@ -516,3 +559,125 @@ async def get_customer(
 
 
 
+
+
+# ---------------------------------------------------------------------------
+# Issue dashboard (cross-customer, reviewer-gated). Static page + BFF proxy to
+# the issue-engine. Auth is the reviewer allowlist, NOT room membership.
+# ---------------------------------------------------------------------------
+
+
+@app.get("/dashboard/")
+@app.get("/dashboard")
+def dashboard_index() -> FileResponse:
+    return FileResponse(
+        os.path.join(STATIC_DIR, "dashboard.html"),
+        media_type="text/html",
+        headers=_security_headers(),
+    )
+
+
+@app.get("/api/v1/dashboard/unclosed")
+async def dash_unclosed(mxid: str = Depends(require_reviewer)) -> Any:
+    resp = await _issue_proxy("GET", "/v1/issues/unclosed", mxid)
+    return _passthrough(resp)
+
+
+@app.get("/api/v1/dashboard/rollup")
+async def dash_rollup(mxid: str = Depends(require_reviewer)) -> Any:
+    resp = await _issue_proxy("GET", "/v1/customers/rollup", mxid)
+    return _passthrough(resp)
+
+
+@app.get("/api/v1/dashboard/issues")
+async def dash_issues(
+    request: Request, mxid: str = Depends(require_reviewer),
+) -> Any:
+    params = dict(request.query_params)
+    resp = await _issue_proxy("GET", "/v1/issues", mxid, params=params)
+    return _passthrough(resp)
+
+
+@app.get("/api/v1/dashboard/issues/{issue_id}")
+async def dash_issue_detail(issue_id: str, mxid: str = Depends(require_reviewer)) -> Any:
+    resp = await _issue_proxy("GET", f"/v1/issues/{issue_id}", mxid)
+    return _passthrough(resp)
+
+
+class DashReviewBody(BaseModel):
+    action: str
+    note: Optional[str] = None
+
+
+@app.post("/api/v1/dashboard/issues/{issue_id}/review")
+async def dash_review(issue_id: str, body: DashReviewBody, mxid: str = Depends(require_reviewer)) -> Any:
+    resp = await _issue_proxy(
+        "POST", f"/v1/issues/{issue_id}/review", mxid, json_body=body.model_dump(),
+    )
+    return _passthrough(resp)
+
+
+class DashMergeBody(BaseModel):
+    into_issue_id: str
+
+
+@app.post("/api/v1/dashboard/issues/{issue_id}/merge")
+async def dash_merge(issue_id: str, body: DashMergeBody, mxid: str = Depends(require_reviewer)) -> Any:
+    resp = await _issue_proxy(
+        "POST", f"/v1/issues/{issue_id}/merge", mxid, json_body=body.model_dump(),
+    )
+    return _passthrough(resp)
+
+
+class DashPromoteBody(BaseModel):
+    subject: Optional[str] = None
+    priority: Optional[str] = "standard"
+
+
+@app.post("/api/v1/dashboard/issues/{issue_id}/promote", status_code=201)
+async def dash_promote(issue_id: str, body: DashPromoteBody, mxid: str = Depends(require_reviewer)) -> Any:
+    """Promote an issue to a real ticket. Orchestration lives in the BFF: it
+    reads the issue (for conversation_id + title), creates the ticket via
+    ticket-api (the sole ticket write path), then links the issue to it via the
+    engine. If the link step fails the ticket still exists — surfaced to the
+    caller so it can be reconciled, rather than silently dropping either side."""
+    detail = await _issue_proxy("GET", f"/v1/issues/{issue_id}", mxid)
+    if detail.status_code != 200:
+        return _passthrough(detail)
+    issue = detail.json() or {}
+    conversation_id = issue.get("conversation_id")
+    if not conversation_id:
+        raise HTTPException(409, "issue has no conversation_id; cannot promote")
+    subject = (body.subject or issue.get("title") or "").strip() or "客户问题"
+
+    # 1. Create the ticket via ticket-api (bearer + actor injected by _proxy).
+    create = await _proxy(
+        "POST", "/v1/tickets", mxid,
+        json_body={
+            "subject": subject,
+            "conversation_id": conversation_id,
+            "priority": body.priority or "standard",
+            "metadata": {"promoted_from_issue": issue_id,
+                         "issue_code": issue.get("code")},
+        },
+    )
+    if create.status_code not in (200, 201):
+        return _passthrough(create)
+    ticket = create.json() or {}
+    ticket_id = ticket.get("id")
+    if not ticket_id:
+        raise HTTPException(502, "ticket-api did not return a ticket id")
+
+    # 2. Link the issue to the ticket via the engine.
+    link = await _issue_proxy(
+        "POST", f"/v1/issues/{issue_id}/promote", mxid,
+        json_body={"ticket_id": ticket_id},
+    )
+    if link.status_code != 200:
+        # Ticket exists but link failed — report both so the operator can fix up.
+        raise HTTPException(
+            502,
+            f"ticket {ticket_id} created but issue link failed: "
+            f"{link.status_code} {link.text[:200]}",
+        )
+    return {"ok": True, "issue_id": issue_id, "ticket": ticket}
