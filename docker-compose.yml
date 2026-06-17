@@ -253,5 +253,10 @@ services:
       ISSUE_LLM_API_KEY: "${ISSUE_LLM_API_KEY:-}"
       ISSUE_LLM_MODEL: "${ISSUE_LLM_MODEL:-}"
       ISSUE_LLM_DAILY_BUDGET_CNY: "${ISSUE_LLM_DAILY_BUDGET_CNY:-0}"
+      ISSUE_LLM_PER_TICK_BUDGET: "${ISSUE_LLM_PER_TICK_BUDGET:-100}"
+      # Auto-merge of over-segmented issues (P4f). Off by default; enable only
+      # after validate_merge.py shows acceptable accuracy on real data.
+      ISSUE_AUTO_MERGE: "${ISSUE_AUTO_MERGE:-}"
+      ISSUE_MERGE_WINDOW_DAYS: "${ISSUE_MERGE_WINDOW_DAYS:-30}"
     ports:
       - "127.0.0.1:8768:8768"

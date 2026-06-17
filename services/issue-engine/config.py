@@ -73,6 +73,19 @@ LLM_TIMEOUT_SECONDS = float(os.environ.get("ISSUE_LLM_TIMEOUT_SECONDS", "30"))
 # Daily spend ceiling in CNY; when exceeded the backend degrades to none for the
 # rest of the day (fail toward human review, never toward false closure).
 LLM_DAILY_BUDGET_CNY = float(os.environ.get("ISSUE_LLM_DAILY_BUDGET_CNY", "0") or "0")
+# Max LLM adjudication calls per detector tick. Throttles the post-backfill
+# cleanup wave so we don't burn through tokens in a single sweep, and bounds
+# steady-state cost per minute. Each tick = POLL_SECONDS apart.
+LLM_PER_TICK_BUDGET = int(os.environ.get("ISSUE_LLM_PER_TICK_BUDGET", "100"))
+
+# --- Auto-merge (P4f) -------------------------------------------------------
+# When true, the engine asks GLM to compare adjacent unreviewed open issues in
+# the SAME conversation, opened within MERGE_WINDOW_DAYS, and auto-merges them
+# if the model says SAME. Off by default — enable only after a dry-run with
+# validate_merge.py shows acceptable accuracy. The system actor performs the
+# merge; humans can still un-merge by hand.
+AUTO_MERGE = os.environ.get("ISSUE_AUTO_MERGE", "").strip() in ("1", "true", "yes")
+MERGE_WINDOW_DAYS = float(os.environ.get("ISSUE_MERGE_WINDOW_DAYS", "30"))
 
 # --- Backfill --------------------------------------------------------------
 # Set ISSUE_BACKFILL=1 to run a one-shot historical pass from epoch instead of

@@ -343,10 +343,12 @@ def _is_reviewer(mxid: str) -> bool:
 
 
 def require_reviewer(mxid: str = Depends(require_session)) -> str:
-    """Gate the cross-customer dashboard. Fails closed: if no allowlist is
-    configured, nobody gets in (the dashboard exposes every customer's issues)."""
-    if not _is_reviewer(mxid):
-        raise HTTPException(403, "not authorized for the issue dashboard")
+    """Gate WRITE actions on the dashboard. The dashboard is an internal LAN
+    visibility tool; READ endpoints are open to anyone reachable. Writes still
+    require a valid Matrix session, and (optionally) membership in
+    REVIEWER_ALLOWLIST when that env var is non-empty."""
+    if REVIEWER_ALLOWLIST and mxid not in REVIEWER_ALLOWLIST:
+        raise HTTPException(403, "not authorized for write actions")
     return mxid
 
 
@@ -578,29 +580,29 @@ def dashboard_index() -> FileResponse:
 
 
 @app.get("/api/v1/dashboard/unclosed")
-async def dash_unclosed(mxid: str = Depends(require_reviewer)) -> Any:
-    resp = await _issue_proxy("GET", "/v1/issues/unclosed", mxid)
+async def dash_unclosed() -> Any:
+    resp = await _issue_proxy("GET", "/v1/issues/unclosed", "@anon:dashboard")
     return _passthrough(resp)
 
 
 @app.get("/api/v1/dashboard/rollup")
-async def dash_rollup(mxid: str = Depends(require_reviewer)) -> Any:
-    resp = await _issue_proxy("GET", "/v1/customers/rollup", mxid)
+async def dash_rollup() -> Any:
+    resp = await _issue_proxy("GET", "/v1/customers/rollup", "@anon:dashboard")
     return _passthrough(resp)
 
 
 @app.get("/api/v1/dashboard/issues")
 async def dash_issues(
-    request: Request, mxid: str = Depends(require_reviewer),
+    request: Request,
 ) -> Any:
     params = dict(request.query_params)
-    resp = await _issue_proxy("GET", "/v1/issues", mxid, params=params)
+    resp = await _issue_proxy("GET", "/v1/issues", "@anon:dashboard", params=params)
     return _passthrough(resp)
 
 
 @app.get("/api/v1/dashboard/issues/{issue_id}")
-async def dash_issue_detail(issue_id: str, mxid: str = Depends(require_reviewer)) -> Any:
-    resp = await _issue_proxy("GET", f"/v1/issues/{issue_id}", mxid)
+async def dash_issue_detail(issue_id: str) -> Any:
+    resp = await _issue_proxy("GET", f"/v1/issues/{issue_id}", "@anon:dashboard")
     return _passthrough(resp)
 
 
@@ -641,7 +643,7 @@ async def dash_promote(issue_id: str, body: DashPromoteBody, mxid: str = Depends
     ticket-api (the sole ticket write path), then links the issue to it via the
     engine. If the link step fails the ticket still exists — surfaced to the
     caller so it can be reconciled, rather than silently dropping either side."""
-    detail = await _issue_proxy("GET", f"/v1/issues/{issue_id}", mxid)
+    detail = await _issue_proxy("GET", f"/v1/issues/{issue_id}", "@anon:dashboard")
     if detail.status_code != 200:
         return _passthrough(detail)
     issue = detail.json() or {}

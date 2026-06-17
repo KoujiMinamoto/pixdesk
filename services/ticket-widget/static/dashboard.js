@@ -126,8 +126,15 @@
     }
     let resp = await fetch(path, init);
     if (resp.status === 401) {
-      await obtainSession();
-      resp = await fetch(path, init);
+      // Read endpoints are open; a 401 here means a WRITE call without a
+      // session. Try OpenID once if we are inside Element; otherwise give a
+      // clear message instead of silently failing.
+      if (widgetApi) {
+        await obtainSession();
+        resp = await fetch(path, init);
+      } else {
+        throw new Error("写操作需登录:请在 Element 中打开看板,或联系管理员开放独立登录页");
+      }
     }
     if (resp.status === 403) {
       throw new Error("无权限:你的账号不在审核员名单里(请联系管理员配置 REVIEWER_ALLOWLIST)");
@@ -352,8 +359,8 @@
     b.addEventListener("click", () => switchTab(b.dataset.tab)));
 
   (async function boot() {
-    try { await obtainSession(); }
-    catch (e) { setStatus(String(e.message || e), "error"); }
+    // Reads are open — no upfront login. Only kick OpenID when a 401 hits us
+    // (or a write action runs). On a fresh open this just loads data.
     switchTab("unclosed");
   })();
 

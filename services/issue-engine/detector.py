@@ -27,6 +27,7 @@ import psycopg2.extras
 
 import config
 import markers
+import llm
 
 log = logging.getLogger("issue-engine.detector")
 
@@ -409,6 +410,154 @@ def _record_history(cur, issue_id, field, old, new):
     )
 
 
+# ---------------------------------------------------------------------------
+# LLM adjudication (P4)
+#
+# Runs in upsert_issue's transaction so the LLM verdict, the issue.issues
+# update, the issue_history entry, and the issue_signals row all commit
+# atomically. Per-tick budget caps cost; overshooting just defers
+# adjudication to the next tick (the heuristic verdict still stands until
+# then). Hard invariants:
+#   * Silence still NEVER closes — adjudicate only DOWNGRADES (never upgrades
+#     to closed_*).
+#   * Any LLM error => uncertain => human queue (no automation kicks in).
+#   * Each LLM call writes one issue_signals row, regardless of verdict.
+# ---------------------------------------------------------------------------
+
+# Per-tick LLM call counter, reset by reset_llm_budget() at the top of every
+# tick(). Single detector thread so a module-level int is safe.
+_llm_calls_this_tick = 0
+
+
+def reset_llm_budget() -> None:
+    global _llm_calls_this_tick
+    _llm_calls_this_tick = 0
+
+
+def _llm_budget_ok() -> bool:
+    return _llm_calls_this_tick < config.LLM_PER_TICK_BUDGET
+
+
+def _format_transcript(turns: list[dict[str, Any]], *, max_chars: int = 2000) -> str:
+    """Compact, role-tagged excerpt for the LLM. Trim from the END (i.e. keep
+    the head: the problem statement matters most for is-problem judgments;
+    closure judgments need the head AND tail, so we keep both with a marker
+    when truncated)."""
+    lines: list[str] = []
+    for t in turns:
+        role = t.get("role") or "?"
+        text = (t.get("text") or "").replace("\n", " ").strip()
+        if not text:
+            continue
+        lines.append(f"[{role}] {text}")
+    full = "\n".join(lines)
+    if len(full) <= max_chars:
+        return full
+    # Keep head 60% / tail 40% with a marker, so we don't hide the resolution
+    # turn at the end.
+    head = int(max_chars * 0.6)
+    tail = max_chars - head - 30
+    return full[:head] + "\n... [truncated] ...\n" + full[-tail:]
+
+
+def _record_signal(cur, issue_id: str, evaluator: str, llm_out: dict,
+                   *, score: float | None = None) -> None:
+    """One row per LLM call, with the structured verdict + token usage. Cost
+    is recorded as the raw token total in micros so the dashboard can sum it
+    without caring about per-model pricing here."""
+    pt = int(llm_out.get("prompt_tokens", 0))
+    ct = int(llm_out.get("completion_tokens", 0))
+    cost_micros = (pt + ct)  # raw tokens; dashboard converts to ¥ if it wants
+    verdict = llm_out.get("verdict")
+    signals = {
+        "verdict": verdict,
+        "reason": llm_out.get("reason"),
+        "raw": (llm_out.get("raw") or "")[-300:],  # tail only — egress hygiene
+        "model": llm_out.get("model"),
+        "prompt_tokens": pt,
+        "completion_tokens": ct,
+    }
+    # Map our internal verdict tags to the issue_signals CHECK enum.
+    enum_verdict = None
+    if verdict in ("likely_closed", "likely_open", "uncertain"):
+        enum_verdict = verdict
+    cur.execute(
+        """
+        INSERT INTO issue.issue_signals
+          (issue_id, evaluator, closure_score, signals, verdict, cost_micros)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        """,
+        (issue_id, evaluator, score, psycopg2.extras.Json(signals),
+         enum_verdict, cost_micros),
+    )
+
+
+def _has_recent_signal(cur, issue_id: str, evaluator: str) -> bool:
+    """Has this evaluator already produced a non-uncertain verdict for this
+    issue? Idempotency guard so the cleanup wave doesn't burn tokens
+    re-judging the same issue every tick."""
+    cur.execute(
+        """SELECT 1 FROM issue.issue_signals
+           WHERE issue_id = %s AND evaluator = %s
+             AND verdict IN ('likely_closed','likely_open')
+           LIMIT 1""",
+        (issue_id, evaluator),
+    )
+    return cur.fetchone() is not None
+
+
+def adjudicate(cur, issue_id: str, d: dict[str, Any]) -> tuple[str, Optional[str], Optional[str]]:
+    """Run LLM checks against the heuristic verdict. Returns the (possibly
+    overridden) (lifecycle_state, nonclosure_reason, closure_reason) that the
+    caller should write. Per-tick budgeted; bypassed when llm.enabled() is
+    False (heuristic verdict passes through unchanged)."""
+    global _llm_calls_this_tick
+    state = d["lifecycle_state"]
+    nc = d["nonclosure_reason"]
+    cr = d["closure_reason"]
+    if not llm.enabled():
+        return state, nc, cr
+
+    transcript = _format_transcript(d["turns"])
+    if not transcript:
+        return state, nc, cr
+
+    # 1) PROBLEM FILTER (TELEMETRY ONLY). After dry-run on 30 real issues
+    #    showed 0/30 not_a_problem (real customer support traffic looks like
+    #    real problems even when terse), we DON'T auto-dismiss anymore. The
+    #    verdict is recorded into issue_signals so a human reviewer can see
+    #    it, but the lifecycle stays whatever the heuristic chose. Also: when
+    #    AUTO_MERGE is on, skip this call entirely so the per-tick budget
+    #    goes to merges (which actually change anything).
+    if state in ("active", "awaiting_agent", "awaiting_customer", "detected") \
+            and not config.AUTO_MERGE \
+            and not _has_recent_signal(cur, issue_id, "llm-problem-filter") \
+            and _llm_budget_ok():
+        out = llm.judge_is_problem(transcript)
+        _llm_calls_this_tick += 1
+        _record_signal(cur, issue_id, "llm-problem-filter", out)
+        # No state mutation; signal serves as transparency only.
+
+    # 2) CLOSURE CHALLENGE. Heuristic said closed_inferred; ask the model to
+    #    argue OPEN. If it finds anything, veto. Silence-only inferred closures
+    #    don't reach this path because derive() doesn't infer closure from
+    #    silence (only from customer_thanked + agent_proposed).
+    if state == "closed_inferred" \
+            and not _has_recent_signal(cur, issue_id, "llm-closure-challenge") \
+            and _llm_budget_ok():
+        out = llm.judge_closure_challenge(transcript)
+        _llm_calls_this_tick += 1
+        _record_signal(cur, issue_id, "llm-closure-challenge", out)
+        if out.get("verdict") == "likely_open":
+            log.info("issue %s closure VETOED by challenge", issue_id)
+            # Re-derive a non-closed state from the heuristic signals: if there
+            # was a real customer follow-up the heuristic missed, the safest
+            # bet is awaiting_agent (ball back in our court) and re-flag.
+            return "awaiting_agent", "reopened", None
+
+    return state, nc, cr
+
+
 def upsert_issue(conn, conv: dict[str, Any], d: dict[str, Any]) -> Optional[str]:
     """Insert or extend the issue for this segment. Idempotent on
     (conversation_id, segment_key) while the issue is active. Respects the
@@ -468,6 +617,29 @@ def upsert_issue(conn, conv: dict[str, Any], d: dict[str, Any]) -> Optional[str]
             if d["nonclosure_reason"]:
                 _record_history(cur, issue_id, "nonclosure_flagged", None,
                                 {"reason": d["nonclosure_reason"]})
+
+            # LLM adjudication may downgrade the verdict. Runs in this same
+            # transaction so the issue_signals row, the lifecycle change, and
+            # the history entry commit atomically.
+            adj_state, adj_nc, adj_cr = adjudicate(cur, str(issue_id), d)
+            if adj_state != new_state or adj_nc != d["nonclosure_reason"] \
+                    or adj_cr != d["closure_reason"]:
+                cur.execute(
+                    """UPDATE issue.issues
+                       SET lifecycle_state = %s, nonclosure_reason = %s,
+                           closure_reason = %s,
+                           closed_at = CASE WHEN %s = 'dismissed' THEN now()
+                                            ELSE closed_at END
+                       WHERE id = %s""",
+                    (adj_state, adj_nc, adj_cr, adj_state, issue_id),
+                )
+                _record_history(cur, str(issue_id), "llm_adjudicated",
+                                {"lifecycle_state": new_state,
+                                 "nonclosure_reason": d["nonclosure_reason"],
+                                 "closure_reason": d["closure_reason"]},
+                                {"lifecycle_state": adj_state,
+                                 "nonclosure_reason": adj_nc,
+                                 "closure_reason": adj_cr})
         else:
             issue_id = existing["id"]
             # Human boundary: do not touch issues a person has acted on.
@@ -513,6 +685,29 @@ def upsert_issue(conn, conv: dict[str, Any], d: dict[str, Any]) -> Optional[str]
                                 {"reason": existing["nonclosure_reason"]},
                                 {"reason": d["nonclosure_reason"]})
 
+            # LLM adjudication on existing issues — only re-runs filters that
+            # haven't yielded a final verdict yet (the _has_recent_signal
+            # guard inside adjudicate handles idempotency).
+            adj_state, adj_nc, adj_cr = adjudicate(cur, str(issue_id), {**d, "lifecycle_state": target})
+            if adj_state != target or adj_nc != d["nonclosure_reason"] \
+                    or adj_cr != d["closure_reason"]:
+                cur.execute(
+                    """UPDATE issue.issues
+                       SET lifecycle_state = %s, nonclosure_reason = %s,
+                           closure_reason = %s,
+                           closed_at = CASE WHEN %s = 'dismissed' AND closed_at IS NULL
+                                            THEN now() ELSE closed_at END
+                       WHERE id = %s""",
+                    (adj_state, adj_nc, adj_cr, adj_state, issue_id),
+                )
+                _record_history(cur, str(issue_id), "llm_adjudicated",
+                                {"lifecycle_state": target,
+                                 "nonclosure_reason": d["nonclosure_reason"],
+                                 "closure_reason": d["closure_reason"]},
+                                {"lifecycle_state": adj_state,
+                                 "nonclosure_reason": adj_nc,
+                                 "closure_reason": adj_cr})
+
         _write_evidence(cur, issue_id, d)
         return str(issue_id)
 
@@ -551,6 +746,163 @@ def _write_evidence(cur, issue_id, d: dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Auto-merge of over-segmented issues (P4f)
+#
+# Heuristic time-gap segmentation cuts a single in-progress problem into many
+# "issues" because support follow-ups span days. After the heuristic pass, ask
+# GLM to compare adjacent unreviewed open issues in the same conversation and
+# merge those it judges to be the same underlying problem. Skips human-touched
+# issues entirely. Idempotent: a SAME verdict already recorded on a pair is not
+# re-evaluated.
+#
+# Failure semantics: any LLM error or uncertain verdict leaves the pair split.
+# False merges (hiding distinct problems behind one row) are worse than false
+# splits (more rows for a human to glance at).
+# ---------------------------------------------------------------------------
+
+def _issue_transcript(conn, issue_id: str, *, max_chars: int = 1200) -> str:
+    """Build the same minimal transcript used by validate_merge.py for one
+    issue's evidence rows. Trim from the middle so head + tail survive."""
+    with dict_cur(conn) as cur:
+        cur.execute(
+            """SELECT im.role, am.text, am.ts
+               FROM issue.issue_messages im
+               LEFT JOIN agent.messages am
+                 ON am.platform = im.platform AND am.workspace_id = im.workspace_id
+                AND am.channel_id = im.channel_id AND am.message_id = im.message_id
+               WHERE im.issue_id = %s
+               ORDER BY am.ts NULLS LAST
+               LIMIT 50""",
+            (issue_id,),
+        )
+        rows = cur.fetchall()
+    lines = []
+    for r in rows:
+        text = (r.get("text") or "").replace("\n", " ").strip()
+        if not text:
+            continue
+        lines.append(f"[{r.get('role') or '?'}] {text}")
+    full = "\n".join(lines)
+    if len(full) <= max_chars:
+        return full
+    head = int(max_chars * 0.6)
+    tail = max_chars - head - 30
+    return full[:head] + "\n... [truncated] ...\n" + full[-tail:]
+
+
+def _merge_pair_already_judged(cur, src_id: str, dst_id: str) -> bool:
+    """Have we already evaluated this exact pair this run? Tracked in
+    issue_signals on the source issue with evaluator='llm-merge:<dst>'."""
+    cur.execute(
+        """SELECT 1 FROM issue.issue_signals
+           WHERE issue_id = %s AND evaluator = %s
+             AND verdict IN ('likely_closed','likely_open')
+           LIMIT 1""",
+        (src_id, f"llm-merge:{dst_id}"),
+    )
+    return cur.fetchone() is not None
+
+
+def _do_merge(cur, src_id: str, dst_id: str) -> None:
+    """Re-point src's evidence onto dst (skipping rows already on dst), mark
+    src as merged, write the merge_links audit row + history on both sides.
+    Mirrors the manual /merge endpoint in main.py."""
+    cur.execute(
+        """UPDATE issue.issue_messages m
+           SET issue_id = %s
+           WHERE m.issue_id = %s
+             AND NOT EXISTS (
+               SELECT 1 FROM issue.issue_messages t
+               WHERE t.issue_id = %s AND t.platform = m.platform
+                 AND t.workspace_id = m.workspace_id AND t.channel_id = m.channel_id
+                 AND t.message_id = m.message_id)""",
+        (dst_id, src_id, dst_id),
+    )
+    cur.execute(
+        """UPDATE issue.issues
+           SET review_state='merged', lifecycle_state='dismissed',
+               merged_into_issue_id=%s, nonclosure_reason=NULL,
+               reviewed_by_mxid=%s, reviewed_at=now(), closed_at=now()
+           WHERE id=%s""",
+        (dst_id, config.SYSTEM_ACTOR, src_id),
+    )
+    cur.execute(
+        """INSERT INTO issue.merge_links (kept_issue_id, merged_issue_id, actor_mxid)
+           VALUES (%s, %s, %s)""",
+        (dst_id, src_id, config.SYSTEM_ACTOR),
+    )
+    _record_history(cur, src_id, "merged", None,
+                    {"into": dst_id, "by": "auto-merge"})
+    _record_history(cur, dst_id, "merged_from", None,
+                    {"from": src_id, "by": "auto-merge"})
+
+
+def merge_overcut_issues(conn, conversation_id: str) -> int:
+    """For one conversation: ask GLM to compare adjacent unreviewed open
+    issues; auto-merge each SAME pair into the older issue. Returns count of
+    merges performed. No-op when AUTO_MERGE is off or the LLM is disabled.
+
+    Walks pairs left-to-right, so a SAME-SAME chain (A,B,C) collapses A->B then
+    A,C — but since B is now dismissed we re-walk from the survivor list, so
+    chains end up A<-merged C (A as the kept survivor)."""
+    global _llm_calls_this_tick
+    if not config.AUTO_MERGE or not llm.enabled():
+        return 0
+    merged = 0
+    while True:
+        with dict_cur(conn) as cur:
+            cur.execute(
+                """SELECT id, opened_at, title
+                   FROM issue.issues
+                   WHERE conversation_id = %s
+                     AND review_state = 'unreviewed'
+                     AND lifecycle_state NOT IN ('closed_confirmed','dismissed')
+                   ORDER BY opened_at""",
+                (conversation_id,),
+            )
+            issues = cur.fetchall()
+        if len(issues) < 2 or not _llm_budget_ok():
+            break
+
+        progress = False
+        for a, b in zip(issues, issues[1:]):
+            if not _llm_budget_ok():
+                break
+            if not (a["opened_at"] and b["opened_at"]):
+                continue
+            gap_days = (b["opened_at"] - a["opened_at"]).total_seconds() / 86400
+            if gap_days > config.MERGE_WINDOW_DAYS:
+                continue
+            with dict_cur(conn) as cur:
+                if _merge_pair_already_judged(cur, str(b["id"]), str(a["id"])):
+                    continue
+                ta = _issue_transcript(conn, str(a["id"]))
+                tb = _issue_transcript(conn, str(b["id"]))
+            if not ta or not tb:
+                continue
+            out = llm.judge_same_problem(ta, tb)
+            _llm_calls_this_tick += 1
+            with conn.cursor() as cur:
+                # Record the verdict on the SRC (the one that may be merged
+                # away), keyed by the DST so the same pair isn't re-judged.
+                _record_signal(
+                    cur, str(b["id"]), f"llm-merge:{a['id']}", out,
+                    score=1.0 if out.get("verdict") == "same_problem" else 0.0,
+                )
+                if out.get("verdict") == "same_problem":
+                    _do_merge(cur, str(b["id"]), str(a["id"]))
+                    merged += 1
+                    progress = True
+                    log.info("auto-merge: %s -> %s", b["id"], a["id"])
+                    conn.commit()
+                    break  # restart with refreshed list (b is gone)
+            conn.commit()
+        if not progress:
+            break
+    return merged
+
+
+# ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
 
@@ -574,6 +926,14 @@ def process_conversation(conn, conversation_id: str, now: dt.datetime) -> Option
             if upsert_issue(conn, conv, d):
                 touched += 1
         conn.commit()
+        # Auto-merge runs AFTER the heuristic pass commits, so even if it
+        # fails partway the new/updated issues are already saved. It commits
+        # per-merge internally.
+        try:
+            merge_overcut_issues(conn, conversation_id)
+        except Exception:
+            conn.rollback()
+            log.exception("auto-merge skipped for %s", conversation_id)
         return touched
     except Exception:
         conn.rollback()
@@ -652,6 +1012,7 @@ def tick(conn, now: Optional[dt.datetime] = None) -> dict[str, int]:
     tick (it is retried next tick); it cannot be silently skipped. Processing
     more than BATCH_SIZE conversations simply continues on the next tick."""
     now = now or dt.datetime.now(UTC)
+    reset_llm_budget()
     since_ts, since_conv = _get_cursor(conn)
     rows = _due_conversations(conn, since_ts, since_conv, config.BATCH_SIZE)
 
@@ -753,6 +1114,7 @@ def backfill(conn) -> dict[str, int]:
     pages = 0
     consecutive_stalls = 0
     while True:
+        reset_llm_budget()
         since_ts, since_conv = _get_cursor(conn)
         rows = _due_conversations(conn, since_ts, since_conv, config.BATCH_SIZE)
         if not rows:
