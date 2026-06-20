@@ -11,6 +11,18 @@ import os
 # --- DB --------------------------------------------------------------------
 DATABASE_URL = os.environ["DATABASE_URL"]
 
+# Postgres schema that holds issue.* tables. Default "issue" matches the
+# publisher (185). Tenant deployments (e.g. the Tencent mirror) use a separate
+# schema like "issue_tc" so they can write locally without conflicting with
+# logical replication of the publisher's "issue" schema. Validated against a
+# strict allowlist because it's interpolated into f-string SQL.
+import re as _re
+SCHEMA = os.environ.get("ISSUE_SCHEMA", "issue").strip()
+if not _re.match(r"^[a-z_][a-z0-9_]{0,62}$", SCHEMA):
+    raise RuntimeError(
+        f"ISSUE_SCHEMA must match ^[a-z_][a-z0-9_]*$ (got {SCHEMA!r})"
+    )
+
 # --- Service identity / auth ----------------------------------------------
 # Bearer secret for the (future) BFF -> issue-engine trust boundary, mirroring
 # ticket-api. Read endpoints in P1 are localhost-only; the secret gates writes.
@@ -73,6 +85,14 @@ LLM_TIMEOUT_SECONDS = float(os.environ.get("ISSUE_LLM_TIMEOUT_SECONDS", "30"))
 # Daily spend ceiling in CNY; when exceeded the backend degrades to none for the
 # rest of the day (fail toward human review, never toward false closure).
 LLM_DAILY_BUDGET_CNY = float(os.environ.get("ISSUE_LLM_DAILY_BUDGET_CNY", "0") or "0")
+
+# Dashboard hides issues with last_activity_at older than this floor. The
+# detector + distiller still see full history (so a thread starting in May
+# that gets followed up in June produces ONE issue whose last_activity_at
+# falls in June and stays visible). Default 2026-06-01 by user decision
+# 2026-06-20: pre-June issues are dust, hide them. Set to empty string to
+# disable.
+TIME_FLOOR = os.environ.get("ISSUE_DASHBOARD_TIME_FLOOR", "2026-06-01").strip()
 # Max LLM adjudication calls per detector tick. Throttles the post-backfill
 # cleanup wave so we don't burn through tokens in a single sweep, and bounds
 # steady-state cost per minute. Each tick = POLL_SECONDS apart.

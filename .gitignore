@@ -23,3 +23,6 @@ __pycache__/
 node_modules/
 dist/
 out/
+
+# Generated analysis output. Contains real customer chat text — never commit.
+reports/

@@ -14,8 +14,7 @@ endpoints (confirm/reject/merge/promote) and reviewer auth land in P2.
 from __future__ import annotations
 
 import logging
-import threading
-import logging
+import os
 import re
 import threading
 import time
@@ -29,7 +28,15 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 import config
+from config import SCHEMA, TIME_FLOOR
 import detector
+import distill
+
+# Dashboard read endpoints filter by last_activity_at >= TIME_FLOOR. Built once
+# so every endpoint shares the same predicate. Two flavors because some queries
+# use an alias and some don't:
+TIME_FLOOR_BARE = f"last_activity_at >= '{TIME_FLOOR}'" if TIME_FLOOR else "TRUE"
+TIME_FLOOR_ALIAS = f"i.last_activity_at >= '{TIME_FLOOR}'" if TIME_FLOOR else "TRUE"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("issue-engine")
@@ -121,11 +128,53 @@ def _detector_loop() -> None:
         _stop.wait(config.POLL_SECONDS)
 
 
+def _distill_loop() -> None:
+    """Periodically re-distill every channel that has a channel_memory row.
+    The first row for any channel is created manually via distill_cli.py
+    --reset (P5d bootstrap); after that, this loop keeps it fresh.
+
+    Default interval: 12 h. Override with ISSUE_DISTILL_INTERVAL_SECONDS.
+    Each pass walks every opted-in channel sequentially; per-channel
+    distill.run is incremental (reads watermark, only sends new messages)
+    so cost scales with new traffic, not channel size."""
+    interval = int(os.environ.get("ISSUE_DISTILL_INTERVAL_SECONDS", "43200"))
+    # Wait a bit on startup so detector + DB are warm before the first pass.
+    _stop.wait(60)
+    log.info("distill thread started (interval=%ds)", interval)
+    while not _stop.is_set():
+        try:
+            conn = psycopg2.connect(config.DATABASE_URL)
+            conn.autocommit = False
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    f"""SELECT cm.platform, cm.workspace_id, cm.channel_id,
+                              cm.channel_name, cm.last_distilled_ts
+                       FROM {SCHEMA}.channel_memory cm
+                       ORDER BY cm.last_run_at NULLS FIRST"""
+                )
+                channels = [dict(r) for r in cur.fetchall()]
+            log.info("distill pass: %d opted-in channels", len(channels))
+            for ch in channels:
+                try:
+                    res = distill.run(conn, ch)
+                    log.info("distill: %s -> %s", ch.get("channel_name"), res)
+                except Exception:
+                    conn.rollback()
+                    log.exception("distill failed for %s", ch.get("channel_name"))
+            try:
+                conn.close()
+            except Exception:
+                pass
+        except Exception:
+            log.exception("distill pass failed")
+        _stop.wait(interval)
+
+
 @app.on_event("startup")
 def _startup() -> None:
     _get_pool()  # warm the read pool
-    t = threading.Thread(target=_detector_loop, name="detector", daemon=True)
-    t.start()
+    threading.Thread(target=_detector_loop, name="detector", daemon=True).start()
+    threading.Thread(target=_distill_loop, name="distill", daemon=True).start()
     log.info("issue-engine started")
 
 
@@ -148,7 +197,7 @@ def healthz() -> Any:
     try:
         with _PooledConn() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT count(*) FROM issue.issues")
+                cur.execute(f"SELECT count(*) FROM {SCHEMA}.issues")
                 n = cur.fetchone()[0]
         return {"ok": True, "issues": n, "llm_backend": config.LLM_BACKEND}
     except Exception as exc:
@@ -180,7 +229,8 @@ def list_issues(
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
 ) -> Any:
-    where = ["lifecycle_state NOT IN ('closed_confirmed','dismissed')"]
+    where = ["lifecycle_state NOT IN ('closed_confirmed','dismissed')",
+             TIME_FLOOR_BARE]
     args: list[Any] = []
     if nonclosure_only:
         where.append("nonclosure_reason IS NOT NULL")
@@ -199,7 +249,7 @@ def list_issues(
                review_state, nonclosure_reason, closure_reason, last_speaker,
                last_customer_at, last_agent_at, message_count, opened_at,
                last_activity_at, sla_due_at, reopened_count
-        FROM issue.issues
+        FROM {SCHEMA}.issues
         WHERE {' AND '.join(where)}
         ORDER BY (nonclosure_reason IS NOT NULL) DESC, last_activity_at ASC
         LIMIT %s OFFSET %s
@@ -218,13 +268,13 @@ def unclosed() -> Any:
     with _PooledConn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
-                """
+                f"""
                 SELECT i.id, i.code, i.customer_platform, i.customer_workspace_id,
                        i.external_party_name, i.title, i.lifecycle_state,
                        i.nonclosure_reason, i.last_speaker, i.last_customer_at,
                        i.sla_due_at, i.last_activity_at,
                        ch.channel_name
-                FROM issue.issues i
+                FROM {SCHEMA}.issues i
                 LEFT JOIN agent.channels ch
                   ON ch.platform = i.customer_platform
                  AND ch.workspace_id = i.customer_workspace_id
@@ -232,6 +282,7 @@ def unclosed() -> Any:
                 WHERE i.nonclosure_reason IS NOT NULL
                   AND i.review_state = 'unreviewed'
                   AND i.lifecycle_state NOT IN ('closed_confirmed','dismissed')
+                  AND {TIME_FLOOR_ALIAS}
                 ORDER BY i.last_activity_at ASC
                 LIMIT 500
                 """
@@ -242,52 +293,187 @@ def unclosed() -> Any:
 
 @app.get("/v1/customers/rollup", dependencies=[Depends(require_secret)])
 def rollup() -> Any:
-    """Per-customer counts: how many unclosed, how stale, for the dashboard."""
+    """Per-channel rollup. One row per (platform, workspace_id, channel_id) so
+    Slack workspaces with many ext channels show each one separately. Returns
+    counts for both unclosed (ball in our court) and closed_inferred so the UI
+    can render a progress bar per customer."""
     with _PooledConn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
-                """
+                f"""
                 SELECT i.customer_platform, i.customer_workspace_id,
+                       i.customer_channel_id,
                        max(ch.channel_name) AS channel_name,
-                       count(*) FILTER (WHERE i.nonclosure_reason IS NOT NULL) AS unclosed,
-                       count(*) AS total_open,
-                       min(i.last_activity_at) FILTER (WHERE i.nonclosure_reason IS NOT NULL)
-                         AS oldest_unclosed_at
-                FROM issue.issues i
+                       count(*) FILTER (WHERE i.nonclosure_reason IS NOT NULL
+                                          AND i.lifecycle_state NOT IN ('closed_confirmed','dismissed','closed_inferred')
+                                          AND i.review_state = 'unreviewed') AS unclosed,
+                       count(*) FILTER (WHERE i.lifecycle_state = 'closed_inferred'
+                                          AND i.review_state = 'unreviewed') AS suggested_closed,
+                       count(*) FILTER (WHERE i.lifecycle_state IN ('closed_confirmed','closed_inferred')
+                                         OR i.review_state = 'confirmed') AS closed,
+                       count(*) FILTER (WHERE i.lifecycle_state NOT IN ('dismissed')
+                                          AND NOT (i.review_state='rejected')) AS total,
+                       min(i.last_activity_at) FILTER (WHERE i.nonclosure_reason IS NOT NULL
+                                          AND i.lifecycle_state NOT IN ('closed_confirmed','dismissed','closed_inferred')
+                                          AND i.review_state = 'unreviewed') AS oldest_unclosed_at,
+                       max(i.last_activity_at) AS most_recent_at
+                FROM {SCHEMA}.issues i
                 LEFT JOIN agent.channels ch
                   ON ch.platform = i.customer_platform
                  AND ch.workspace_id = i.customer_workspace_id
                  AND ch.channel_id = i.customer_channel_id
-                WHERE i.review_state = 'unreviewed'
-                  AND i.lifecycle_state NOT IN ('closed_confirmed','dismissed')
-                GROUP BY i.customer_platform, i.customer_workspace_id
-                HAVING count(*) FILTER (WHERE i.nonclosure_reason IS NOT NULL) > 0
-                ORDER BY unclosed DESC, oldest_unclosed_at ASC
+                WHERE i.lifecycle_state <> 'dismissed' AND i.review_state <> 'rejected'
+                  AND {TIME_FLOOR_ALIAS}
+                GROUP BY i.customer_platform, i.customer_workspace_id,
+                         i.customer_channel_id
+                HAVING count(*) > 0
+                ORDER BY unclosed DESC, suggested_closed DESC, most_recent_at DESC
                 """
             )
             items = _rows(cur)
     return {"items": items, "count": len(items)}
 
 
+@app.get("/v1/dashboard/summary", dependencies=[Depends(require_secret)])
+def dash_summary() -> Any:
+    """Top-of-page numbers for the dashboard hero strip."""
+    with _PooledConn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                f"""
+                SELECT
+                  count(DISTINCT (customer_platform, customer_workspace_id, customer_channel_id))
+                    FILTER (WHERE lifecycle_state <> 'dismissed' AND review_state <> 'rejected')
+                    AS active_customers,
+                  count(*) FILTER (WHERE lifecycle_state <> 'dismissed' AND review_state <> 'rejected')
+                    AS total_issues,
+                  count(*) FILTER (WHERE nonclosure_reason IS NOT NULL
+                                     AND lifecycle_state NOT IN ('closed_confirmed','dismissed','closed_inferred')
+                                     AND review_state = 'unreviewed') AS awaiting_us,
+                  count(*) FILTER (WHERE lifecycle_state = 'closed_inferred'
+                                     AND review_state = 'unreviewed') AS suggested_closed,
+                  count(*) FILTER (WHERE lifecycle_state = 'closed_confirmed'
+                                      OR review_state = 'confirmed') AS resolved,
+                  count(*) FILTER (WHERE last_activity_at >= now() - interval '7 days'
+                                     AND lifecycle_state <> 'dismissed' AND review_state <> 'rejected')
+                    AS new_this_week
+                FROM {SCHEMA}.issues
+                WHERE {TIME_FLOOR_BARE}
+                """
+            )
+            row = cur.fetchone()
+    return dict(row) if row else {}
+
+
+@app.get("/v1/dashboard/customers/issues", dependencies=[Depends(require_secret)])
+def dash_customer_issues(
+    platform: str = Query(...),
+    workspace_id: str = Query(...),
+    channel_id: str = Query(...),
+    include_closed: bool = Query(False),
+) -> Any:
+    """All issues for ONE customer (channel). The issue-detail page drilldown
+    target. include_closed=true to also show closed_inferred/closed_confirmed
+    so reviewers can verify them; default hides closed for a focused open list."""
+    where = ["i.customer_platform = %s",
+             "i.customer_workspace_id = %s",
+             "i.customer_channel_id = %s",
+             "i.lifecycle_state <> 'dismissed'",
+             "i.review_state <> 'rejected'",
+             TIME_FLOOR_ALIAS]
+    args = [platform, workspace_id, channel_id]
+    if not include_closed:
+        where.append("i.lifecycle_state NOT IN ('closed_confirmed','closed_inferred')")
+        where.append("i.review_state <> 'confirmed'")
+    sql = f"""
+        SELECT i.id, i.code, i.title, (i.metadata->>'summary') AS summary,
+               i.lifecycle_state, i.review_state, i.nonclosure_reason,
+               i.closure_reason, i.last_speaker, i.last_customer_at, i.last_agent_at,
+               i.message_count, i.opened_at, i.last_activity_at, i.sla_due_at,
+               i.external_party_name, i.detector
+        FROM {SCHEMA}.issues i
+        WHERE {' AND '.join(where)}
+        ORDER BY
+          CASE i.lifecycle_state
+            WHEN 'awaiting_agent' THEN 0
+            WHEN 'active' THEN 1
+            WHEN 'awaiting_customer' THEN 2
+            WHEN 'closed_inferred' THEN 3
+            WHEN 'closed_confirmed' THEN 4
+            ELSE 5 END,
+          i.last_activity_at DESC NULLS LAST
+    """
+    with _PooledConn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, args)
+            items = _rows(cur)
+            cur.execute(
+                """SELECT platform, workspace_id, channel_id, channel_name
+                   FROM agent.channels
+                   WHERE platform=%s AND workspace_id=%s AND channel_id=%s""",
+                (platform, workspace_id, channel_id),
+            )
+            chrow = cur.fetchone()
+    return {"items": items, "count": len(items),
+            "channel": dict(chrow) if chrow else None}
+
+
+@app.get("/v1/dashboard/issues/{issue_id}/transcript", dependencies=[Depends(require_secret)])
+def dash_issue_transcript(issue_id: str) -> Any:
+    """Full chat transcript for ONE issue: every agent.messages row pinned to
+    the issue, joined back with text + sender so the drawer can render a real
+    conversation, not just message ids."""
+    with _PooledConn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(f"SELECT * FROM {SCHEMA}.issues WHERE id = %s", (issue_id,))
+            issue_rows = _rows(cur)
+            if not issue_rows:
+                raise HTTPException(404, "issue not found")
+            issue = issue_rows[0]
+            cur.execute(
+                f"""SELECT im.role, im.signal_kind, im.is_segment_start,
+                          am.platform, am.workspace_id, am.channel_id, am.message_id,
+                          am.thread_id, am.sender_id, am.sender_name, am.text, am.ts
+                   FROM {SCHEMA}.issue_messages im
+                   LEFT JOIN agent.messages am
+                     ON am.platform = im.platform
+                    AND am.workspace_id = im.workspace_id
+                    AND am.channel_id = im.channel_id
+                    AND am.message_id = im.message_id
+                   WHERE im.issue_id = %s
+                   ORDER BY am.ts NULLS LAST, im.message_id""",
+                (issue_id,),
+            )
+            transcript = _rows(cur)
+            cur.execute(
+                f"""SELECT field, old_value, new_value, actor_mxid, ts
+                   FROM {SCHEMA}.issue_history WHERE issue_id = %s ORDER BY ts DESC""",
+                (issue_id,),
+            )
+            history = _rows(cur)
+    return {"issue": issue, "transcript": transcript, "history": history,
+            "transcript_count": len(transcript)}
+
+
 @app.get("/v1/issues/{issue_id}", dependencies=[Depends(require_secret)])
 def issue_detail(issue_id: str) -> Any:
     with _PooledConn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("SELECT * FROM issue.issues WHERE id = %s", (issue_id,))
+            cur.execute(f"SELECT * FROM {SCHEMA}.issues WHERE id = %s", (issue_id,))
             rows = _rows(cur)
             if not rows:
                 raise HTTPException(404, "issue not found")
             item = rows[0]
             cur.execute(
-                """SELECT platform, workspace_id, channel_id, message_id, role,
+                f"""SELECT platform, workspace_id, channel_id, message_id, role,
                           signal_kind, is_segment_start, ts
-                   FROM issue.issue_messages WHERE issue_id = %s ORDER BY ts ASC""",
+                   FROM {SCHEMA}.issue_messages WHERE issue_id = %s ORDER BY ts ASC""",
                 (issue_id,),
             )
             item["messages"] = _rows(cur)
             cur.execute(
-                """SELECT field, old_value, new_value, actor_mxid, ts
-                   FROM issue.issue_history WHERE issue_id = %s ORDER BY ts DESC""",
+                f"""SELECT field, old_value, new_value, actor_mxid, ts
+                   FROM {SCHEMA}.issue_history WHERE issue_id = %s ORDER BY ts DESC""",
                 (issue_id,),
             )
             item["history"] = _rows(cur)
@@ -305,7 +491,7 @@ def _history(cur, issue_id: str, field: str, old: Any, new: Any, actor: str) -> 
     if old == new:
         return
     cur.execute(
-        """INSERT INTO issue.issue_history (issue_id, field, old_value, new_value, actor_mxid)
+        f"""INSERT INTO {SCHEMA}.issue_history (issue_id, field, old_value, new_value, actor_mxid)
            VALUES (%s, %s, %s, %s, %s)""",
         (issue_id, field,
          psycopg2.extras.Json(old) if old is not None else None,
@@ -316,7 +502,7 @@ def _history(cur, issue_id: str, field: str, old: Any, new: Any, actor: str) -> 
 
 def _fetch_issue(cur, issue_id: str) -> Optional[dict]:
     cur.execute(
-        "SELECT id, lifecycle_state, review_state, ticket_id FROM issue.issues WHERE id = %s",
+        f"SELECT id, lifecycle_state, review_state, ticket_id FROM {SCHEMA}.issues WHERE id = %s",
         (issue_id,),
     )
     row = cur.fetchone()
@@ -348,7 +534,7 @@ def review_issue(issue_id: str, body: ReviewBody, actor: str = Depends(require_a
                 old_life = issue["lifecycle_state"]
                 if body.action == "confirm":
                     cur.execute(
-                        """UPDATE issue.issues
+                        f"""UPDATE {SCHEMA}.issues
                            SET review_state='confirmed', reviewed_by_mxid=%s, reviewed_at=now()
                            WHERE id=%s""",
                         (actor, issue_id),
@@ -357,7 +543,7 @@ def review_issue(issue_id: str, body: ReviewBody, actor: str = Depends(require_a
                              {"review_state": old_review}, {"review_state": "confirmed"}, actor)
                 else:  # reject | dismiss
                     cur.execute(
-                        """UPDATE issue.issues
+                        f"""UPDATE {SCHEMA}.issues
                            SET review_state='rejected', lifecycle_state='dismissed',
                                nonclosure_reason=NULL, reviewed_by_mxid=%s, reviewed_at=now(),
                                closed_at=now()
@@ -397,13 +583,13 @@ def merge_issue(issue_id: str, body: MergeBody, actor: str = Depends(require_act
                 dst = _fetch_issue(cur, target)
                 if src is None or dst is None:
                     raise HTTPException(404, "issue or target not found")
-                # Repoint evidence rows that don't already exist on the target.
+                # Repoint evidence rows that donf't already exist on the target.
                 cur.execute(
-                    """UPDATE issue.issue_messages m
+                    f"""UPDATE {SCHEMA}.issue_messages m
                        SET issue_id = %s
                        WHERE m.issue_id = %s
                          AND NOT EXISTS (
-                           SELECT 1 FROM issue.issue_messages t
+                           SELECT 1 FROM {SCHEMA}.issue_messages t
                            WHERE t.issue_id = %s AND t.platform = m.platform
                              AND t.workspace_id = m.workspace_id
                              AND t.channel_id = m.channel_id
@@ -411,15 +597,15 @@ def merge_issue(issue_id: str, body: MergeBody, actor: str = Depends(require_act
                     (target, issue_id, target),
                 )
                 cur.execute(
-                    """UPDATE issue.issues
-                       SET review_state='merged', lifecycle_state='dismissed',
+                    f"""UPDATE {SCHEMA}.issues
+                       SET review_state='merged', lifecycle_state='dismissedf',
                            merged_into_issue_id=%s, nonclosure_reason=NULL,
                            reviewed_by_mxid=%s, reviewed_at=now(), closed_at=now()
                        WHERE id=%s""",
                     (target, actor, issue_id),
                 )
                 cur.execute(
-                    """INSERT INTO issue.merge_links (kept_issue_id, merged_issue_id, actor_mxid)
+                    f"""INSERT INTO {SCHEMA}.merge_links (kept_issue_id, merged_issue_id, actor_mxid)
                        VALUES (%s, %s, %s)""",
                     (target, issue_id, actor),
                 )
@@ -452,7 +638,7 @@ def promote_issue(issue_id: str, body: PromoteBody, actor: str = Depends(require
                 if issue is None:
                     raise HTTPException(404, "issue not found")
                 cur.execute(
-                    """UPDATE issue.issues
+                    f"""UPDATE {SCHEMA}.issues
                        SET review_state='promoted', ticket_id=%s,
                            reviewed_by_mxid=%s, reviewed_at=now()
                        WHERE id=%s""",

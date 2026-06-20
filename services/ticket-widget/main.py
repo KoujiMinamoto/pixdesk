@@ -606,6 +606,30 @@ async def dash_issue_detail(issue_id: str) -> Any:
     return _passthrough(resp)
 
 
+@app.get("/api/v1/dashboard/summary")
+async def dash_summary() -> Any:
+    resp = await _issue_proxy("GET", "/v1/dashboard/summary", "@anon:dashboard")
+    return _passthrough(resp)
+
+
+@app.get("/api/v1/dashboard/customers/issues")
+async def dash_customer_issues(
+    request: Request,
+) -> Any:
+    """Per-customer issue list. Pass platform/workspace_id/channel_id as query."""
+    params = dict(request.query_params)
+    resp = await _issue_proxy("GET", "/v1/dashboard/customers/issues",
+                              "@anon:dashboard", params=params)
+    return _passthrough(resp)
+
+
+@app.get("/api/v1/dashboard/issues/{issue_id}/transcript")
+async def dash_issue_transcript(issue_id: str) -> Any:
+    resp = await _issue_proxy("GET", f"/v1/dashboard/issues/{issue_id}/transcript",
+                              "@anon:dashboard")
+    return _passthrough(resp)
+
+
 class DashReviewBody(BaseModel):
     action: str
     note: Optional[str] = None

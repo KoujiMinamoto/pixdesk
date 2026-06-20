@@ -27,6 +27,7 @@ import psycopg2.extras
 
 import detector
 import llm
+from config import SCHEMA
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 MAX_CALLS = int(sys.argv[1]) if len(sys.argv) > 1 else 100
@@ -34,19 +35,19 @@ MERGE_WINDOW_DAYS = float(os.environ.get("VALIDATE_MERGE_WINDOW_DAYS", "30"))
 
 
 def _issue_transcript(conn, issue_id: str, *, max_chars: int = 1200) -> str:
-    """Mini transcript from this issue's evidence messages only (the rows the
-    detector pinned to issue.issue_messages). Falls back to title if there is
+    f"""Mini transcript from this issue's evidence messages only (the rows the
+    detector pinned to {SCHEMA}.issue_messages). Falls back to title if there is
     no evidence (issue from a reply-only segment, etc.)."""
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
-            """SELECT m.platform, m.workspace_id, m.channel_id, m.message_id,
+            f"""SELECT m.platform, m.workspace_id, m.channel_id, m.message_id,
                       im.role, am.text, am.ts
-               FROM issue.issue_messages im
-               JOIN issue.issues i ON i.id = im.issue_id
+               FROM {SCHEMA}.issue_messages im
+               JOIN {SCHEMA}.issues i ON i.id = im.issue_id
                LEFT JOIN agent.messages am
                  ON am.platform = im.platform AND am.workspace_id = im.workspace_id
                 AND am.channel_id = im.channel_id AND am.message_id = im.message_id
-               JOIN issue.issue_messages m
+               JOIN {SCHEMA}.issue_messages m
                  ON m.issue_id = im.issue_id AND m.platform = im.platform
                 AND m.workspace_id = im.workspace_id AND m.channel_id = im.channel_id
                 AND m.message_id = im.message_id
@@ -79,9 +80,9 @@ def main() -> int:
 
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
-            """SELECT id, conversation_id, title, opened_at, lifecycle_state,
+            f"""SELECT id, conversation_id, title, opened_at, lifecycle_state,
                       customer_workspace_id, customer_platform
-               FROM issue.issues
+               FROM {SCHEMA}.issues
                WHERE review_state = 'unreviewed'
                  AND lifecycle_state NOT IN ('closed_confirmed','dismissed')
                ORDER BY conversation_id, opened_at"""

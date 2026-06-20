@@ -33,6 +33,7 @@ import psycopg2
 import psycopg2.extras
 
 import config
+from config import SCHEMA
 import detector
 import llm
 
@@ -61,8 +62,8 @@ def list_pairs() -> list[tuple[str, dict, dict]]:
     c.autocommit = True
     with c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
-            """SELECT id, conversation_id, opened_at, title
-               FROM issue.issues
+            f"""SELECT id, conversation_id, opened_at, title
+               FROM {SCHEMA}.issues
                WHERE review_state = 'unreviewed'
                  AND lifecycle_state NOT IN ('closed_confirmed','dismissed')
                ORDER BY conversation_id, opened_at"""
@@ -99,7 +100,7 @@ def process_pair(pair) -> tuple[str, str]:
         with c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             # Skip if already judged.
             cur.execute(
-                """SELECT 1 FROM issue.issue_signals
+                f"""SELECT 1 FROM {SCHEMA}.issue_signals
                    WHERE issue_id = %s AND evaluator = %s LIMIT 1""",
                 (src_id, f"llm-merge:{dst_id}"),
             )
@@ -109,7 +110,7 @@ def process_pair(pair) -> tuple[str, str]:
             # Refresh lifecycle/review_state — chained merges may have killed
             # this pair already.
             cur.execute(
-                """SELECT id, lifecycle_state, review_state FROM issue.issues
+                f"""SELECT id, lifecycle_state, review_state FROM {SCHEMA}.issues
                    WHERE id IN (%s, %s)""",
                 (src_id, dst_id),
             )

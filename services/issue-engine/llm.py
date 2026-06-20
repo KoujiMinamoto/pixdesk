@@ -74,9 +74,14 @@ def _uncertain(reason: str) -> dict:
             "model": config.LLM_MODEL, "prompt_tokens": 0, "completion_tokens": 0}
 
 
-def _ask(system: str, user: str, *, max_tokens: int = 256) -> dict:
+def _ask(system: str, user: str, *, max_tokens: int = 256,
+         timeout: Optional[float] = None) -> dict:
     """One chat-completion. Returns {raw, model, prompt_tokens, completion_tokens}
-    on success; {verdict:"uncertain", reason, ...} on any failure path."""
+    on success; {verdict:"uncertain", reason, ...} on any failure path.
+
+    timeout overrides config.LLM_TIMEOUT_SECONDS when set — distill calls send
+    much more input than the small judge calls and need longer.
+    """
     if not enabled():
         return _uncertain("llm_disabled")
     if not _budget_ok():
@@ -98,7 +103,7 @@ def _ask(system: str, user: str, *, max_tokens: int = 256) -> dict:
                 # latency knob.
                 "max_tokens": max_tokens,
             },
-            timeout=config.LLM_TIMEOUT_SECONDS,
+            timeout=timeout if timeout is not None else config.LLM_TIMEOUT_SECONDS,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -107,7 +112,15 @@ def _ask(system: str, user: str, *, max_tokens: int = 256) -> dict:
         return _uncertain(f"llm_error:{type(exc).__name__}")
 
     try:
-        raw = (data["choices"][0]["message"]["content"] or "").strip()
+        msg = data["choices"][0]["message"]
+        content = (msg.get("content") or "").strip()
+        # GLM-5.1 puts thinking in `reasoning_content` and the final answer in
+        # `content`. When max_tokens is too small, reasoning eats the budget
+        # and content comes back empty; falling back to reasoning_content lets
+        # the regex parser still extract the JSON the model managed to write.
+        if not content:
+            content = (msg.get("reasoning_content") or "").strip()
+        raw = content
     except (KeyError, IndexError, TypeError):
         return _uncertain("llm_bad_response")
 

@@ -21,6 +21,7 @@ import psycopg2.extras
 
 import detector
 import llm
+from config import SCHEMA
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 30
@@ -35,8 +36,8 @@ def main() -> int:
 
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
-            """SELECT id, conversation_id, title, lifecycle_state, nonclosure_reason
-               FROM issue.issues
+            f"""SELECT id, conversation_id, title, lifecycle_state, nonclosure_reason
+               FROM {SCHEMA}.issues
                WHERE review_state = 'unreviewed'
                  AND nonclosure_reason IS NOT NULL
                  AND lifecycle_state IN ('awaiting_agent','active','awaiting_customer','detected')

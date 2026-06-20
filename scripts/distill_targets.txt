@@ -1,0 +1,36 @@
+discord,1232359089674256457,1513821586858442864,snaphub
+slack,T0700DDQN3E,C0AMVGUTQ3A,ext-starsling-novita
+slack,T0700DDQN3E,C0B4QR2UCHM,ext-simpliciter-novita
+slack,T0700DDQN3E,C09CXN58ZMH,ext-novita-genspark
+slack,T0700DDQN3E,C06UZ51G8UX,ext-openrouter
+slack,T0700DDQN3E,C098Y1T1A79,ext-ourdream
+slack,T0700DDQN3E,C09J3QAE79A,ext-kilocode
+slack,T0700DDQN3E,C0B7PGRLF97,e-xt-te-st
+slack,T0700DDQN3E,C086MB64H6U,ext-artificial-analysis
+slack,T0700DDQN3E,C0AJ6UEEBB9,ext-deepai-novita
+slack,T0700DDQN3E,C0987R9RJ2Z,ext-quora
+slack,T0700DDQN3E,C07CGMVPKUM,ext-yodayo
+slack,T0700DDQN3E,C0AJ82SLFGB,#ext-onlychats
+discord,1113789452079337522,1250003326943367209,#💻｜gpu-instance
+slack,T0700DDQN3E,C0AJNT933R6,ext-aichat-novita
+slack,T0700DDQN3E,C08QZ55HXPF,ext-respan
+discord,direct:1232359089674256457,1429865808258924687,gobimaps <> Novita
+slack,T0700DDQN3E,C0B8R2BSN9Z,ext-paperclip-novita
+discord,1232359089674256457,1511667457046085753,riley600_
+slack,T0700DDQN3E,C0B7Z09M2KT,ext-mason-novita
+slack,T0700DDQN3E,C08KG11JLTE,ext-gcore
+slack,T0700DDQN3E,C0AKESQAT08,ext-podpitch-novita
+slack,T0700DDQN3E,C09QQQSHYSD,#ext-radixark
+discord,direct:1232359089674256457,1375296562737188998,Redboon<>Novita
+slack,T0700DDQN3E,C0AU445FE8N,ext-vercel-novita
+slack,T0700DDQN3E,C0B3S01NFU3,ext-anara-novita
+discord,direct:1232359089674256457,1386159016295792750,Frosting.ai<>Novita
+slack,T0700DDQN3E,C0ASE5T4GNN,cafe24-llm-router-novita
+discord,direct:1232359089674256457,1432683118581645382,ucillny<> Novita
+slack,T0700DDQN3E,C098411NJV6,zai-novita-collab4930
+discord,1232359089674256457,1511075861141655692,neurallinkimplanted
+slack,T0700DDQN3E,C0A98FPDXC6,ext-highrise-novita
+discord,direct:1232359089674256457,1372820331428970576,Melon AI & Novita
+slack,T0700DDQN3E,C0APC7U7EMU,ext-novita-inworld
+slack,T0700DDQN3E,C08BD3PC9JR,ext-huggingface
+slack,T0700DDQN3E,C0B7SH0NN7M,#ext-viol-novita

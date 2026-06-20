@@ -277,3 +277,43 @@ CREATE TABLE IF NOT EXISTS issue.merge_links (
 );
 
 CREATE INDEX IF NOT EXISTS merge_links_kept_idx ON issue.merge_links (kept_issue_id);
+
+-- ---------------------------------------------------------------------------
+-- 8. Channel distillation memory (P5)
+--
+-- One row per opted-in channel. Each row carries the rolling state the GLM
+-- distiller needs to do incremental updates: when did we last process this
+-- channel, and what does it currently know about it.  open_issues_summary is
+-- a compact markdown the GLM reads back on the NEXT run so it can update an
+-- existing issue instead of re-discovering it. recent_closed_summary lets
+-- the GLM detect re-opens of issues it already closed.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS issue.channel_memory (
+  platform text NOT NULL,
+  workspace_id text NOT NULL,
+  channel_id text NOT NULL,
+  channel_name text,
+  last_distilled_ts timestamptz,           -- watermark: only msgs after this are "new"
+  last_message_id text,                    -- tie-break for equal ts
+  open_issues_summary text NOT NULL DEFAULT '',
+  recent_closed_summary text NOT NULL DEFAULT '',
+  total_distill_runs int NOT NULL DEFAULT 0,
+  total_tokens_used bigint NOT NULL DEFAULT 0,
+  last_run_at timestamptz,
+  metadata jsonb NOT NULL DEFAULT '{}',
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (platform, workspace_id, channel_id)
+);
+
+CREATE OR REPLACE FUNCTION issue.touch_channel_memory_updated_at() RETURNS trigger AS $$
+BEGIN
+  NEW.updated_at := now();
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS channel_memory_touch ON issue.channel_memory;
+CREATE TRIGGER channel_memory_touch
+  BEFORE UPDATE ON issue.channel_memory
+  FOR EACH ROW EXECUTE FUNCTION issue.touch_channel_memory_updated_at();

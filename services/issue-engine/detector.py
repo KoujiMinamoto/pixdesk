@@ -26,6 +26,7 @@ import psycopg2
 import psycopg2.extras
 
 import config
+from config import SCHEMA
 import markers
 import llm
 
@@ -399,8 +400,8 @@ def _record_history(cur, issue_id, field, old, new):
     if old == new:
         return
     cur.execute(
-        """
-        INSERT INTO issue.issue_history (issue_id, field, old_value, new_value, actor_mxid)
+        f"""
+        INSERT INTO {SCHEMA}.issue_history (issue_id, field, old_value, new_value, actor_mxid)
         VALUES (%s, %s, %s, %s, %s)
         """,
         (issue_id, field,
@@ -482,8 +483,8 @@ def _record_signal(cur, issue_id: str, evaluator: str, llm_out: dict,
     if verdict in ("likely_closed", "likely_open", "uncertain"):
         enum_verdict = verdict
     cur.execute(
-        """
-        INSERT INTO issue.issue_signals
+        f"""
+        INSERT INTO {SCHEMA}.issue_signals
           (issue_id, evaluator, closure_score, signals, verdict, cost_micros)
         VALUES (%s, %s, %s, %s, %s, %s)
         """,
@@ -497,7 +498,7 @@ def _has_recent_signal(cur, issue_id: str, evaluator: str) -> bool:
     issue? Idempotency guard so the cleanup wave doesn't burn tokens
     re-judging the same issue every tick."""
     cur.execute(
-        """SELECT 1 FROM issue.issue_signals
+        f"""SELECT 1 FROM {SCHEMA}.issue_signals
            WHERE issue_id = %s AND evaluator = %s
              AND verdict IN ('likely_closed','likely_open')
            LIMIT 1""",
@@ -540,7 +541,7 @@ def adjudicate(cur, issue_id: str, d: dict[str, Any]) -> tuple[str, Optional[str
 
     # 2) CLOSURE CHALLENGE. Heuristic said closed_inferred; ask the model to
     #    argue OPEN. If it finds anything, veto. Silence-only inferred closures
-    #    don't reach this path because derive() doesn't infer closure from
+    #    don't reach this path because derive() doesnf't infer closure from
     #    silence (only from customer_thanked + agent_proposed).
     if state == "closed_inferred" \
             and not _has_recent_signal(cur, issue_id, "llm-closure-challenge") \
@@ -569,11 +570,11 @@ def upsert_issue(conn, conv: dict[str, Any], d: dict[str, Any]) -> Optional[str]
     seg_key = d["segment_key"]
     with dict_cur(conn) as cur:
         cur.execute(
-            """
+            f"""
             SELECT id, lifecycle_state, review_state, nonclosure_reason,
                    closure_reason, reopened_count
-            FROM issue.issues
-            WHERE conversation_id = %s AND metadata->>'segment_key' = %s
+            FROM {SCHEMA}.issues
+            WHERE conversation_id = %s AND metadata->>'segment_keyf' = %s
             ORDER BY created_at DESC LIMIT 1
             """,
             (conv["id"], seg_key),
@@ -584,8 +585,8 @@ def upsert_issue(conn, conv: dict[str, Any], d: dict[str, Any]) -> Optional[str]
 
         if existing is None:
             cur.execute(
-                """
-                INSERT INTO issue.issues
+                f"""
+                INSERT INTO {SCHEMA}.issues
                   (conversation_id, customer_platform, customer_workspace_id,
                    customer_channel_id, thread_id, external_party_id,
                    external_party_name, title, lifecycle_state, nonclosure_reason,
@@ -625,10 +626,10 @@ def upsert_issue(conn, conv: dict[str, Any], d: dict[str, Any]) -> Optional[str]
             if adj_state != new_state or adj_nc != d["nonclosure_reason"] \
                     or adj_cr != d["closure_reason"]:
                 cur.execute(
-                    """UPDATE issue.issues
+                    f"""UPDATE {SCHEMA}.issues
                        SET lifecycle_state = %s, nonclosure_reason = %s,
                            closure_reason = %s,
-                           closed_at = CASE WHEN %s = 'dismissed' THEN now()
+                           closed_at = CASE WHEN %s = 'dismissedf' THEN now()
                                             ELSE closed_at END
                        WHERE id = %s""",
                     (adj_state, adj_nc, adj_cr, adj_state, issue_id),
@@ -652,8 +653,8 @@ def upsert_issue(conn, conv: dict[str, Any], d: dict[str, Any]) -> Optional[str]
             target = new_state if validate_transition(old_state, new_state) else old_state
 
             cur.execute(
-                """
-                UPDATE issue.issues SET
+                f"""
+                UPDATE {SCHEMA}.issues SET
                   lifecycle_state = %s, nonclosure_reason = %s, closure_reason = %s,
                   closure_confidence = %s, last_speaker = %s, last_customer_at = %s,
                   last_agent_at = %s, message_count = %s, last_activity_at = %s,
@@ -692,7 +693,7 @@ def upsert_issue(conn, conv: dict[str, Any], d: dict[str, Any]) -> Optional[str]
             if adj_state != target or adj_nc != d["nonclosure_reason"] \
                     or adj_cr != d["closure_reason"]:
                 cur.execute(
-                    """UPDATE issue.issues
+                    f"""UPDATE {SCHEMA}.issues
                        SET lifecycle_state = %s, nonclosure_reason = %s,
                            closure_reason = %s,
                            closed_at = CASE WHEN %s = 'dismissed' AND closed_at IS NULL
@@ -713,7 +714,7 @@ def upsert_issue(conn, conv: dict[str, Any], d: dict[str, Any]) -> Optional[str]
 
 
 def _write_evidence(cur, issue_id, d: dict[str, Any]) -> None:
-    """Map the segment's turns into issue.issue_messages (idempotent upsert).
+    f"""Map the segment's turns into {SCHEMA}.issue_messages (idempotent upsert).
     Only agent.messages rows have a composite FK target; agent.replies turns are
     skipped (they are not in agent.messages)."""
     start_id = d["start"]["message_id"]
@@ -731,8 +732,8 @@ def _write_evidence(cur, issue_id, d: dict[str, Any]) -> None:
         elif t["role"] == "customer" and "reopen" in m:
             signal_kind = "reopen_trigger"
         cur.execute(
-            """
-            INSERT INTO issue.issue_messages
+            f"""
+            INSERT INTO {SCHEMA}.issue_messages
               (issue_id, platform, workspace_id, channel_id, message_id, role,
                signal_kind, is_segment_start, ts, added_by)
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
@@ -765,8 +766,8 @@ def _issue_transcript(conn, issue_id: str, *, max_chars: int = 1200) -> str:
     issue's evidence rows. Trim from the middle so head + tail survive."""
     with dict_cur(conn) as cur:
         cur.execute(
-            """SELECT im.role, am.text, am.ts
-               FROM issue.issue_messages im
+            f"""SELECT im.role, am.text, am.ts
+               FROM {SCHEMA}.issue_messages im
                LEFT JOIN agent.messages am
                  ON am.platform = im.platform AND am.workspace_id = im.workspace_id
                 AND am.channel_id = im.channel_id AND am.message_id = im.message_id
@@ -794,7 +795,7 @@ def _merge_pair_already_judged(cur, src_id: str, dst_id: str) -> bool:
     """Have we already evaluated this exact pair this run? Tracked in
     issue_signals on the source issue with evaluator='llm-merge:<dst>'."""
     cur.execute(
-        """SELECT 1 FROM issue.issue_signals
+        f"""SELECT 1 FROM {SCHEMA}.issue_signals
            WHERE issue_id = %s AND evaluator = %s
              AND verdict IN ('likely_closed','likely_open')
            LIMIT 1""",
@@ -808,18 +809,18 @@ def _do_merge(cur, src_id: str, dst_id: str) -> None:
     src as merged, write the merge_links audit row + history on both sides.
     Mirrors the manual /merge endpoint in main.py."""
     cur.execute(
-        """UPDATE issue.issue_messages m
+        f"""UPDATE {SCHEMA}.issue_messages m
            SET issue_id = %s
            WHERE m.issue_id = %s
              AND NOT EXISTS (
-               SELECT 1 FROM issue.issue_messages t
+               SELECT 1 FROM {SCHEMA}.issue_messages t
                WHERE t.issue_id = %s AND t.platform = m.platform
                  AND t.workspace_id = m.workspace_id AND t.channel_id = m.channel_id
                  AND t.message_id = m.message_id)""",
         (dst_id, src_id, dst_id),
     )
     cur.execute(
-        """UPDATE issue.issues
+        f"""UPDATE {SCHEMA}.issues
            SET review_state='merged', lifecycle_state='dismissed',
                merged_into_issue_id=%s, nonclosure_reason=NULL,
                reviewed_by_mxid=%s, reviewed_at=now(), closed_at=now()
@@ -827,7 +828,7 @@ def _do_merge(cur, src_id: str, dst_id: str) -> None:
         (dst_id, config.SYSTEM_ACTOR, src_id),
     )
     cur.execute(
-        """INSERT INTO issue.merge_links (kept_issue_id, merged_issue_id, actor_mxid)
+        f"""INSERT INTO {SCHEMA}.merge_links (kept_issue_id, merged_issue_id, actor_mxid)
            VALUES (%s, %s, %s)""",
         (dst_id, src_id, config.SYSTEM_ACTOR),
     )
@@ -852,8 +853,8 @@ def merge_overcut_issues(conn, conversation_id: str) -> int:
     while True:
         with dict_cur(conn) as cur:
             cur.execute(
-                """SELECT id, opened_at, title
-                   FROM issue.issues
+                f"""SELECT id, opened_at, title
+                   FROM {SCHEMA}.issues
                    WHERE conversation_id = %s
                      AND review_state = 'unreviewed'
                      AND lifecycle_state NOT IN ('closed_confirmed','dismissed')
@@ -886,7 +887,7 @@ def merge_overcut_issues(conn, conversation_id: str) -> int:
                 # Record the verdict on the SRC (the one that may be merged
                 # away), keyed by the DST so the same pair isn't re-judged.
                 _record_signal(
-                    cur, str(b["id"]), f"llm-merge:{a['id']}", out,
+                    cur, str(b["id"]), f"llm-merge:{a['idf']}", out,
                     score=1.0 if out.get("verdict") == "same_problem" else 0.0,
                 )
                 if out.get("verdict") == "same_problem":
@@ -915,6 +916,17 @@ def process_conversation(conn, conversation_id: str, now: dt.datetime) -> Option
         conv = fetch_conversation_meta(conn, conversation_id)
         if conv is None:
             return 0
+        # P5: if this channel is owned by the GLM distiller (it has a
+        # channel_memory row), the heuristic detector stays out of its way.
+        # The distiller will pick this up on its next scheduled run.
+        with conn.cursor() as _cur:
+            _cur.execute(
+                f"""SELECT 1 FROM {SCHEMA}.channel_memory
+                   WHERE platform=%s AND workspace_id=%s AND channel_id=%s""",
+                (conv["platform"], conv["workspace_id"], conv["channel_id"]),
+            )
+            if _cur.fetchone():
+                return 0
         turns = fetch_conversation_messages(conn, conversation_id)
         if not turns:
             return 0
@@ -950,7 +962,7 @@ def _get_cursor(conn) -> tuple[dt.datetime, str]:
     """Return the keyset watermark (last_imported_at, last_conversation_id)."""
     with dict_cur(conn) as cur:
         cur.execute(
-            "SELECT last_imported_at, last_message_pk FROM issue.detector_cursor WHERE detector = %s",
+            f"SELECT last_imported_at, last_message_pk FROM {SCHEMA}.detector_cursor WHERE detector = %s",
             (config.DETECTOR_NAME,),
         )
         row = cur.fetchone()
@@ -971,8 +983,8 @@ def _get_cursor(conn) -> tuple[dt.datetime, str]:
 def _set_cursor(conn, ts: dt.datetime, conv_id: str) -> None:
     with conn.cursor() as cur:
         cur.execute(
-            """
-            INSERT INTO issue.detector_cursor (detector, last_imported_at, last_message_pk, last_run_at)
+            f"""
+            INSERT INTO {SCHEMA}.detector_cursor (detector, last_imported_at, last_message_pk, last_run_at)
             VALUES (%s, %s, %s, now())
             ON CONFLICT (detector) DO UPDATE SET
               last_imported_at = EXCLUDED.last_imported_at,
@@ -1042,9 +1054,9 @@ def sweep_open_issues(conn, now: dt.datetime) -> int:
     Only re-runs issues that have NOT been human-touched."""
     with dict_cur(conn) as cur:
         cur.execute(
-            """
+            f"""
             SELECT DISTINCT conversation_id
-            FROM issue.issues
+            FROM {SCHEMA}.issues
             WHERE review_state = 'unreviewed'
               AND lifecycle_state NOT IN ('closed_confirmed','dismissed')
             LIMIT %s
@@ -1067,8 +1079,8 @@ def apply_closure_grace(conn, now: dt.datetime) -> int:
     try:
         with dict_cur(conn) as cur:
             cur.execute(
-                """
-                SELECT id FROM issue.issues
+                f"""
+                SELECT id FROM {SCHEMA}.issues
                 WHERE lifecycle_state = 'closed_inferred'
                   AND review_state = 'unreviewed'
                   AND closure_reason = 'customer_thanked'
@@ -1081,8 +1093,8 @@ def apply_closure_grace(conn, now: dt.datetime) -> int:
             ids = [r["id"] for r in cur.fetchall()]
             for iid in ids:
                 cur.execute(
-                    """
-                    UPDATE issue.issues
+                    f"""
+                    UPDATE {SCHEMA}.issues
                     SET lifecycle_state = 'closed_confirmed', closed_at = now(),
                         nonclosure_reason = NULL
                     WHERE id = %s AND lifecycle_state = 'closed_inferred'
