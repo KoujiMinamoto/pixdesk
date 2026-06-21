@@ -201,13 +201,61 @@ def apply_merges(conn, channel: dict, clusters: list[dict]) -> int:
     return merged
 
 
+def run(conn, channel: dict, *, apply: bool = False, verbose: bool = True) -> dict:
+    """Cluster-merge for one channel. Programmatic entry point used by both the
+    CLI and the distill scheduler's auto-cluster step.
+
+    Returns {clusters, merged, skipped_reason}. Caller controls commit; we
+    commit per cluster inside apply_merges so a partial failure leaves earlier
+    merges intact (idempotent on next run because merged issues drop out of
+    fetch_open_issues)."""
+    out = {"clusters": 0, "merged": 0, "skipped_reason": None}
+    if not llm.enabled():
+        out["skipped_reason"] = "llm_disabled"
+        return out
+    issues = fetch_open_issues(conn, channel)
+    if verbose:
+        print(f"  open issues since floor: {len(issues)}")
+    if len(issues) < 2:
+        out["skipped_reason"] = "fewer_than_2_issues"
+        return out
+    if verbose:
+        print(f"  asking Sonnet to cluster…")
+    clusters = call_clusterer(issues)
+    if not clusters:
+        out["skipped_reason"] = "no_clusters_returned"
+        return out
+
+    total_merge_targets = sum(len(c["issue_ids"]) - 1 for c in clusters)
+    out["clusters"] = len(clusters)
+    if verbose:
+        print(f"\n=== {len(clusters)} clusters, {total_merge_targets} issues to merge ===\n")
+        by_id = {it["id"]: it for it in issues}
+        for i, c in enumerate(clusters, 1):
+            print(f"[{i}] {c['title']}")
+            print(f"    survivor: {by_id.get(c['issue_ids'][0], {}).get('code', '?')} "
+                  f"{by_id.get(c['issue_ids'][0], {}).get('title', '')[:60]}")
+            for src in c["issue_ids"][1:]:
+                it = by_id.get(src, {})
+                print(f"    +merge:   {it.get('code', '?')} {it.get('title', '')[:60]}")
+
+    if not apply:
+        if verbose:
+            print("\nDRY-RUN — no changes.")
+        out["skipped_reason"] = "dry_run"
+        return out
+
+    n = apply_merges(conn, channel, clusters)
+    out["merged"] = n
+    if verbose:
+        print(f"\nAPPLIED: {n} merges across {len(clusters)} clusters")
+    return out
+
+
 def main() -> int:
     if not ARGS:
         print(__doc__, file=sys.stderr)
         return 2
-    if not llm.enabled():
-        print("LLM not enabled — set ISSUE_LLM_BACKEND=api + creds", file=sys.stderr)
-        return 1
     conn = psycopg2.connect(DATABASE_URL)
     conn.autocommit = False
 
@@ -220,35 +268,10 @@ def main() -> int:
     print(f"  schema: {SCHEMA}  time floor: {TIME_FLOOR}  "
           f"mode: {'DRY-RUN' if DRY_RUN else 'APPLY'}")
 
-    issues = fetch_open_issues(conn, channel)
-    print(f"  open issues since floor: {len(issues)}")
-    if len(issues) < 2:
-        print("  nothing to cluster")
-        return 0
-
-    print(f"  asking Sonnet to cluster…")
-    clusters = call_clusterer(issues)
-    if not clusters:
-        print("  no clusters returned")
-        return 0
-
-    total_merge_targets = sum(len(c["issue_ids"]) - 1 for c in clusters)
-    print(f"\n=== {len(clusters)} clusters, {total_merge_targets} issues to merge ===\n")
-    by_id = {it["id"]: it for it in issues}
-    for i, c in enumerate(clusters, 1):
-        print(f"[{i}] {c['title']}")
-        print(f"    survivor: {by_id.get(c['issue_ids'][0], {}).get('code', '?')} "
-              f"{by_id.get(c['issue_ids'][0], {}).get('title', '')[:60]}")
-        for src in c["issue_ids"][1:]:
-            it = by_id.get(src, {})
-            print(f"    +merge:   {it.get('code', '?')} {it.get('title', '')[:60]}")
-
-    if DRY_RUN:
-        print("\nDRY-RUN — no changes. Re-run with --apply to commit.")
-        return 0
-
-    n = apply_merges(conn, channel, clusters)
-    print(f"\nAPPLIED: {n} merges across {len(clusters)} clusters")
+    result = run(conn, channel, apply=not DRY_RUN, verbose=True)
+    if result.get("skipped_reason") == "llm_disabled":
+        print("LLM not enabled — set ISSUE_LLM_BACKEND=api + creds", file=sys.stderr)
+        return 1
     return 0
 
 

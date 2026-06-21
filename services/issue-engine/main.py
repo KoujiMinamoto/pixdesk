@@ -31,6 +31,7 @@ import config
 from config import SCHEMA, TIME_FLOOR
 import detector
 import distill
+import cluster_merge
 
 # Dashboard read endpoints filter by last_activity_at >= TIME_FLOOR. Built once
 # so every endpoint shares the same predicate. Two flavors because some queries
@@ -161,6 +162,18 @@ def _distill_loop() -> None:
                 except Exception:
                     conn.rollback()
                     log.exception("distill failed for %s", ch.get("channel_name"))
+                    continue
+                # Auto cluster-merge after distill produced new work. Skip
+                # when no issues were emitted (incremental ticks for quiet
+                # channels would otherwise spend a Sonnet call to find no
+                # duplicates).
+                if (res or {}).get("issues_emitted", 0) > 0:
+                    try:
+                        cm = cluster_merge.run(conn, ch, apply=True, verbose=False)
+                        log.info("cluster_merge: %s -> %s", ch.get("channel_name"), cm)
+                    except Exception:
+                        conn.rollback()
+                        log.exception("cluster_merge failed for %s", ch.get("channel_name"))
             try:
                 conn.close()
             except Exception:
