@@ -382,6 +382,40 @@ def _upsert_issue(conn, channel: dict[str, Any], item: dict[str, Any]) -> Option
     first_msg = evidence[0]
     last_msg = evidence[-1]
 
+    # Real timestamps + last speaker, computed from the evidence messages
+    # themselves (NOT distill run time). The dashboard relies on these to show
+    # "last activity" and "ball in whose court". We join agent.messages for ts
+    # and infer role with the same heuristic distill uses for the transcript.
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """SELECT message_id, sender_id, sender_name, ts
+               FROM agent.messages
+               WHERE platform=%s AND workspace_id=%s AND channel_id=%s
+                 AND message_id = ANY(%s) AND ts IS NOT NULL
+               ORDER BY ts""",
+            (*pk, evidence),
+        )
+        ev_rows = cur.fetchall()
+    opened_at = ev_rows[0]["ts"] if ev_rows else None
+    last_activity_at = ev_rows[-1]["ts"] if ev_rows else None
+    last_speaker = None
+    last_customer_at = None
+    last_agent_at = None
+    for r in ev_rows:
+        role = _infer_role({"origin": "message", "sender_id": r.get("sender_id"),
+                            "sender_name": r.get("sender_name")})
+        if role == "customer":
+            last_customer_at = r["ts"]
+        elif role == "agent":
+            last_agent_at = r["ts"]
+        if role in ("customer", "agent"):
+            last_speaker = role  # ev_rows is ts-ordered, so last wins
+    # Fallbacks so NOT NULL opened_at never breaks and a message-less issue
+    # (shouldn't happen post-filter) still inserts.
+    now = dt.datetime.now(UTC)
+    opened_at = opened_at or now
+    last_activity_at = last_activity_at or now
+
     conv_id = _conversation_for_message(conn, channel, first_msg)
     if conv_id is None:
         # Fall back to the channelf's most recent conversation row — required
@@ -416,12 +450,18 @@ def _upsert_issue(conn, channel: dict[str, Any], item: dict[str, Any]) -> Option
         nc = None
         cr = closure_reason or "distilled_closed"
     else:
-        # Heuristic for "ball in whose court" we leave to the dashboard's
-        # last_speaker logic — distill just says open, defaulting to
-        # awaiting_agent.
-        new_state = "awaiting_agent"
-        nc = "unanswered_customer"
-        cr = None
+        # Open issue: who has the ball depends on who spoke last. If the
+        # customer spoke last, it's on us (awaiting_agent + unanswered flag);
+        # if we spoke last, we're waiting on them (awaiting_customer, no
+        # unanswered flag — silence is theirs, not ours).
+        if last_speaker == "agent":
+            new_state = "awaiting_customer"
+            nc = None
+            cr = None
+        else:
+            new_state = "awaiting_agent"
+            nc = "unanswered_customer"
+            cr = None
 
     metadata = {"distill_external_id": ext, "summary": summary,
                 "distilled": True, "evidence_count": len(evidence)}
@@ -433,14 +473,16 @@ def _upsert_issue(conn, channel: dict[str, Any], item: dict[str, Any]) -> Option
                      (conversation_id, customer_platform, customer_workspace_id,
                       customer_channel_id, title, lifecycle_state, nonclosure_reason,
                       closure_reason, message_count, detector, opened_at,
-                      last_activity_at, closure_detected_at, signals, metadata)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                      last_activity_at, last_speaker, last_customer_at, last_agent_at,
+                      closure_detected_at, signals, metadata)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                    RETURNING id""",
                 (conv_id, channel["platform"], channel["workspace_id"],
                  channel["channel_id"], title or "(no title)", new_state, nc,
                  cr, len(evidence), "glm-distill",
-                 dt.datetime.now(UTC), dt.datetime.now(UTC),
-                 dt.datetime.now(UTC) if new_state == "closed_inferred" else None,
+                 opened_at, last_activity_at, last_speaker,
+                 last_customer_at, last_agent_at,
+                 last_activity_at if new_state == "closed_inferred" else None,
                  psycopg2.extras.Json({"summary": summary}),
                  psycopg2.extras.Json(metadata)),
             )
@@ -455,7 +497,9 @@ def _upsert_issue(conn, channel: dict[str, Any], item: dict[str, Any]) -> Option
                 f"""UPDATE {SCHEMA}.issues SET
                      title = %s, lifecycle_state = %s, nonclosure_reason = %s,
                      closure_reason = %s, message_count = %s,
-                     last_activity_at = now(),
+                     opened_at = LEAST(opened_at, %s),
+                     last_activity_at = GREATEST(last_activity_at, %s),
+                     last_speaker = %s, last_customer_at = %s, last_agent_at = %s,
                      closure_detected_at = CASE
                        WHEN %s = 'closed_inferred' AND closure_detected_at IS NULL THEN now()
                        WHEN %s <> 'closed_inferred' THEN NULL
@@ -464,7 +508,9 @@ def _upsert_issue(conn, channel: dict[str, Any], item: dict[str, Any]) -> Option
                      metadata = metadata || %s
                    WHERE id = %s""",
                 (title or existing.get("title") or "(no title)", new_state, nc, cr,
-                 len(evidence), new_state, new_state,
+                 len(evidence), opened_at, last_activity_at,
+                 last_speaker, last_customer_at, last_agent_at,
+                 new_state, new_state,
                  psycopg2.extras.Json({"summary": summary}),
                  psycopg2.extras.Json(metadata), issue_id),
             )
