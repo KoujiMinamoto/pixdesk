@@ -574,7 +574,7 @@ def upsert_issue(conn, conv: dict[str, Any], d: dict[str, Any]) -> Optional[str]
             SELECT id, lifecycle_state, review_state, nonclosure_reason,
                    closure_reason, reopened_count
             FROM {SCHEMA}.issues
-            WHERE conversation_id = %s AND metadata->>'segment_keyf' = %s
+            WHERE conversation_id = %s AND metadata->>'segment_key' = %s
             ORDER BY created_at DESC LIMIT 1
             """,
             (conv["id"], seg_key),
@@ -887,7 +887,7 @@ def merge_overcut_issues(conn, conversation_id: str) -> int:
                 # Record the verdict on the SRC (the one that may be merged
                 # away), keyed by the DST so the same pair isn't re-judged.
                 _record_signal(
-                    cur, str(b["id"]), f"llm-merge:{a['idf']}", out,
+                    cur, str(b["id"]), f"llm-merge:{a['id']}", out,
                     score=1.0 if out.get("verdict") == "same_problem" else 0.0,
                 )
                 if out.get("verdict") == "same_problem":

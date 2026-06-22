@@ -418,7 +418,7 @@ def _upsert_issue(conn, channel: dict[str, Any], item: dict[str, Any]) -> Option
 
     conv_id = _conversation_for_message(conn, channel, first_msg)
     if conv_id is None:
-        # Fall back to the channelf's most recent conversation row — required
+        # Fall back to the channel's most recent conversation row — required
         # because {SCHEMA}.issues.conversation_id is NOT NULL.
         with conn.cursor() as cur:
             cur.execute(
@@ -521,7 +521,7 @@ def _upsert_issue(conn, channel: dict[str, Any], item: dict[str, Any]) -> Option
 
         # Evidence rows: idempotent upsert of every msg the GLM listed. Filter
         # against agent.messages first because the model can hallucinate IDs
-        # that donf't exist (Sonnet has been observed to invent timestamps);
+        # that don't exist (Sonnet has been observed to invent timestamps);
         # the FK on issue_messages would otherwise abort the whole transaction.
         cur.execute(
             """SELECT message_id FROM agent.messages

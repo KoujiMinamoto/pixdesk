@@ -152,6 +152,49 @@ def fetch_pending(conn, limit: int) -> list[dict]:
         return [dict(r) for r in cur.fetchall()]
 
 
+def fetch_pending_for_channel(conn, platform: str, workspace_id: str,
+                              channel_id: str, limit: int = 200) -> list[dict]:
+    """Same pending filter as fetch_pending, scoped to one channel. Used by the
+    distill scheduler to re-judge a channel right after it was distilled."""
+    floor = f"AND i.last_activity_at >= '{TIME_FLOOR}'" if TIME_FLOOR else ""
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            f"""SELECT i.id::text AS id, i.code, i.title, i.lifecycle_state,
+                       (i.metadata->>'summary') AS summary,
+                       i.customer_platform, i.customer_workspace_id, i.customer_channel_id,
+                       i.last_activity_at
+                FROM {SCHEMA}.issues i
+                WHERE i.review_state = 'unreviewed'
+                  AND i.lifecycle_state NOT IN ('closed_confirmed','dismissed')
+                  AND i.customer_platform = %s
+                  AND i.customer_workspace_id = %s
+                  AND i.customer_channel_id = %s
+                  {floor}
+                  AND NOT EXISTS (
+                    SELECT 1 FROM {SCHEMA}.issue_signals s
+                    WHERE s.issue_id = i.id AND s.evaluator = 'closure-agent'
+                      AND s.evaluated_at >= i.last_activity_at)
+                ORDER BY i.last_activity_at DESC
+                LIMIT %s""",
+            (platform, workspace_id, channel_id, limit),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+def run_batch(conn, issues: list[dict]) -> dict:
+    """Judge a list of issues, return verdict counts + token totals. Used by
+    both the CLI and the distill scheduler. Honors the module DRY_RUN flag."""
+    counts: dict[str, int] = {}
+    tot_pt = tot_ct = 0
+    for issue in issues:
+        res = judge_issue(conn, issue)
+        tot_pt += res.get("pt", 0); tot_ct += res.get("ct", 0)
+        v = res.get("verdict") or ("_" + (res.get("error") or "err"))
+        counts[v] = counts.get(v, 0) + 1
+    return {"counts": counts, "prompt_tokens": tot_pt, "completion_tokens": tot_ct,
+            "judged": len(issues)}
+
+
 def tool_get_transcript(conn, issue_id: str) -> dict:
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(

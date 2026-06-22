@@ -32,6 +32,7 @@ from config import SCHEMA, TIME_FLOOR
 import detector
 import distill
 import cluster_merge
+import closure_agent
 
 # Dashboard read endpoints filter by last_activity_at >= TIME_FLOOR. Built once
 # so every endpoint shares the same predicate. Two flavors because some queries
@@ -174,6 +175,19 @@ def _distill_loop() -> None:
                     except Exception:
                         conn.rollback()
                         log.exception("cluster_merge failed for %s", ch.get("channel_name"))
+                    # Closure agent: re-judge this channel's pending issues with
+                    # the autonomous tool-use loop (reads real transcripts, sets
+                    # closed_inferred/awaiting_*). Only the channel's own pending
+                    # set, so cost scales with new work.
+                    try:
+                        pend = closure_agent.fetch_pending_for_channel(
+                            conn, ch["platform"], ch["workspace_id"], ch["channel_id"])
+                        if pend:
+                            ca = closure_agent.run_batch(conn, pend)
+                            log.info("closure_agent: %s -> %s", ch.get("channel_name"), ca)
+                    except Exception:
+                        conn.rollback()
+                        log.exception("closure_agent failed for %s", ch.get("channel_name"))
             try:
                 conn.close()
             except Exception:
@@ -596,7 +610,7 @@ def merge_issue(issue_id: str, body: MergeBody, actor: str = Depends(require_act
                 dst = _fetch_issue(cur, target)
                 if src is None or dst is None:
                     raise HTTPException(404, "issue or target not found")
-                # Repoint evidence rows that donf't already exist on the target.
+                # Repoint evidence rows that don't already exist on the target.
                 cur.execute(
                     f"""UPDATE {SCHEMA}.issue_messages m
                        SET issue_id = %s
