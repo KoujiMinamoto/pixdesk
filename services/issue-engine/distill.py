@@ -845,6 +845,78 @@ def discover_channels(conn) -> list[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# Customer profile (画像记忆) — rolling per-channel profile for the openclaw
+# Feishu bot's pixdesk-memory skill. Refreshed lazily after a channel is
+# distilled, throttled so a quiet channel never re-spends an LLM call.
+# ---------------------------------------------------------------------------
+
+PROFILE_SYS = (
+    "你是 Novita 客服主管。根据下面这个客户在售后渠道里的历史问题列表，提炼一份简洁的"
+    "【客户画像】（简体中文 markdown，<=400 字）。包含这几块（有就写，没有就略）：\n"
+    "- 涉及产品\n- 规模/用量线索\n- 反复出现的问题主题\n- 关键诉求\n"
+    "- 需要注意的敏感点（如对停机/账单/SLA/迁移特别敏感）\n- 当前仍未闭环的重点\n"
+    "只输出画像本身，不要前言、不要解释、不要把原始 issue 列表抄回来。"
+)
+
+
+def refresh_customer_profile(conn, channel: dict[str, Any], *,
+                             max_age_hours: int = 12) -> dict[str, Any]:
+    """Regenerate this channel's customer_profile if it's missing or stale.
+    Returns a small status dict. Commits its own work; the caller wraps the
+    call in try/except + rollback (same pattern as cluster_merge/closure_agent).
+    """
+    pk = _channel_pk(channel)
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""SELECT updated_at FROM {SCHEMA}.customer_profile
+               WHERE platform=%s AND workspace_id=%s AND channel_id=%s""", pk)
+        row = cur.fetchone()
+        if row and row[0] is not None:
+            cur.execute("SELECT (now() - %s) < make_interval(hours => %s)",
+                        (row[0], max_age_hours))
+            if cur.fetchone()[0]:
+                return {"skipped": "fresh"}
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            f"""SELECT title, (metadata->>'summary_zh') sz, lifecycle_state,
+                      (metadata->'products') prods
+               FROM {SCHEMA}.issues
+               WHERE customer_platform=%s AND customer_workspace_id=%s AND customer_channel_id=%s
+                 AND lifecycle_state<>'dismissed' AND review_state<>'rejected'
+               ORDER BY last_activity_at DESC LIMIT 30""", pk)
+        issues = cur.fetchall()
+    if not issues:
+        return {"skipped": "no_issues"}
+    prods: set = set()
+    lines = []
+    for it in issues:
+        for p in (it.get("prods") or []):
+            prods.add(p)
+        st = it["lifecycle_state"]
+        tag = "未闭环" if st not in ("closed_confirmed", "closed_inferred") else "已闭环"
+        lines.append(f"- [{tag}] {it['title']} | {it.get('sz') or ''}")
+    blob = (f"客户：{channel.get('channel_name') or channel.get('workspace_id')}\n"
+            f"历史问题（{len(issues)} 条）：\n" + "\n".join(lines))
+    res = llm._ask(PROFILE_SYS, blob[:12000], max_tokens=900, timeout=90)
+    md = (res.get("raw") or "").strip()
+    if not md or res.get("verdict") == "uncertain":
+        return {"error": res.get("reason", "llm_failed")}
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""INSERT INTO {SCHEMA}.customer_profile
+                  (platform, workspace_id, channel_id, channel_name, profile_md,
+                   products, issue_count, updated_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s, now())
+                ON CONFLICT (platform, workspace_id, channel_id) DO UPDATE SET
+                  channel_name=EXCLUDED.channel_name, profile_md=EXCLUDED.profile_md,
+                  products=EXCLUDED.products, issue_count=EXCLUDED.issue_count, updated_at=now()""",
+            (pk[0], pk[1], pk[2], channel.get("channel_name"), md[:4000],
+             sorted(prods), len(issues)))
+    conn.commit()
+    return {"updated": True, "issue_count": len(issues)}
+
+
+# ---------------------------------------------------------------------------
 # Top-level run
 # ---------------------------------------------------------------------------
 

@@ -174,6 +174,29 @@ Existing open issues were backfilled in one pass (a small `llm._ask` over each
 issue's title + `summary_zh`, written via `metadata = metadata || …`) — 100
 open issues, all populated. New/changed issues get it inline from distill.
 
+## 12. Memory for the Feishu bot (openclaw `pixdesk-memory` skill)
+
+The Tencent host already runs **openclaw** — a self-hosted multi-channel agent
+platform — whose `feishu-claw` agent has been the Feishu bot for months. Rather
+than stand up a second agent runtime (Claude Agent SDK), we feed openclaw the
+knowledge pixdesk already distills, via one drop-in skill.
+
+- **Writer (engine):** `sql/memory_schema.sql` adds `pg_trgm` + an
+  `issue_tc.customer_profile` table (rolling per-customer 画像: products / scale /
+  recurring problems / demands / sensitivities) + trigram indexes on issue
+  title/summary. `distill.refresh_customer_profile()` regenerates a channel's
+  profile after it's distilled (throttled to once / 12h), wired into the distill
+  loop. All 44 active customers backfilled in one pass.
+- **Reader (openclaw):** `integrations/openclaw/skills/pixdesk-memory/`
+  (`SKILL.md` + `query.py`) deployed into feishu-claw's workspace. Three
+  commands: `search` (复现历史解法 — trigram over title + zh **and** en summary, so
+  an English query matches a Chinese-summarised issue), `profile` (客户画像 +
+  current open issues), `customers` (消歧). Reads the pixdesk Postgres directly.
+- **v1 is embedding-free** — no API embedding source was available (ppio out of
+  budget; paigod is chat-only). Cross-lingual paraphrase recall (sandbox↔沙箱
+  beyond shared English tokens) is the v2 upgrade: add a vector column + cosine,
+  skill interface unchanged.
+
 ## Known follow-ups
 - Auto-discovery runs once per distill pass; detector can still create a few
   redundant heuristic issues in distill-owned channels (cleaned via

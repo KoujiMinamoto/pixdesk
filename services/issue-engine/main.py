@@ -206,6 +206,16 @@ def _distill_loop() -> None:
                     except Exception:
                         conn.rollback()
                         log.exception("closure_agent failed for %s", ch.get("channel_name"))
+                    # Refresh the customer profile (for the Feishu bot's memory
+                    # skill). Throttled to once / 12h per channel, so only active
+                    # channels spend the call, and at most once per half-day.
+                    try:
+                        pr = distill.refresh_customer_profile(conn, ch)
+                        if pr.get("updated"):
+                            log.info("profile: %s -> %s", ch.get("channel_name"), pr)
+                    except Exception:
+                        conn.rollback()
+                        log.exception("profile refresh failed for %s", ch.get("channel_name"))
             try:
                 conn.close()
             except Exception:
