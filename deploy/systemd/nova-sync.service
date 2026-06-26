@@ -1,0 +1,9 @@
+[Unit]
+Description=Nova Brain external-API sync (internal API -> Tencent pixdesk-pg nova.*)
+After=network-online.target pixdesk-pg-tunnel.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/nova-sync.env
+ExecStart=/usr/bin/python3 /opt/beeper-matrix/nova-sync.py
+TimeoutStartSec=1800

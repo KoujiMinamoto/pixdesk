@@ -74,6 +74,20 @@ AGENT_SENDERS = tuple(
     if s.strip()
 )
 
+# --- Product tagging -------------------------------------------------------
+# Fixed enum the distiller classifies each issue against (Novita's product
+# surface). The LLM may only pick from this list; anything else is dropped.
+# Override the whole list via ISSUE_PRODUCT_TAGS (comma-separated). "Other" is
+# the catch-all so the model always has a valid choice.
+_DEFAULT_PRODUCT_TAGS = "LLM,GPU,Sandbox,Image/Video,Billing,Account,API,Other"
+PRODUCT_TAGS = tuple(
+    s.strip()
+    for s in os.environ.get("ISSUE_PRODUCT_TAGS", _DEFAULT_PRODUCT_TAGS).split(",")
+    if s.strip()
+)
+# Case-insensitive lookup so the model's casing variance still maps to canonical.
+PRODUCT_TAGS_LC = {t.lower(): t for t in PRODUCT_TAGS}
+
 # --- LLM (decision: external API only; local self-hosting ruled out) -------
 # none = pure heuristics, ZERO egress (P1-P3 default). api = OpenAI-compatible
 # endpoint for the ambiguous residue only.

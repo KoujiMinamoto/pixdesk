@@ -28,6 +28,7 @@ import psycopg2.extras
 import config
 from config import SCHEMA
 import markers
+import distill
 import llm
 
 log = logging.getLogger("issue-engine.detector")
@@ -927,6 +928,14 @@ def process_conversation(conn, conversation_id: str, now: dt.datetime) -> Option
             )
             if _cur.fetchone():
                 return 0
+        # Noise gate: channels whose NAME doesn't look like a customer support
+        # channel (Discord community/topic channels, internal-*, bare-name DMs)
+        # are never adopted by the distiller, so without this the heuristic
+        # detector keeps flooding the dashboard with their chatter. Skip them
+        # with the same rule discovery uses. (Disabled by the same env flag.)
+        if distill.REQUIRE_CUSTOMER_NAME and not distill._is_customer_channel(
+                conv.get("channel_name")):
+            return 0
         turns = fetch_conversation_messages(conn, conversation_id)
         if not turns:
             return 0

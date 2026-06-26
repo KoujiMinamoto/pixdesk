@@ -100,7 +100,10 @@
     }
     const resp = await fetch(path, init);
     if (resp.status === 401) {
-      throw new Error("写操作需在 Element 中打开看板登录");
+      throw new Error("登录已失效，请重新用飞书登录");
+    }
+    if (resp.status === 403) {
+      throw new Error("无权限（需管理员批准）");
     }
     if (!resp.ok) throw new Error(await resp.text() || `HTTP ${resp.status}`);
     const ct = resp.headers.get("content-type") || "";
@@ -122,6 +125,38 @@
     unanswered_customer: "客户未获回复", idle_open: "长期无进展",
     awaiting_customer_stale: "等客户太久", reopened: "已重开",
   };
+  const PLATFORM_LABEL = { discord: "Discord", slack: "Slack", gmail: "Gmail" };
+
+  // Home-page filter state + the last rollup payload, so chip clicks re-render
+  // the grid without re-fetching.
+  const filter = { platform: null, product: null, q: "" };
+  let _rollupItems = [];
+
+  function platformPill(p) {
+    return el("span", { class: "tag platform platform-" + (p || "other") },
+      PLATFORM_LABEL[p] || p || "?");
+  }
+
+  function productPills(products) {
+    const arr = Array.isArray(products) ? products : [];
+    return arr.map((p) => el("span", { class: "tag product" }, p));
+  }
+
+  function matchesFilter(c) {
+    if (filter.platform && c.customer_platform !== filter.platform) return false;
+    if (filter.product) {
+      const prods = Array.isArray(c.products) ? c.products : [];
+      if (!prods.includes(filter.product)) return false;
+    }
+    if (filter.q) {
+      const hay = ((customerLabel(c) || "") + " " +
+        (c.customer_workspace_id || "") + " " +
+        (c.customer_channel_id || "")).toLowerCase();
+      if (!hay.includes(filter.q.toLowerCase())) return false;
+    }
+    return true;
+  }
+
 
   async function renderRoot() {
     $title.textContent = "客户问题闭环看板";
@@ -136,27 +171,101 @@
       api("/api/v1/dashboard/rollup"),
     ]);
 
-    // top strip
+    // top strip — all metrics scoped to "this week" (since last Friday),
+    // except 待我方 which is an always-current total.
     $strip.innerHTML = "";
-    $strip.appendChild(card("活跃客户", summary.active_customers || 0, ""));
-    $strip.appendChild(card("本周新增问题", summary.new_this_week || 0, ""));
-    $strip.appendChild(card("待我方回复", summary.awaiting_us || 0, "red"));
-    $strip.appendChild(card("已闭环 + 待确认",
-      (summary.resolved || 0) + (summary.suggested_closed || 0),
-      "green",
-      `${summary.resolved || 0} 已确认 · ${summary.suggested_closed || 0} 待确认`));
+    $strip.appendChild(card("本周活跃客户", summary.active_customers || 0, ""));
+    $strip.appendChild(card("本周新增问题", summary.new_issues || 0, ""));
+    $strip.appendChild(card("本周活跃问题", summary.active_issues || 0, ""));
+    $strip.appendChild(card("本周新增对话", summary.new_conversations || 0, ""));
+    $strip.appendChild(card("本周新闭环", summary.new_closed || 0, "green"));
+    $strip.appendChild(card("待我方回复", summary.awaiting_us || 0, "red", "实时"));
 
     const items = rollup.items || [];
+    _rollupItems = items;
     $view.innerHTML = "";
     if (!items.length) {
       $view.appendChild(el("div", { class: "empty" },
         "🎉 暂无客户问题"));
       return;
     }
+    renderFilterBar();
+    renderGrid();
+  }
+
+  // Distinct platforms / products present in the current rollup, for chips.
+  function _facetValues() {
+    const platforms = new Set();
+    const products = new Set();
+    for (const c of _rollupItems) {
+      if (c.customer_platform) platforms.add(c.customer_platform);
+      for (const p of (Array.isArray(c.products) ? c.products : [])) products.add(p);
+    }
+    return { platforms: [...platforms].sort(), products: [...products].sort() };
+  }
+
+  function renderFilterBar() {
+    const { platforms, products } = _facetValues();
+    const bar = el("div", { class: "filter-bar" });
+
+    const chip = (label, active, onClick) =>
+      el("button", { class: "chip" + (active ? " active" : ""), onclick: onClick }, label);
+
+    // Search row (kept first so it's always in the same spot).
+    const search = el("input", {
+      class: "cust-search", type: "search", id: "cust-search",
+      placeholder: "搜索客户名 / 渠道…", value: filter.q || "",
+    });
+    search.addEventListener("input", (e) => {
+      filter.q = e.target.value;
+      renderGrid();  // grid only — don't rebuild the bar, keeps input focus
+    });
+    bar.appendChild(el("div", { class: "chip-row" }, search));
+
+    const platRow = el("div", { class: "chip-row" }, el("span", { class: "chip-label" }, "平台"));
+    platRow.appendChild(chip("全部", !filter.platform, () => { filter.platform = null; renderGrid(); refreshChips(); }));
+    for (const p of platforms) {
+      platRow.appendChild(chip(PLATFORM_LABEL[p] || p, filter.platform === p,
+        () => { filter.platform = p; renderGrid(); refreshChips(); }));
+    }
+    bar.appendChild(platRow);
+
+    if (products.length) {
+      const prodRow = el("div", { class: "chip-row" }, el("span", { class: "chip-label" }, "产品"));
+      prodRow.appendChild(chip("全部", !filter.product, () => { filter.product = null; renderGrid(); refreshChips(); }));
+      for (const p of products) {
+        prodRow.appendChild(chip(p, filter.product === p,
+          () => { filter.product = p; renderGrid(); refreshChips(); }));
+      }
+      bar.appendChild(prodRow);
+    }
+    // Replace any existing bar.
+    const old = document.getElementById("filter-bar");
+    if (old) old.remove();
+    bar.id = "filter-bar";
+    $view.parentNode.insertBefore(bar, $view);
+  }
+
+  // Re-paint chip active states. Avoid clobbering the search box mid-typing:
+  // only rebuild when the search input isn't focused.
+  function refreshChips() {
+    const s = document.getElementById("cust-search");
+    if (s && document.activeElement === s) return;
+    renderFilterBar();
+  }
+
+  function renderGrid() {
+    $view.innerHTML = "";
+    const shown = _rollupItems.filter(matchesFilter);
+    if (!shown.length) {
+      $view.appendChild(el("div", { class: "empty" }, "无匹配筛选的客户"));
+      return;
+    }
     const grid = el("div", { class: "customer-grid" });
-    for (const c of items) grid.appendChild(customerCard(c));
+    for (const c of shown) grid.appendChild(customerCard(c));
     $view.appendChild(grid);
   }
+
 
   function card(label, value, kind, sub) {
     return el("div", { class: "summary-card " + (kind || "") },
@@ -178,8 +287,8 @@
       (Date.now() - new Date(c.oldest_unclosed_at).getTime()) > 86400000 ? " danger" : "";
 
     return el("div", { class: "customer-card", onclick: () => location.hash = "#/customers/" + key },
+      el("div", { class: "tags" }, platformPill(c.customer_platform), productPills(c.products)),
       el("div", { class: "name" }, customerLabel(c)),
-      el("div", { class: "platform" }, c.customer_platform + " · " + c.customer_workspace_id),
       el("div", { class: "stats" },
         el("span", null,
           el("span", { class: "big red" }, String(unclosed)),
@@ -229,14 +338,27 @@
       $view.appendChild(el("div", { class: "empty" }, "暂无问题"));
       return;
     }
-    const list = el("div", { class: "issue-list" });
-    for (const it of items) list.appendChild(issueRow(it));
-    $view.appendChild(list);
+    // Group: open/active (ball in play) vs closed. Open first — that's what
+    // needs attention; closed is collapsed-feel via a muted subheader.
+    const CLOSED = new Set(["closed_inferred", "closed_confirmed", "dismissed"]);
+    const openItems = items.filter((it) => !CLOSED.has(it.lifecycle_state));
+    const closedItems = items.filter((it) => CLOSED.has(it.lifecycle_state));
+
+    const section = (label, rows, cls) => {
+      if (!rows.length) return;
+      $view.appendChild(el("div", { class: "list-subhead " + (cls || "") },
+        label + " (" + rows.length + ")"));
+      const list = el("div", { class: "issue-list" });
+      for (const it of rows) list.appendChild(issueRow(it));
+      $view.appendChild(list);
+    };
+    section("待处理 / 进行中", openItems, "open");
+    section("已闭环", closedItems, "closed");
   }
 
   function issueRow(it) {
     const stateLabel = STATE_LABEL[it.lifecycle_state] || it.lifecycle_state;
-    const summary = it.summary || "";
+    const summary = it.summary_zh || it.summary || "";
     const ageVal = fmtAge(it.last_activity_at);
     const isStale = it.nonclosure_reason && it.last_activity_at &&
       (Date.now() - new Date(it.last_activity_at).getTime()) > 86400000;
@@ -267,18 +389,24 @@
     $view.innerHTML = "";
     $view.appendChild(el("div", { class: "loading" }, "加载中…"));
     $back.hidden = false;
-    $back.onclick = () => history.back();
+    // Provisional: until we know the parent channel, fall back to home. Replaced
+    // below once the issue's channel is known. (history.back() is unreliable —
+    // direct loads / re-renders leave nothing to go back to, so the button
+    // appeared dead.)
+    $back.onclick = () => location.hash = "#/";
 
     const data = await api("/api/v1/dashboard/issues/" + encodeURIComponent(issueId) + "/transcript");
     const it = data.issue || {};
     const turns = data.transcript || [];
-    const history = data.history || [];
+    const hist = data.history || [];
 
     const channelKey = customerKey({
       customer_platform: it.customer_platform,
       customer_workspace_id: it.customer_workspace_id,
       customer_channel_id: it.customer_channel_id,
     });
+    // Back → the customer's issue list this issue belongs to.
+    $back.onclick = () => location.hash = "#/customers/" + channelKey;
 
     $title.textContent = it.title || "(无标题)";
     $crumbs.innerHTML = "";
@@ -295,15 +423,29 @@
     const meta = el("div", { class: "meta" },
       el("span", { class: "pill " + it.lifecycle_state },
         STATE_LABEL[it.lifecycle_state] || it.lifecycle_state),
-      it.code ? document.createTextNode(" · " + it.code + " ") : null,
-      it.external_party_name ? document.createTextNode(" · " + it.external_party_name) : null,
-      document.createTextNode(" · " + (it.message_count || turns.length) + " 条消息"),
-      document.createTextNode(" · 最后活动 " + fmtAge(it.last_activity_at)));
+      platformPill(it.customer_platform),
+      it.code ? el("span", { class: "meta-item code" }, it.code) : null,
+      it.external_party_name ? el("span", { class: "meta-item" }, "👤 " + it.external_party_name) : null,
+      el("span", { class: "meta-item" }, (it.message_count || turns.length) + " 条消息"),
+      el("span", { class: "meta-item" }, "最后活动 " + fmtAge(it.last_activity_at)));
     detail.appendChild(meta);
 
-    const summary = (it.metadata && it.metadata.summary) || it.summary;
-    if (summary) {
-      detail.appendChild(el("div", { class: "summary-block" }, summary));
+    const prods = (it.metadata && it.metadata.products) || [];
+    if (Array.isArray(prods) && prods.length) {
+      detail.appendChild(el("div", { class: "tags" }, productPills(prods)));
+    }
+
+
+    const md = it.metadata || {};
+    const summaryZh = md.summary_zh || it.summary_zh;
+    const summaryEn = md.summary || it.summary;
+    if (summaryZh) {
+      detail.appendChild(el("div", { class: "summary-block" }, summaryZh));
+      if (summaryEn && summaryEn !== summaryZh) {
+        detail.appendChild(el("div", { class: "summary-block en" }, summaryEn));
+      }
+    } else if (summaryEn) {
+      detail.appendChild(el("div", { class: "summary-block" }, summaryEn));
     }
 
     const actions = el("div", { class: "actions" });
@@ -319,8 +461,18 @@
       tx.appendChild(el("div", { class: "turn" },
         el("span", { class: "text" }, "无证据消息")));
     } else {
+      const ROLE_LABEL = { customer: "客户", agent: "我方", bot: "机器人", system: "系统" };
+      let lastDay = null;
       for (const t of turns) {
-        tx.appendChild(el("div", { class: "turn " + (t.role || "system") },
+        // Date divider when the calendar day changes (long threads span days).
+        const day = t.ts ? new Date(t.ts).toISOString().slice(0, 10) : null;
+        if (day && day !== lastDay) {
+          tx.appendChild(el("div", { class: "day-divider" }, day));
+          lastDay = day;
+        }
+        const role = t.role || "system";
+        tx.appendChild(el("div", { class: "turn " + role },
+          el("span", { class: "role-badge " + role }, ROLE_LABEL[role] || role),
           el("span", { class: "who" }, t.sender_name || t.sender_id || (t.role || "?")),
           el("span", { class: "when" }, t.ts ? fmtDate(t.ts) : "—"),
           el("span", { class: "text" }, t.text || "(无文本)")));
@@ -328,11 +480,11 @@
     }
     detail.appendChild(tx);
 
-    if (history.length) {
+    if (hist.length) {
       const ul = el("ul", { class: "timeline" });
       ul.appendChild(el("li", null,
-        el("strong", null, "时间线 (" + history.length + " 条)")));
-      for (const h of history) {
+        el("strong", null, "时间线 (" + hist.length + " 条)")));
+      for (const h of hist) {
         ul.appendChild(el("li", null,
           fmtAge(h.ts) + " · " + h.field + " · " + (h.actor_mxid || "")));
       }
@@ -355,15 +507,67 @@
   }
 
   // -------------------------------------------------------------------------
+  // Admin: pending access requests
+  // -------------------------------------------------------------------------
+
+  async function renderAdmin() {
+    $strip.style.display = "none";
+    $back.hidden = false;
+    $back.onclick = () => location.hash = "#/";
+    $title.textContent = "待审批用户";
+    $crumbs.innerHTML = "";
+    $crumbs.appendChild(el("a", { onclick: () => location.hash = "#/" }, "全部客户"));
+    $crumbs.appendChild(document.createTextNode(" / 待审批"));
+    $view.innerHTML = "";
+    $view.appendChild(el("div", { class: "loading" }, "加载中…"));
+    const data = await api("/api/dashboard/pending");
+    const items = data.items || [];
+    $view.innerHTML = "";
+    if (!items.length) {
+      $view.appendChild(el("div", { class: "empty" }, "暂无待审批申请"));
+      return;
+    }
+    const list = el("div", { class: "issue-list" });
+    for (const u of items) {
+      const row = el("div", { class: "issue-row" },
+        el("div", null,
+          el("div", { class: "title" }, (u.name || "") + " · " + u.email),
+          el("div", { class: "who" }, "申请于 " + (u.requested_at ? fmtDate(u.requested_at) : "—"))),
+        el("div", { class: "actions" },
+          el("button", { onclick: async () => { await decide(u.email, "approve"); } }, "✓ 批准"),
+          el("button", { class: "danger", onclick: async () => { await decide(u.email, "reject"); } }, "✕ 拒绝")));
+      list.appendChild(row);
+    }
+    $view.appendChild(list);
+  }
+
+  async function decide(email, action) {
+    try {
+      setStatus("提交中…");
+      await api("/api/dashboard/decide", { method: "POST", json: { email, action } });
+      setStatus(action === "approve" ? "已批准" : "已拒绝", "ok");
+      setTimeout(() => setStatus(""), 1200);
+      renderAdmin();
+    } catch (e) { setStatus(String(e.message || e), "error"); }
+  }
+
+  // -------------------------------------------------------------------------
   // Router
   // -------------------------------------------------------------------------
 
   async function route() {
     const hash = location.hash || "#/";
     setStatus("");
+    // Filter bar belongs to the root view only; drop it on any navigation.
+    if (hash !== "#/" && hash !== "#") {
+      const fb = document.getElementById("filter-bar");
+      if (fb) fb.remove();
+    }
     try {
       if (hash === "#/" || hash === "#") {
         await renderRoot();
+      } else if (hash === "#/admin") {
+        await renderAdmin();
       } else if (hash.startsWith("#/customers/")) {
         await renderCustomer(hash.slice("#/customers/".length));
       } else if (hash.startsWith("#/issues/")) {
@@ -378,5 +582,82 @@
   }
 
   window.addEventListener("hashchange", route);
-  route();
+
+  // -------------------------------------------------------------------------
+  // Feishu login / approval gate — runs before the dashboard renders.
+  // -------------------------------------------------------------------------
+
+  let _me = null;          // whoami result
+  function isAdmin() { return _me && _me.role === "admin" && _me.status === "approved"; }
+
+  function gateScreen(title, desc, btn) {
+    $strip.style.display = "none";
+    $crumbs.innerHTML = "";
+    $back.hidden = true;
+    $view.innerHTML = "";
+    const box = el("div", { class: "gate" },
+      el("h2", null, title),
+      desc ? el("p", null, desc) : null);
+    if (btn) box.appendChild(btn);
+    $view.appendChild(box);
+  }
+
+  function loginBtn(label) {
+    return el("a", { class: "gate-btn",
+      href: "/api/auth/feishu/login?state=" + encodeURIComponent("/dashboard") },
+      label || "飞书登录");
+  }
+
+  async function boot() {
+    try {
+      _me = await api("/api/dashboard/whoami");
+    } catch (e) {
+      _me = { authed: false };
+    }
+    if (!_me.authed) {
+      gateScreen("客户问题闭环看板", "请使用飞书登录后访问。", loginBtn("飞书登录"));
+      return;
+    }
+    if (_me.status === "approved") {
+      // Show an admin entry point in the header if applicable, then render.
+      installHeaderUser();
+      route();
+      return;
+    }
+    if (_me.status === "pending") {
+      gateScreen("申请审核中", `你的账号 ${_me.email} 已提交申请，请等待管理员批准。`,
+        el("button", { class: "gate-btn", onclick: () => boot() }, "刷新状态"));
+      return;
+    }
+    if (_me.status === "rejected") {
+      gateScreen("申请被拒绝", `账号 ${_me.email} 的访问申请已被拒绝。如有疑问请联系管理员。`, null);
+      return;
+    }
+    // status === 'none' (logged in, never applied)
+    gateScreen("申请访问", `已登录为 ${_me.email}。该看板包含全部客户数据，需管理员批准后访问。`,
+      el("button", { class: "gate-btn",
+        onclick: async () => {
+          try { await api("/api/dashboard/apply", { method: "POST", json: {} }); }
+          catch (e) {}
+          boot();
+        } }, "申请访问"));
+  }
+
+  function installHeaderUser() {
+    // a small user chip + logout + (admin) pending-review link in the header
+    let bar = document.getElementById("user-chip");
+    if (bar) bar.remove();
+    bar = el("div", { class: "user-chip", id: "user-chip" },
+      el("span", { class: "uname" }, (_me.name || _me.email) + (isAdmin() ? " · 管理员" : "")));
+    if (isAdmin()) {
+      bar.appendChild(el("a", { class: "link", onclick: () => location.hash = "#/admin" }, "待审批"));
+    }
+    bar.appendChild(el("a", { class: "link", onclick: async () => {
+      await api("/api/dashboard/logout", { method: "POST", json: {} }); boot();
+    } }, "退出"));
+    document.querySelector(".dash-header").appendChild(bar);
+  }
+
+  boot();
 })();
+

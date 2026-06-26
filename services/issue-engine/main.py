@@ -147,6 +147,24 @@ def _distill_loop() -> None:
         try:
             conn = psycopg2.connect(config.DATABASE_URL)
             conn.autocommit = False
+            # Auto-discover NEW customer channels (have customer traffic but no
+            # channel_memory row yet) and bootstrap them, so new groups land on
+            # the dashboard without manual CLI seeding. distill.run writes their
+            # channel_memory row, so the next pass treats them as incremental.
+            try:
+                new_chs = distill.discover_channels(conn)
+                if new_chs:
+                    log.info("discovered %d new customer channels", len(new_chs))
+                for ch in new_chs:
+                    try:
+                        res = distill.run(conn, ch, force_full=True)
+                        log.info("distill(new): %s -> %s", ch.get("channel_name"), res)
+                    except Exception:
+                        conn.rollback()
+                        log.exception("bootstrap failed for %s", ch.get("channel_name"))
+            except Exception:
+                conn.rollback()
+                log.exception("channel discovery failed")
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
                     f"""SELECT cm.platform, cm.workspace_id, cm.channel_id,
@@ -331,6 +349,15 @@ def rollup() -> Any:
                 SELECT i.customer_platform, i.customer_workspace_id,
                        i.customer_channel_id,
                        max(ch.channel_name) AS channel_name,
+                       (SELECT array_agg(DISTINCT p)
+                          FROM {SCHEMA}.issues i2,
+                               jsonb_array_elements_text(
+                                 COALESCE(i2.metadata->'products','[]'::jsonb)) AS p
+                         WHERE i2.customer_platform = i.customer_platform
+                           AND i2.customer_workspace_id = i.customer_workspace_id
+                           AND i2.customer_channel_id = i.customer_channel_id
+                           AND i2.lifecycle_state <> 'dismissed'
+                           AND i2.review_state <> 'rejected') AS products,
                        count(*) FILTER (WHERE i.nonclosure_reason IS NOT NULL
                                           AND i.lifecycle_state NOT IN ('closed_confirmed','dismissed','closed_inferred')
                                           AND i.review_state = 'unreviewed') AS unclosed,
@@ -363,33 +390,78 @@ def rollup() -> Any:
 
 @app.get("/v1/dashboard/summary", dependencies=[Depends(require_secret)])
 def dash_summary() -> Any:
-    """Top-of-page numbers for the dashboard hero strip."""
+    """Top-of-page numbers for the dashboard hero strip.
+
+    "This week" = from the most recent Friday 00:00 (local-ish, server UTC) up to
+    now. We compute that Friday in SQL: date_trunc('week') is Monday; Friday is
+    Monday+4 days, and if that's still in the future (Mon-Thu) step back a week.
+    All week-scoped metrics share this `wk_start`. Plus one always-current
+    "awaiting us" total."""
     with _PooledConn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 f"""
+                WITH bounds AS (
+                  SELECT CASE
+                    WHEN (date_trunc('week', now()) + interval '4 days') <= now()
+                      THEN date_trunc('week', now()) + interval '4 days'
+                      ELSE date_trunc('week', now()) + interval '4 days' - interval '7 days'
+                  END AS wk_start
+                )
                 SELECT
+                  (SELECT wk_start FROM bounds) AS week_start,
+                  -- week-scoped: customers with any issue active this week
                   count(DISTINCT (customer_platform, customer_workspace_id, customer_channel_id))
-                    FILTER (WHERE lifecycle_state <> 'dismissed' AND review_state <> 'rejected')
+                    FILTER (WHERE last_activity_at >= (SELECT wk_start FROM bounds)
+                              AND lifecycle_state <> 'dismissed' AND review_state <> 'rejected')
                     AS active_customers,
-                  count(*) FILTER (WHERE lifecycle_state <> 'dismissed' AND review_state <> 'rejected')
-                    AS total_issues,
+                  -- new issues opened this week
+                  count(*) FILTER (WHERE opened_at >= (SELECT wk_start FROM bounds)
+                                     AND lifecycle_state <> 'dismissed' AND review_state <> 'rejected')
+                    AS new_issues,
+                  -- issues active this week (touched in window, not closed/dismissed)
+                  count(*) FILTER (WHERE last_activity_at >= (SELECT wk_start FROM bounds)
+                                     AND lifecycle_state NOT IN ('closed_confirmed','closed_inferred','dismissed')
+                                     AND review_state <> 'rejected')
+                    AS active_issues,
+                  -- newly closed this week (inferred or confirmed, closure detected in window)
+                  count(*) FILTER (WHERE lifecycle_state IN ('closed_inferred','closed_confirmed')
+                                     AND COALESCE(closure_detected_at, closed_at, last_activity_at) >= (SELECT wk_start FROM bounds))
+                    AS new_closed,
+                  -- always-current: awaiting our reply (not week-scoped)
                   count(*) FILTER (WHERE nonclosure_reason IS NOT NULL
                                      AND lifecycle_state NOT IN ('closed_confirmed','dismissed','closed_inferred')
-                                     AND review_state = 'unreviewed') AS awaiting_us,
-                  count(*) FILTER (WHERE lifecycle_state = 'closed_inferred'
-                                     AND review_state = 'unreviewed') AS suggested_closed,
-                  count(*) FILTER (WHERE lifecycle_state = 'closed_confirmed'
-                                      OR review_state = 'confirmed') AS resolved,
-                  count(*) FILTER (WHERE last_activity_at >= now() - interval '7 days'
-                                     AND lifecycle_state <> 'dismissed' AND review_state <> 'rejected')
-                    AS new_this_week
+                                     AND review_state = 'unreviewed') AS awaiting_us
                 FROM {SCHEMA}.issues
                 WHERE {TIME_FLOOR_BARE}
                 """
             )
             row = cur.fetchone()
-    return dict(row) if row else {}
+            # new conversations this week — from agent.conversations, limited to
+            # customer channels that have at least one issue (matches dashboard scope).
+            cur.execute(
+                f"""
+                WITH bounds AS (
+                  SELECT CASE
+                    WHEN (date_trunc('week', now()) + interval '4 days') <= now()
+                      THEN date_trunc('week', now()) + interval '4 days'
+                      ELSE date_trunc('week', now()) + interval '4 days' - interval '7 days'
+                  END AS wk_start
+                )
+                SELECT count(*) AS new_conversations
+                FROM agent.conversations c
+                WHERE c.opened_at >= (SELECT wk_start FROM bounds)
+                  AND EXISTS (SELECT 1 FROM {SCHEMA}.issues i
+                              WHERE i.customer_platform = c.platform
+                                AND i.customer_workspace_id = c.workspace_id
+                                AND i.customer_channel_id = c.channel_id)
+                """
+            )
+            conv = cur.fetchone()
+    out = dict(row) if row else {}
+    out["new_conversations"] = (conv or {}).get("new_conversations", 0)
+    return out
+
 
 
 @app.get("/v1/dashboard/customers/issues", dependencies=[Depends(require_secret)])
@@ -414,10 +486,11 @@ def dash_customer_issues(
         where.append("i.review_state <> 'confirmed'")
     sql = f"""
         SELECT i.id, i.code, i.title, (i.metadata->>'summary') AS summary,
+               (i.metadata->>'summary_zh') AS summary_zh,
                i.lifecycle_state, i.review_state, i.nonclosure_reason,
                i.closure_reason, i.last_speaker, i.last_customer_at, i.last_agent_at,
                i.message_count, i.opened_at, i.last_activity_at, i.sla_due_at,
-               i.external_party_name, i.detector
+               i.external_party_name, i.detector, (i.metadata->'products') AS products
         FROM {SCHEMA}.issues i
         WHERE {' AND '.join(where)}
         ORDER BY

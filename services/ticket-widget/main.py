@@ -33,7 +33,7 @@ from fastapi import (
     Response,
     status,
 )
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from itsdangerous import BadSignature, SignatureExpired, TimestampSigner
 from pydantic import BaseModel, Field
 
@@ -67,9 +67,28 @@ COOKIE_NAME = "pixdesk_ticket_session"
 COOKIE_TTL_SECONDS = 50 * 60  # < OpenID 1h ceiling
 MEMBERSHIP_CACHE_TTL = 30  # seconds
 
+# --- Feishu (Lark) OAuth login for the cross-customer dashboard ------------
+# A self-built Feishu app. Users log in with Feishu; access is gated by an
+# approval flow stored in issue_tc.dashboard_users. Admins (listed here by
+# login email) are auto-approved on first login and can approve others.
+FEISHU_APP_ID = os.environ.get("FEISHU_APP_ID", "")
+FEISHU_APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "")
+FEISHU_ADMIN_EMAILS = tuple(
+    s.strip().lower() for s in os.environ.get("FEISHU_ADMIN_EMAILS", "").split(",") if s.strip()
+)
+FEISHU_AUTHORIZE_URL = "https://open.feishu.cn/open-apis/authen/v1/authorize"
+FEISHU_APP_TOKEN_URL = "https://open.feishu.cn/open-apis/auth/v3/app_access_token/internal"
+FEISHU_USER_TOKEN_URL = "https://open.feishu.cn/open-apis/authen/v1/oidc/access_token"
+FEISHU_USERINFO_URL = "https://open.feishu.cn/open-apis/authen/v1/user_info"
+# Separate cookie from the Matrix-widget session so the two auth realms don't
+# collide. Holds the dashboard user's email.
+DASH_COOKIE_NAME = "pixdesk_dash_session"
+DASH_COOKIE_TTL_SECONDS = 12 * 60 * 60  # 12h dashboard session
+
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
 signer = TimestampSigner(COOKIE_SECRET, salt="pixdesk-ticket-widget")
+dash_signer = TimestampSigner(COOKIE_SECRET, salt="pixdesk-dashboard-feishu")
 
 app = FastAPI(title="PixDesk Ticket Widget", version="0.1.0")
 
@@ -298,6 +317,251 @@ def api_logout(response: Response) -> dict[str, Any]:
 @app.get("/api/whoami")
 def api_whoami(mxid: str = Depends(require_session)) -> dict[str, Any]:
     return {"mxid": mxid}
+
+
+# ---------------------------------------------------------------------------
+# Feishu (Lark) OAuth login + approval flow for the dashboard
+# ---------------------------------------------------------------------------
+
+
+def _set_dash_cookie(resp: Response, email: str) -> None:
+    token = dash_signer.sign(email).decode()
+    resp.set_cookie(
+        DASH_COOKIE_NAME, token,
+        max_age=DASH_COOKIE_TTL_SECONDS,
+        httponly=True, samesite="lax", secure=False, path="/",
+    )
+
+
+def _read_dash_cookie(token: Optional[str]) -> Optional[str]:
+    if not token:
+        return None
+    try:
+        return dash_signer.unsign(token, max_age=DASH_COOKIE_TTL_SECONDS).decode()
+    except (BadSignature, SignatureExpired):
+        return None
+
+
+def _dash_user_by_email(email: str) -> Optional[dict[str, Any]]:
+    conn = _pg_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT feishu_user_id, email, name, status, role "
+            "FROM issue_tc.dashboard_users WHERE lower(email)=lower(%s)",
+            (email,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    return {"feishu_user_id": row[0], "email": row[1], "name": row[2],
+            "status": row[3], "role": row[4]}
+
+
+def _dash_user_upsert(feishu_user_id: str, email: str, name: str,
+                      avatar_url: str) -> dict[str, Any]:
+    """Insert/refresh a dashboard user from a Feishu login. Admins (by email)
+    are force-set to approved+admin. Everyone else defaults to pending on first
+    sight and keeps their existing status on subsequent logins."""
+    is_admin = email.lower() in FEISHU_ADMIN_EMAILS
+    conn = _pg_conn()
+    # Bootstrap: if there is no admin yet, the first person to log in becomes the
+    # admin. This guarantees someone can approve others even when Feishu doesn't
+    # return an email to match FEISHU_ADMIN_EMAILS against.
+    if not is_admin:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM issue_tc.dashboard_users WHERE role='admin' AND status='approved' LIMIT 1")
+            has_admin = cur.fetchone() is not None
+        if not has_admin:
+            is_admin = True
+    with conn.cursor() as cur:
+        if is_admin:
+            cur.execute(
+                """INSERT INTO issue_tc.dashboard_users
+                     (feishu_user_id, email, name, avatar_url, status, role,
+                      decided_at, decided_by)
+                   VALUES (%s,%s,%s,%s,'approved','admin', now(), 'system:admin-email')
+                   ON CONFLICT (feishu_user_id) DO UPDATE SET
+                     email=EXCLUDED.email, name=EXCLUDED.name,
+                     avatar_url=EXCLUDED.avatar_url,
+                     status='approved', role='admin', updated_at=now()
+                   RETURNING status, role""",
+                (feishu_user_id, email, name, avatar_url),
+            )
+        else:
+            cur.execute(
+                """INSERT INTO issue_tc.dashboard_users
+                     (feishu_user_id, email, name, avatar_url)
+                   VALUES (%s,%s,%s,%s)
+                   ON CONFLICT (feishu_user_id) DO UPDATE SET
+                     email=EXCLUDED.email, name=EXCLUDED.name,
+                     avatar_url=EXCLUDED.avatar_url, updated_at=now()
+                   RETURNING status, role""",
+                (feishu_user_id, email, name, avatar_url),
+            )
+        status_role = cur.fetchone()
+    conn.commit()
+    return {"status": status_role[0], "role": status_role[1]}
+
+
+def require_dash_session(
+    pixdesk_dash_session: Optional[str] = Cookie(default=None),
+) -> str:
+    """Email of the logged-in Feishu user, or 401. Does NOT check approval."""
+    email = _read_dash_cookie(pixdesk_dash_session)
+    if not email:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "feishu login required")
+    return email
+
+
+def require_dash_approved(email: str = Depends(require_dash_session)) -> dict[str, Any]:
+    """Gate dashboard data: caller must be an approved dashboard user."""
+    u = _dash_user_by_email(email)
+    if not u or u["status"] != "approved":
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "not approved")
+    return u
+
+
+def require_dash_admin(email: str = Depends(require_dash_session)) -> dict[str, Any]:
+    u = _dash_user_by_email(email)
+    if not u or u["status"] != "approved" or u["role"] != "admin":
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "admin only")
+    return u
+
+
+@app.get("/api/auth/feishu/login")
+def feishu_login(state: str = Query(default="/dashboard")) -> Response:
+    if not FEISHU_APP_ID:
+        raise HTTPException(503, "FEISHU_APP_ID not configured")
+    redirect_uri = f"{PUBLIC_BASE_URL}/api/auth/feishu/callback"
+    url = (f"{FEISHU_AUTHORIZE_URL}?app_id={FEISHU_APP_ID}"
+           f"&redirect_uri={httpx.URL(redirect_uri)}"
+           f"&response_type=code&state={httpx.URL(state)}")
+    return RedirectResponse(url, status_code=302)
+
+
+async def _feishu_app_token() -> str:
+    assert _http is not None
+    r = await _http.post(FEISHU_APP_TOKEN_URL,
+                         json={"app_id": FEISHU_APP_ID, "app_secret": FEISHU_APP_SECRET})
+    data = r.json() if r.status_code == 200 else {}
+    tok = data.get("app_access_token")
+    if not tok:
+        raise HTTPException(502, f"feishu app_access_token failed: {str(data)[:200]}")
+    return tok
+
+
+@app.get("/api/auth/feishu/callback")
+async def feishu_callback(code: str = Query(...), state: str = Query(default="/dashboard"),
+                          response: Response = None) -> Response:
+    assert _http is not None
+    if not FEISHU_APP_ID:
+        raise HTTPException(503, "FEISHU_APP_ID not configured")
+    app_token = await _feishu_app_token()
+    # exchange code -> user_access_token
+    r = await _http.post(
+        FEISHU_USER_TOKEN_URL,
+        headers={"Authorization": f"Bearer {app_token}"},
+        json={"grant_type": "authorization_code", "code": code},
+    )
+    data = r.json() if r.status_code == 200 else {}
+    user_tok = (data.get("data") or {}).get("access_token") or data.get("access_token")
+    if not user_tok:
+        raise HTTPException(502, f"feishu user token failed: {str(data)[:200]}")
+    # fetch profile
+    ui = await _http.get(FEISHU_USERINFO_URL,
+                         headers={"Authorization": f"Bearer {user_tok}"})
+    uidata = (ui.json() or {}).get("data") or {} if ui.status_code == 200 else {}
+    email = (uidata.get("email") or uidata.get("enterprise_email") or "").strip()
+    name = uidata.get("name") or ""
+    fid = (uidata.get("open_id") or uidata.get("user_id") or uidata.get("union_id") or "").strip()
+    avatar = uidata.get("avatar_url") or uidata.get("avatar_big") or ""
+    if not fid:
+        raise HTTPException(502, f"feishu userinfo missing open_id: {str(uidata)[:200]}")
+    # Feishu may not return an email (the email scope isn't granted). Identity is
+    # keyed on the stable open_id; email is best-effort for display/whitelist. If
+    # absent we synthesize a stable handle from the open_id so the session cookie
+    # (which carries the "email") still works.
+    if not email:
+        email = f"feishu:{fid}"
+    _dash_user_upsert(fid, email, name, avatar)
+    # set session cookie, then redirect back into the dashboard SPA
+    target = state if state.startswith("/") else "/dashboard"
+    resp = RedirectResponse(target, status_code=302)
+    _set_dash_cookie(resp, email)
+    return resp
+
+
+@app.post("/api/dashboard/logout")
+def dash_logout(response: Response) -> dict[str, Any]:
+    response.delete_cookie(DASH_COOKIE_NAME, path="/")
+    return {"ok": True}
+
+
+@app.get("/api/dashboard/whoami")
+def dash_whoami(pixdesk_dash_session: Optional[str] = Cookie(default=None)) -> dict[str, Any]:
+    """Login + approval state for the SPA to decide what to render. Never 401s
+    so the page can show the right call-to-action (login / apply / pending)."""
+    email = _read_dash_cookie(pixdesk_dash_session)
+    if not email:
+        return {"authed": False}
+    u = _dash_user_by_email(email)
+    if not u:
+        return {"authed": True, "email": email, "status": "none"}
+    return {"authed": True, "email": u["email"], "name": u["name"],
+            "status": u["status"], "role": u["role"]}
+
+
+@app.post("/api/dashboard/apply")
+def dash_apply(email: str = Depends(require_dash_session)) -> dict[str, Any]:
+    """Logged-in but unapproved user requests access. Idempotent: a row already
+    exists from the login upsert; this just ensures status is 'pending' (not
+    re-opening a rejected one without admin action)."""
+    u = _dash_user_by_email(email)
+    if not u:
+        raise HTTPException(404, "login first")
+    if u["status"] == "approved":
+        return {"status": "approved"}
+    # leave 'rejected' as-is; only 'none'/fresh becomes pending (it already is)
+    return {"status": u["status"]}
+
+
+@app.get("/api/dashboard/pending")
+def dash_pending(admin: dict = Depends(require_dash_admin)) -> dict[str, Any]:
+    conn = _pg_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT email, name, status, role, requested_at "
+            "FROM issue_tc.dashboard_users WHERE status='pending' ORDER BY requested_at")
+        rows = cur.fetchall()
+    return {"items": [{"email": r[0], "name": r[1], "status": r[2],
+                       "role": r[3], "requested_at": r[4].isoformat() if r[4] else None}
+                      for r in rows]}
+
+
+class DashDecisionBody(BaseModel):
+    email: str
+    action: str  # 'approve' | 'reject'
+
+
+@app.post("/api/dashboard/decide")
+def dash_decide(body: DashDecisionBody, admin: dict = Depends(require_dash_admin)) -> dict[str, Any]:
+    if body.action not in ("approve", "reject"):
+        raise HTTPException(400, "action must be approve|reject")
+    new_status = "approved" if body.action == "approve" else "rejected"
+    conn = _pg_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE issue_tc.dashboard_users SET status=%s, decided_at=now(), "
+            "decided_by=%s, updated_at=now() WHERE lower(email)=lower(%s) RETURNING email",
+            (new_status, admin["email"], body.email),
+        )
+        row = cur.fetchone()
+    conn.commit()
+    if not row:
+        raise HTTPException(404, "user not found")
+    return {"email": row[0], "status": new_status}
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -580,13 +844,13 @@ def dashboard_index() -> FileResponse:
 
 
 @app.get("/api/v1/dashboard/unclosed")
-async def dash_unclosed() -> Any:
+async def dash_unclosed(user: dict = Depends(require_dash_approved)) -> Any:
     resp = await _issue_proxy("GET", "/v1/issues/unclosed", "@anon:dashboard")
     return _passthrough(resp)
 
 
 @app.get("/api/v1/dashboard/rollup")
-async def dash_rollup() -> Any:
+async def dash_rollup(user: dict = Depends(require_dash_approved)) -> Any:
     resp = await _issue_proxy("GET", "/v1/customers/rollup", "@anon:dashboard")
     return _passthrough(resp)
 
@@ -594,6 +858,7 @@ async def dash_rollup() -> Any:
 @app.get("/api/v1/dashboard/issues")
 async def dash_issues(
     request: Request,
+    user: dict = Depends(require_dash_approved),
 ) -> Any:
     params = dict(request.query_params)
     resp = await _issue_proxy("GET", "/v1/issues", "@anon:dashboard", params=params)
@@ -601,13 +866,13 @@ async def dash_issues(
 
 
 @app.get("/api/v1/dashboard/issues/{issue_id}")
-async def dash_issue_detail(issue_id: str) -> Any:
+async def dash_issue_detail(issue_id: str, user: dict = Depends(require_dash_approved)) -> Any:
     resp = await _issue_proxy("GET", f"/v1/issues/{issue_id}", "@anon:dashboard")
     return _passthrough(resp)
 
 
 @app.get("/api/v1/dashboard/summary")
-async def dash_summary() -> Any:
+async def dash_summary(user: dict = Depends(require_dash_approved)) -> Any:
     resp = await _issue_proxy("GET", "/v1/dashboard/summary", "@anon:dashboard")
     return _passthrough(resp)
 
@@ -615,6 +880,7 @@ async def dash_summary() -> Any:
 @app.get("/api/v1/dashboard/customers/issues")
 async def dash_customer_issues(
     request: Request,
+    user: dict = Depends(require_dash_approved),
 ) -> Any:
     """Per-customer issue list. Pass platform/workspace_id/channel_id as query."""
     params = dict(request.query_params)
@@ -624,7 +890,7 @@ async def dash_customer_issues(
 
 
 @app.get("/api/v1/dashboard/issues/{issue_id}/transcript")
-async def dash_issue_transcript(issue_id: str) -> Any:
+async def dash_issue_transcript(issue_id: str, user: dict = Depends(require_dash_approved)) -> Any:
     resp = await _issue_proxy("GET", f"/v1/dashboard/issues/{issue_id}/transcript",
                               "@anon:dashboard")
     return _passthrough(resp)
@@ -635,10 +901,21 @@ class DashReviewBody(BaseModel):
     note: Optional[str] = None
 
 
+def _actor_mxid(user: dict[str, Any]) -> str:
+    """Map a Feishu dashboard user to an mxid-shaped actor string the
+    issue-engine accepts (@local:server), so issue_history records who acted.
+    Email local/domain go into the two halves; '@' becomes '=' (allowed by the
+    engine's MXID regex, '@' is not)."""
+    email = (user.get("email") or "unknown").replace("@", "=")
+    return f"@{email}:feishu"
+
+
 @app.post("/api/v1/dashboard/issues/{issue_id}/review")
-async def dash_review(issue_id: str, body: DashReviewBody, mxid: str = Depends(require_reviewer)) -> Any:
+async def dash_review(issue_id: str, body: DashReviewBody,
+                      user: dict = Depends(require_dash_approved)) -> Any:
     resp = await _issue_proxy(
-        "POST", f"/v1/issues/{issue_id}/review", mxid, json_body=body.model_dump(),
+        "POST", f"/v1/issues/{issue_id}/review", _actor_mxid(user),
+        json_body=body.model_dump(),
     )
     return _passthrough(resp)
 
@@ -648,9 +925,11 @@ class DashMergeBody(BaseModel):
 
 
 @app.post("/api/v1/dashboard/issues/{issue_id}/merge")
-async def dash_merge(issue_id: str, body: DashMergeBody, mxid: str = Depends(require_reviewer)) -> Any:
+async def dash_merge(issue_id: str, body: DashMergeBody,
+                     user: dict = Depends(require_dash_approved)) -> Any:
     resp = await _issue_proxy(
-        "POST", f"/v1/issues/{issue_id}/merge", mxid, json_body=body.model_dump(),
+        "POST", f"/v1/issues/{issue_id}/merge", _actor_mxid(user),
+        json_body=body.model_dump(),
     )
     return _passthrough(resp)
 
@@ -661,7 +940,8 @@ class DashPromoteBody(BaseModel):
 
 
 @app.post("/api/v1/dashboard/issues/{issue_id}/promote", status_code=201)
-async def dash_promote(issue_id: str, body: DashPromoteBody, mxid: str = Depends(require_reviewer)) -> Any:
+async def dash_promote(issue_id: str, body: DashPromoteBody,
+                       user: dict = Depends(require_dash_approved)) -> Any:
     """Promote an issue to a real ticket. Orchestration lives in the BFF: it
     reads the issue (for conversation_id + title), creates the ticket via
     ticket-api (the sole ticket write path), then links the issue to it via the
@@ -678,7 +958,7 @@ async def dash_promote(issue_id: str, body: DashPromoteBody, mxid: str = Depends
 
     # 1. Create the ticket via ticket-api (bearer + actor injected by _proxy).
     create = await _proxy(
-        "POST", "/v1/tickets", mxid,
+        "POST", "/v1/tickets", _actor_mxid(user),
         json_body={
             "subject": subject,
             "conversation_id": conversation_id,
@@ -696,7 +976,7 @@ async def dash_promote(issue_id: str, body: DashPromoteBody, mxid: str = Depends
 
     # 2. Link the issue to the ticket via the engine.
     link = await _issue_proxy(
-        "POST", f"/v1/issues/{issue_id}/promote", mxid,
+        "POST", f"/v1/issues/{issue_id}/promote", _actor_mxid(user),
         json_body={"ticket_id": ticket_id},
     )
     if link.status_code != 200:
