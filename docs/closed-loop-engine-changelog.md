@@ -101,6 +101,27 @@ the paigod proxy. Deploy = scp changed files + `docker compose build/up`.
   (API returns duplicate model/product names). Two base URLs (.190 main,
   .123 or-intel). Contains customer PII — internal only.
 
+## 9. Shift-review panel (8h handoff)
+
+Support runs **3 rotating 8-hour shifts**; reviewers need an end-of-shift
+"what moved on my watch" view. Added a dedicated panel reachable from the
+header ("班次复盘", `#/shift`).
+
+- **Engine** `/v1/dashboard/shift?hours=8` (default 8, 1–72). Returns the
+  issues in a rolling N-hour window split into three **mutually-exclusive**
+  buckets, each a full issue list (+ `channel_name` so cross-customer rows are
+  legible):
+  - `closed` — closure detected in-window (terminal state wins priority),
+  - `new` — opened in-window and still open,
+  - `active` — opened earlier but had activity in-window (still open).
+  Plus a `counts` summary and the window's `since` timestamp.
+- **Widget** proxies it at `/api/v1/dashboard/shift` behind the same
+  `require_dash_approved` gate as the rest of the dashboard.
+- **Frontend** `renderShift()`: a 3-card count strip (新增/活跃/已闭环) over
+  three issue sections, a window selector (8 / 12 / 24 小时), and a header
+  link. Issue rows in this view carry a clickable customer chip
+  (`issueRow(it, {showCustomer:true})`) that jumps to that customer's page.
+
 ## Known follow-ups
 - Auto-discovery runs once per distill pass; detector can still create a few
   redundant heuristic issues in distill-owned channels (cleaned via

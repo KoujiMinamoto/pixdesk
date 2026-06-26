@@ -190,6 +190,19 @@ body { background: #fafbfc; }
 .list-subhead.open { color: var(--color-red); }
 .list-subhead:first-child { margin-top: 0; }
 
+/* -------- shift review panel -------- */
+.shift-controls { margin: 4px 2px 14px; }
+.shift-strip { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px;
+  margin-bottom: 8px; }
+.shift-since { font-size: 12px; color: var(--color-muted); margin: 0 2px 8px; }
+.empty.sm { padding: 12px; font-size: 13px; text-align: left; }
+/* customer chip on a cross-customer issue row */
+.cust-line { margin-bottom: 2px; }
+.cust-chip { display: inline-block; font-size: 11px; color: var(--color-blue);
+  background: var(--color-bg-soft); border: 1px solid var(--color-border);
+  padding: 1px 8px; border-radius: 10px; cursor: pointer; }
+.cust-chip:hover { border-color: var(--color-blue); }
+
 /* -------- issue detail meta row -------- */
 .detail .meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
 .detail .meta .meta-item { font-size: 12px; color: var(--color-muted);
@@ -206,6 +219,7 @@ body { background: #fafbfc; }
 
 @media (max-width: 720px) {
   .summary-strip { grid-template-columns: repeat(2, 1fr); }
+  .shift-strip { grid-template-columns: repeat(3, 1fr); gap: 8px; }
   .customer-grid { grid-template-columns: 1fr; }
   /* stack issue rows: state pill + meta on top, content below, full width */
   .issue-row { grid-template-columns: auto 1fr; grid-auto-flow: row; row-gap: 4px; }

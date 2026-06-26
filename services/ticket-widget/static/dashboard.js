@@ -131,6 +131,8 @@
   // the grid without re-fetching.
   const filter = { platform: null, product: null, q: "" };
   let _rollupItems = [];
+  // Shift-review window in hours (support runs 3 rotating 8h shifts).
+  let shiftHours = 8;
 
   function platformPill(p) {
     return el("span", { class: "tag platform platform-" + (p || "other") },
@@ -356,16 +358,28 @@
     section("已闭环", closedItems, "closed");
   }
 
-  function issueRow(it) {
+  function issueRow(it, opts) {
+    opts = opts || {};
     const stateLabel = STATE_LABEL[it.lifecycle_state] || it.lifecycle_state;
     const summary = it.summary_zh || it.summary || "";
     const ageVal = fmtAge(it.last_activity_at);
     const isStale = it.nonclosure_reason && it.last_activity_at &&
       (Date.now() - new Date(it.last_activity_at).getTime()) > 86400000;
+    // In cross-customer lists (shift review) show which customer this issue is
+    // under, as a chip that jumps to that customer's page.
+    const custChip = opts.showCustomer
+      ? el("span", { class: "cust-chip",
+                     onclick: (e) => {
+                       e.stopPropagation();
+                       location.hash = "#/customers/" + customerKey(it);
+                     } },
+          customerLabel(it))
+      : null;
     return el("div", { class: "issue-row",
                        onclick: () => location.hash = "#/issues/" + it.id },
       el("span", { class: "pill " + it.lifecycle_state }, stateLabel),
       el("div", null,
+        custChip ? el("div", { class: "cust-line" }, custChip) : null,
         el("div", { class: "title" }, it.title || "(无标题)"),
         summary ? el("div", { class: "summary" }, summary) : null,
         el("div", { class: "who" },
@@ -552,6 +566,65 @@
   }
 
   // -------------------------------------------------------------------------
+  // View 4: shift review (8h rolling window) — end-of-shift handoff panel
+  // -------------------------------------------------------------------------
+
+  async function renderShift() {
+    $strip.style.display = "none";
+    $view.innerHTML = "";
+    $back.hidden = false;
+    $back.onclick = () => location.hash = "#/";
+    $title.textContent = "班次复盘";
+    $crumbs.innerHTML = "";
+    $crumbs.appendChild(el("a", { onclick: () => location.hash = "#/" }, "全部客户"));
+    $crumbs.appendChild(document.createTextNode(" / 班次复盘"));
+    $view.appendChild(el("div", { class: "loading" }, "加载中…"));
+
+    const hours = shiftHours;
+    const data = await api("/api/v1/dashboard/shift?hours=" + hours);
+    $view.innerHTML = "";
+
+    // Window selector — default 8h, but a reviewer covering a long/handed-over
+    // shift can widen it.
+    const sel = el("div", { class: "chip-row shift-controls" },
+      el("span", { class: "chip-label" }, "时间窗口"));
+    for (const h of [8, 12, 24]) {
+      sel.appendChild(el("button",
+        { class: "chip" + (h === hours ? " active" : ""),
+          onclick: () => { shiftHours = h; renderShift(); } },
+        h + " 小时"));
+    }
+    $view.appendChild(sel);
+
+    const counts = data.counts || {};
+    const strip = el("div", { class: "shift-strip" },
+      card("新增问题", counts.new || 0, ""),
+      card("活跃问题", counts.active || 0, "amber"),
+      card("已闭环", counts.closed || 0, "green"));
+    $view.appendChild(strip);
+
+    if (data.since) {
+      $view.appendChild(el("div", { class: "shift-since" },
+        "统计窗口：" + fmtDate(data.since) + " 至今（约 " + hours + " 小时）"));
+    }
+
+    const section = (label, rows, cls) => {
+      $view.appendChild(el("div", { class: "list-subhead " + (cls || "") },
+        label + " (" + rows.length + ")"));
+      if (!rows.length) {
+        $view.appendChild(el("div", { class: "empty sm" }, "本班次无"));
+        return;
+      }
+      const list = el("div", { class: "issue-list" });
+      for (const it of rows) list.appendChild(issueRow(it, { showCustomer: true }));
+      $view.appendChild(list);
+    };
+    section("🆕 新增问题", data.new_issues || [], "open");
+    section("🔥 活跃问题", data.active_issues || [], "open");
+    section("✅ 已闭环", data.closed_issues || [], "closed");
+  }
+
+  // -------------------------------------------------------------------------
   // Router
   // -------------------------------------------------------------------------
 
@@ -566,6 +639,8 @@
     try {
       if (hash === "#/" || hash === "#") {
         await renderRoot();
+      } else if (hash === "#/shift") {
+        await renderShift();
       } else if (hash === "#/admin") {
         await renderAdmin();
       } else if (hash.startsWith("#/customers/")) {
@@ -649,6 +724,7 @@
     if (bar) bar.remove();
     bar = el("div", { class: "user-chip", id: "user-chip" },
       el("span", { class: "uname" }, (_me.name || _me.email) + (isAdmin() ? " · 管理员" : "")));
+    bar.appendChild(el("a", { class: "link", onclick: () => location.hash = "#/shift" }, "班次复盘"));
     if (isAdmin()) {
       bar.appendChild(el("a", { class: "link", onclick: () => location.hash = "#/admin" }, "待审批"));
     }

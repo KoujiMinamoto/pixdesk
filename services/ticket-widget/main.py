@@ -877,6 +877,15 @@ async def dash_summary(user: dict = Depends(require_dash_approved)) -> Any:
     return _passthrough(resp)
 
 
+@app.get("/api/v1/dashboard/shift")
+async def dash_shift(request: Request, user: dict = Depends(require_dash_approved)) -> Any:
+    """Shift-review panel: issues new/active/closed in a rolling window (default
+    8h). Pass ?hours=N to widen it."""
+    params = dict(request.query_params)
+    resp = await _issue_proxy("GET", "/v1/dashboard/shift", "@anon:dashboard", params=params)
+    return _passthrough(resp)
+
+
 @app.get("/api/v1/dashboard/customers/issues")
 async def dash_customer_issues(
     request: Request,

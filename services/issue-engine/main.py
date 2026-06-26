@@ -463,6 +463,83 @@ def dash_summary() -> Any:
     return out
 
 
+@app.get("/v1/dashboard/shift", dependencies=[Depends(require_secret)])
+def dash_shift(hours: int = Query(8, ge=1, le=72)) -> Any:
+    """Shift-review panel. Support runs 3 rotating 8h shifts; at clock-off a
+    reviewer opens this to see everything that moved on their watch. Returns the
+    issues in a rolling `hours`-hour window (default 8) split into three
+    mutually-exclusive buckets:
+
+      closed  — closure detected in-window (terminal state takes priority)
+      new     — opened in-window and still open
+      active  — opened earlier but had activity in-window (still open)
+
+    Each bucket is a full issue list (same row shape as the customer view) plus
+    the channel name so the reviewer can tell customers apart at a glance."""
+    with _PooledConn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                f"""
+                WITH bounds AS (
+                  SELECT now() - make_interval(hours => %s) AS since
+                )
+                SELECT i.id, i.code, i.title,
+                       (i.metadata->>'summary') AS summary,
+                       (i.metadata->>'summary_zh') AS summary_zh,
+                       i.lifecycle_state, i.review_state, i.nonclosure_reason,
+                       i.closure_reason, i.last_speaker,
+                       i.last_customer_at, i.last_agent_at,
+                       i.message_count, i.opened_at, i.last_activity_at,
+                       i.external_party_name, i.detector,
+                       i.customer_platform, i.customer_workspace_id,
+                       i.customer_channel_id,
+                       (i.metadata->'products') AS products,
+                       (SELECT ch.channel_name FROM agent.channels ch
+                          WHERE ch.platform = i.customer_platform
+                            AND ch.workspace_id = i.customer_workspace_id
+                            AND ch.channel_id = i.customer_channel_id
+                          LIMIT 1) AS channel_name,
+                       CASE
+                         WHEN i.lifecycle_state IN ('closed_inferred','closed_confirmed')
+                              AND COALESCE(i.closure_detected_at, i.closed_at, i.last_activity_at)
+                                  >= (SELECT since FROM bounds)
+                           THEN 'closed'
+                         WHEN i.opened_at >= (SELECT since FROM bounds)
+                           THEN 'new'
+                         ELSE 'active'
+                       END AS bucket
+                FROM {SCHEMA}.issues i
+                WHERE i.lifecycle_state <> 'dismissed'
+                  AND i.review_state <> 'rejected'
+                  AND (
+                    -- closed in window (any open-date)
+                    (i.lifecycle_state IN ('closed_inferred','closed_confirmed')
+                     AND COALESCE(i.closure_detected_at, i.closed_at, i.last_activity_at)
+                         >= (SELECT since FROM bounds))
+                    -- or still-open and touched/opened in window
+                    OR (i.lifecycle_state NOT IN ('closed_inferred','closed_confirmed')
+                        AND (i.opened_at >= (SELECT since FROM bounds)
+                             OR i.last_activity_at >= (SELECT since FROM bounds)))
+                  )
+                ORDER BY i.last_activity_at DESC NULLS LAST
+                """,
+                (hours,),
+            )
+            rows = _rows(cur)
+            cur.execute("SELECT now() - make_interval(hours => %s) AS since", (hours,))
+            since = cur.fetchone()["since"]
+    buckets: dict[str, list] = {"new": [], "active": [], "closed": []}
+    for r in rows:
+        buckets.get(r.get("bucket"), buckets["active"]).append(r)
+    return {
+        "hours": hours,
+        "since": since.isoformat() if since else None,
+        "counts": {k: len(v) for k, v in buckets.items()},
+        "new_issues": buckets["new"],
+        "active_issues": buckets["active"],
+        "closed_issues": buckets["closed"],
+    }
+
 
 @app.get("/v1/dashboard/customers/issues", dependencies=[Depends(require_secret)])
 def dash_customer_issues(
