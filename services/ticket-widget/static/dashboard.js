@@ -19,7 +19,28 @@
   const $back = document.getElementById("back-btn");
   const $crumbs = document.getElementById("crumbs");
   const $strip = document.getElementById("summary-strip");
+  const $nav = document.getElementById("main-nav");
   const $view = document.getElementById("view");
+
+  // Top-level section tabs. `active` is one of: overview | shift | tickets,
+  // or null to hide the nav (gate screens, deep drilldowns keep it for quick
+  // jumps but null hides it entirely).
+  const NAV_TABS = [
+    { key: "overview", label: "总览", hash: "#/" },
+    { key: "shift", label: "班次复盘", hash: "#/shift" },
+    { key: "tickets", label: "Ticket 记录", hash: "#/tickets" },
+  ];
+  function renderNav(active) {
+    if (!active) { $nav.hidden = true; $nav.innerHTML = ""; return; }
+    $nav.hidden = false;
+    $nav.innerHTML = "";
+    for (const t of NAV_TABS) {
+      $nav.appendChild(el("a",
+        { class: "nav-tab" + (t.key === active ? " active" : ""),
+          onclick: () => { location.hash = t.hash; } },
+        t.label));
+    }
+  }
 
   function setStatus(msg, kind) {
     $status.textContent = msg || "";
@@ -133,6 +154,8 @@
   let _rollupItems = [];
   // Shift-review window in hours (support runs 3 rotating 8h shifts).
   let shiftHours = 8;
+  // Ticket-archive list filter state.
+  const ticketFilter = { status: "all", q: "" };
 
   function platformPill(p) {
     return el("span", { class: "tag platform platform-" + (p || "other") },
@@ -164,6 +187,7 @@
     $title.textContent = "客户问题闭环看板";
     $back.hidden = true;
     $crumbs.innerHTML = "";
+    renderNav("overview");
     $strip.style.display = "grid";
     $view.innerHTML = "";
     $view.appendChild(el("div", { class: "loading" }, "加载中…"));
@@ -316,6 +340,7 @@
   async function renderCustomer(key) {
     const { platform, workspace_id, channel_id } = parseCustomerKey(key);
     $strip.style.display = "none";
+    renderNav(null);
     $view.innerHTML = "";
     $view.appendChild(el("div", { class: "loading" }, "加载中…"));
     $back.hidden = false;
@@ -400,6 +425,7 @@
 
   async function renderIssue(issueId) {
     $strip.style.display = "none";
+    renderNav(null);
     $view.innerHTML = "";
     $view.appendChild(el("div", { class: "loading" }, "加载中…"));
     $back.hidden = false;
@@ -462,10 +488,43 @@
       detail.appendChild(el("div", { class: "summary-block" }, summaryEn));
     }
 
+    // Participants (经手同学): support logs in with a *shared* account, so the
+    // real handlers are the distinct 我方 senders in the transcript. This is the
+    // hook a future shift-roster will attribute work against.
+    const handlers = [];
+    const seen = new Set();
+    for (const t of turns) {
+      if (t.role === "agent") {
+        const n = t.sender_name || t.sender_id;
+        if (n && !seen.has(n)) { seen.add(n); handlers.push(n); }
+      }
+    }
+    if (handlers.length) {
+      detail.appendChild(el("div", { class: "handlers" },
+        el("span", { class: "handlers-label" }, "经手同学"),
+        ...handlers.map((h) => el("span", { class: "handler-chip" }, h))));
+    }
+
+    // State-aware review actions.
+    //  - 疑似闭环 (closed_inferred): 确认闭环 / 未闭环 / 忽略
+    //  - 已闭环 (closed_confirmed): 重新打开
+    //  - 其它(进行中): 确认为真问题 / 标记已闭环 / 忽略
     const actions = el("div", { class: "actions" });
-    actions.appendChild(el("button", { onclick: () => act(issueId, "confirm") }, "✓ 确认为真问题"));
-    actions.appendChild(el("button", { class: "danger",
-      onclick: () => act(issueId, "reject") }, "✕ 忽略"));
+    const btn = (label, action, cls) =>
+      el("button", cls ? { class: cls, onclick: () => act(issueId, action) }
+                        : { onclick: () => act(issueId, action) }, label);
+    const st = it.lifecycle_state;
+    if (st === "closed_inferred") {
+      actions.appendChild(btn("✓ 确认闭环", "close"));
+      actions.appendChild(btn("✗ 未闭环", "reopen", "warn"));
+      actions.appendChild(btn("✕ 忽略", "reject", "danger"));
+    } else if (st === "closed_confirmed") {
+      actions.appendChild(btn("↩ 重新打开", "reopen", "warn"));
+    } else {
+      actions.appendChild(btn("✓ 确认为真问题", "confirm"));
+      actions.appendChild(btn("✓ 标记已闭环", "close"));
+      actions.appendChild(btn("✕ 忽略", "reject", "danger"));
+    }
     detail.appendChild(actions);
 
     // transcript
@@ -508,12 +567,16 @@
     $view.appendChild(detail);
   }
 
+  const ACT_DONE = {
+    confirm: "已确认", reject: "已忽略", dismiss: "已忽略",
+    close: "已确认闭环", reopen: "已重新打开",
+  };
   async function act(issueId, action) {
     try {
       setStatus("提交中…");
       await api("/api/v1/dashboard/issues/" + issueId + "/review",
         { method: "POST", json: { action } });
-      setStatus("已" + (action === "confirm" ? "确认" : "忽略"), "ok");
+      setStatus(ACT_DONE[action] || "已提交", "ok");
       setTimeout(() => setStatus(""), 1500);
       // re-render current view
       route();
@@ -526,6 +589,7 @@
 
   async function renderAdmin() {
     $strip.style.display = "none";
+    renderNav(null);
     $back.hidden = false;
     $back.onclick = () => location.hash = "#/";
     $title.textContent = "待审批用户";
@@ -571,6 +635,7 @@
 
   async function renderShift() {
     $strip.style.display = "none";
+    renderNav("shift");
     $view.innerHTML = "";
     $back.hidden = false;
     $back.onclick = () => location.hash = "#/";
@@ -625,6 +690,115 @@
   }
 
   // -------------------------------------------------------------------------
+  // View 5: ticket archive — every issue as a ticket record (flat list)
+  // -------------------------------------------------------------------------
+
+  const TICKET_STATUS_TABS = [
+    { key: "all", label: "全部" },
+    { key: "open", label: "进行中" },
+    { key: "closed", label: "已闭环" },
+  ];
+
+  function ticketRow(it) {
+    const stateLabel = STATE_LABEL[it.lifecycle_state] || it.lifecycle_state;
+    const summary = it.summary_zh || it.summary || "";
+    const handler = it.last_handler
+      ? "经手 " + it.last_handler +
+        (it.handler_count > 1 ? " 等 " + it.handler_count + " 人" : "")
+      : null;
+    const closed = (it.lifecycle_state === "closed_confirmed" ||
+                    it.lifecycle_state === "closed_inferred");
+    const whenLabel = closed && it.closed_at
+      ? "闭环 " + fmtAge(it.closed_at)
+      : fmtAge(it.last_activity_at);
+    return el("div", { class: "issue-row",
+                       onclick: () => location.hash = "#/issues/" + it.id },
+      el("span", { class: "pill " + it.lifecycle_state }, stateLabel),
+      el("div", null,
+        el("div", { class: "cust-line" },
+          el("span", { class: "cust-chip",
+                       onclick: (e) => { e.stopPropagation();
+                         location.hash = "#/customers/" + customerKey(it); } },
+            customerLabel(it)),
+          it.code ? el("span", { class: "ticket-code" }, it.code) : null,
+          ...productPills(Array.isArray(it.products) ? it.products : [])),
+        el("div", { class: "title" }, it.title || "(无标题)"),
+        summary ? el("div", { class: "summary" }, summary) : null,
+        el("div", { class: "who" },
+          (it.message_count || 0) + " 条消息" +
+          (handler ? " · " + handler : ""))),
+      el("div", { class: "when" }, whenLabel));
+  }
+
+  let _ticketSearchTimer = null;
+
+  async function renderTickets() {
+    $strip.style.display = "none";
+    renderNav("tickets");
+    $back.hidden = true;
+    $title.textContent = "Ticket 记录";
+    $crumbs.innerHTML = "";
+    $view.innerHTML = "";
+
+    // Filter bar (built once per visit; search only refreshes the list below so
+    // typing never loses focus, status tabs re-render to flip the active chip).
+    const bar = el("div", { class: "filter-bar", id: "ticket-bar" });
+    const search = el("input", {
+      class: "cust-search", type: "search", id: "ticket-search",
+      placeholder: "搜索标题 / 编号 / 客户…", value: ticketFilter.q || "",
+    });
+    search.addEventListener("input", (e) => {
+      ticketFilter.q = e.target.value;
+      clearTimeout(_ticketSearchTimer);
+      _ticketSearchTimer = setTimeout(refreshTicketList, 250);
+    });
+    bar.appendChild(el("div", { class: "chip-row" }, search));
+    const tabRow = el("div", { class: "chip-row" }, el("span", { class: "chip-label" }, "状态"));
+    for (const t of TICKET_STATUS_TABS) {
+      tabRow.appendChild(el("button",
+        { class: "chip" + (ticketFilter.status === t.key ? " active" : ""),
+          onclick: () => { ticketFilter.status = t.key; renderTickets(); } },
+        t.label));
+    }
+    bar.appendChild(tabRow);
+    $view.appendChild(bar);
+
+    // List container, filled by refreshTicketList.
+    $view.appendChild(el("div", { class: "ticket-list-wrap", id: "ticket-list-wrap" }));
+    await refreshTicketList();
+  }
+
+  async function refreshTicketList() {
+    const wrap = document.getElementById("ticket-list-wrap");
+    if (!wrap) return;
+    wrap.innerHTML = "";
+    wrap.appendChild(el("div", { class: "loading" }, "加载中…"));
+
+    const params = new URLSearchParams({ status: ticketFilter.status, limit: "300" });
+    if (ticketFilter.q) params.set("q", ticketFilter.q);
+    let data;
+    try {
+      data = await api("/api/v1/dashboard/tickets?" + params);
+    } catch (e) {
+      wrap.innerHTML = "";
+      wrap.appendChild(el("div", { class: "empty" }, String(e.message || e)));
+      return;
+    }
+    const items = data.items || [];
+    wrap.innerHTML = "";
+    wrap.appendChild(el("div", { class: "list-subhead" },
+      "共 " + (data.total != null ? data.total : items.length) + " 条" +
+      (data.total > items.length ? "（显示前 " + items.length + " 条）" : "")));
+    if (!items.length) {
+      wrap.appendChild(el("div", { class: "empty" }, "无匹配的 ticket"));
+      return;
+    }
+    const list = el("div", { class: "issue-list" });
+    for (const it of items) list.appendChild(ticketRow(it));
+    wrap.appendChild(list);
+  }
+
+  // -------------------------------------------------------------------------
   // Router
   // -------------------------------------------------------------------------
 
@@ -641,6 +815,8 @@
         await renderRoot();
       } else if (hash === "#/shift") {
         await renderShift();
+      } else if (hash === "#/tickets") {
+        await renderTickets();
       } else if (hash === "#/admin") {
         await renderAdmin();
       } else if (hash.startsWith("#/customers/")) {
@@ -667,6 +843,7 @@
 
   function gateScreen(title, desc, btn) {
     $strip.style.display = "none";
+    renderNav(null);
     $crumbs.innerHTML = "";
     $back.hidden = true;
     $view.innerHTML = "";
@@ -724,7 +901,6 @@
     if (bar) bar.remove();
     bar = el("div", { class: "user-chip", id: "user-chip" },
       el("span", { class: "uname" }, (_me.name || _me.email) + (isAdmin() ? " · 管理员" : "")));
-    bar.appendChild(el("a", { class: "link", onclick: () => location.hash = "#/shift" }, "班次复盘"));
     if (isAdmin()) {
       bar.appendChild(el("a", { class: "link", onclick: () => location.hash = "#/admin" }, "待审批"));
     }

@@ -122,6 +122,44 @@ header ("班次复盘", `#/shift`).
   link. Issue rows in this view carry a clickable customer chip
   (`issueRow(it, {showCustomer:true})`) that jumps to that customer's page.
 
+## 10. Closure actions, top-level nav, and the ticket archive
+
+A reviewer needs to act on a 疑似闭环, and every issue needs an archival
+"ticket" record with handler attribution. Three linked changes:
+
+### 10a. Human closure actions (确认闭环 / 未闭环)
+`/v1/issues/{id}/review` gains two actions on top of confirm/reject/dismiss:
+- **`close`** (确认闭环) — sets `lifecycle_state=closed_confirmed` (the
+  human-only terminal state the closure_agent is forbidden from setting),
+  `review_state=confirmed`, fills `closed_at`/`closure_detected_at`. This is
+  how a 疑似闭环 is promoted to a real closure and archived as a finished
+  ticket.
+- **`reopen`** (未闭环) — the auto-closure was wrong. Lifecycle returns to an
+  open state derived from who spoke last (我方 last → `awaiting_customer`;
+  else `awaiting_agent` + `unanswered_customer`), bumps `reopened_count`, and
+  sets `review_state=confirmed` so the closure_agent won't silently re-close it
+  — a human now owns the close.
+
+Issue-detail buttons are now state-aware: 疑似闭环 shows 确认闭环 / 未闭环 /
+忽略; 已闭环 shows 重新打开; open issues show 确认为真问题 / 标记已闭环 /
+忽略.
+
+### 10b. Top-level nav (总览 / 班次复盘 / Ticket 记录)
+A tab bar under the header switches between the three top-level views
+(`#/`, `#/shift`, `#/tickets`); hidden on drilldowns and gate screens. (The
+old per-link header shortcut for 班次复盘 was removed in favour of the tabs.)
+
+### 10c. Ticket archive page + handler attribution
+`/v1/dashboard/tickets` returns every issue as a flat "ticket record"
+(status/q/platform/product filters, paginated, default newest-closed-first).
+Because **`support` is a shared on-duty login**, the real handler can't come
+from the auth identity — so each ticket derives `last_handler` and
+`handler_count` from the distinct **我方 senders** in the chat itself. The
+issue-detail page shows the full 经手同学 chip list (derived client-side from
+the transcript roles). This is the hook a future **support shift-roster** will
+use to attribute who worked/resolved each issue by time. Frontend
+`renderTickets()` is a searchable, status-tabbed list → existing issue detail.
+
 ## Known follow-ups
 - Auto-discovery runs once per distill pass; detector can still create a few
   redundant heuristic issues in distill-owned channels (cleaned via

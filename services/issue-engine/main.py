@@ -541,6 +541,98 @@ def dash_shift(hours: int = Query(8, ge=1, le=72)) -> Any:
     }
 
 
+@app.get("/v1/dashboard/tickets", dependencies=[Depends(require_secret)])
+def dash_tickets(
+    status: str = Query("all"),     # all | open | closed | archived
+    q: Optional[str] = Query(None),
+    platform: Optional[str] = Query(None),
+    product: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+) -> Any:
+    """Ticket archive: every issue as a flat 'ticket record' for the dedicated
+    ticket page. Each issue is one ticket. Because `support` is a *shared*
+    on-duty login, the human who actually handled it can't come from the
+    auth identity — so we derive the handler(s) from the chat itself: the
+    distinct agent-side senders on the issue, plus the most recent one as the
+    `last_handler`. A future shift-roster can then attribute work by time."""
+    where = ["i.lifecycle_state <> 'dismissed'", "i.review_state <> 'rejected'",
+             TIME_FLOOR_ALIAS]
+    args: list[Any] = []
+    if status == "open":
+        where.append("i.lifecycle_state NOT IN ('closed_confirmed','closed_inferred')")
+    elif status == "closed":
+        where.append("i.lifecycle_state IN ('closed_confirmed','closed_inferred')")
+    elif status == "archived":
+        where.append("i.lifecycle_state = 'closed_confirmed'")
+    if platform:
+        where.append("i.customer_platform = %s")
+        args.append(platform)
+    if product:
+        where.append("COALESCE(i.metadata->'products','[]'::jsonb) ? %s")
+        args.append(product)
+    if q:
+        where.append(
+            "(i.title ILIKE %s OR i.code ILIKE %s OR i.external_party_name ILIKE %s "
+            "OR i.customer_workspace_id ILIKE %s "
+            "OR EXISTS (SELECT 1 FROM agent.channels ch2 "
+            "  WHERE ch2.platform=i.customer_platform "
+            "    AND ch2.workspace_id=i.customer_workspace_id "
+            "    AND ch2.channel_id=i.customer_channel_id "
+            "    AND ch2.channel_name ILIKE %s))"
+        )
+        like = f"%{q}%"
+        args.extend([like, like, like, like, like])
+    sql = f"""
+        SELECT i.id, i.code, i.title,
+               (i.metadata->>'summary') AS summary,
+               (i.metadata->>'summary_zh') AS summary_zh,
+               i.lifecycle_state, i.review_state, i.nonclosure_reason,
+               i.closure_reason, i.last_speaker, i.last_customer_at, i.last_agent_at,
+               i.message_count, i.opened_at, i.last_activity_at, i.closed_at,
+               i.external_party_name, i.reopened_count,
+               i.customer_platform, i.customer_workspace_id, i.customer_channel_id,
+               (i.metadata->'products') AS products,
+               (SELECT ch.channel_name FROM agent.channels ch
+                  WHERE ch.platform = i.customer_platform
+                    AND ch.workspace_id = i.customer_workspace_id
+                    AND ch.channel_id = i.customer_channel_id
+                  LIMIT 1) AS channel_name,
+               (SELECT am.sender_name
+                  FROM {SCHEMA}.issue_messages im
+                  JOIN agent.messages am
+                    ON am.platform = im.platform AND am.workspace_id = im.workspace_id
+                   AND am.channel_id = im.channel_id AND am.message_id = im.message_id
+                  WHERE im.issue_id = i.id AND im.role = 'agent'
+                    AND am.sender_name IS NOT NULL
+                  ORDER BY am.ts DESC NULLS LAST LIMIT 1) AS last_handler,
+               (SELECT count(DISTINCT am.sender_name)
+                  FROM {SCHEMA}.issue_messages im
+                  JOIN agent.messages am
+                    ON am.platform = im.platform AND am.workspace_id = im.workspace_id
+                   AND am.channel_id = im.channel_id AND am.message_id = im.message_id
+                  WHERE im.issue_id = i.id AND im.role = 'agent'
+                    AND am.sender_name IS NOT NULL) AS handler_count
+        FROM {SCHEMA}.issues i
+        WHERE {' AND '.join(where)}
+        ORDER BY COALESCE(i.closed_at, i.last_activity_at) DESC NULLS LAST
+        LIMIT %s OFFSET %s
+    """
+    args.extend([limit, offset])
+    with _PooledConn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, args)
+            items = _rows(cur)
+            # total (ignoring pagination) for the list header
+            cur.execute(
+                f"SELECT count(*) AS n FROM {SCHEMA}.issues i WHERE {' AND '.join(where)}",
+                args[:-2],
+            )
+            total = cur.fetchone()["n"]
+    return {"items": items, "count": len(items), "total": total,
+            "status": status, "limit": limit, "offset": offset}
+
+
 @app.get("/v1/dashboard/customers/issues", dependencies=[Depends(require_secret)])
 def dash_customer_issues(
     platform: str = Query(...),
@@ -679,7 +771,7 @@ def _history(cur, issue_id: str, field: str, old: Any, new: Any, actor: str) -> 
 
 def _fetch_issue(cur, issue_id: str) -> Optional[dict]:
     cur.execute(
-        f"SELECT id, lifecycle_state, review_state, ticket_id FROM {SCHEMA}.issues WHERE id = %s",
+        f"SELECT id, lifecycle_state, review_state, ticket_id, last_speaker FROM {SCHEMA}.issues WHERE id = %s",
         (issue_id,),
     )
     row = cur.fetchone()
@@ -687,7 +779,7 @@ def _fetch_issue(cur, issue_id: str) -> Optional[dict]:
 
 
 class ReviewBody(BaseModel):
-    action: str            # confirm | reject | dismiss
+    action: str            # confirm | reject | dismiss | close | reopen
     note: Optional[str] = None
 
 
@@ -698,9 +790,19 @@ def review_issue(issue_id: str, body: ReviewBody, actor: str = Depends(require_a
                   unchanged so it stays on the unclosed list until truly closed).
       reject/dismiss -> review_state=rejected, lifecycle_state=dismissed,
                   nonclosure cleared (it leaves every dashboard).
+      close    -> 确认闭环: lifecycle_state=closed_confirmed (the human-only
+                  terminal state the closure_agent is forbidden from setting),
+                  review_state=confirmed, nonclosure cleared. This is how a
+                  疑似闭环 (closed_inferred) gets promoted to a real closure, and
+                  it's what archives the issue as a finished ticket.
+      reopen   -> 未闭环: the auto-closure was wrong / the problem isn't actually
+                  resolved. Lifecycle returns to an open state derived from who
+                  spoke last (mirrors distill's awaiting_* rule); review_state is
+                  set to confirmed so the closure_agent won't silently re-close
+                  it — a human now owns the close.
     """
-    if body.action not in ("confirm", "reject", "dismiss"):
-        raise HTTPException(400, "action must be confirm | reject | dismiss")
+    if body.action not in ("confirm", "reject", "dismiss", "close", "reopen"):
+        raise HTTPException(400, "action must be confirm | reject | dismiss | close | reopen")
     with _PooledConn() as conn:
         try:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -718,6 +820,41 @@ def review_issue(issue_id: str, body: ReviewBody, actor: str = Depends(require_a
                     )
                     _history(cur, issue_id, "review_confirmed",
                              {"review_state": old_review}, {"review_state": "confirmed"}, actor)
+                elif body.action == "close":
+                    cur.execute(
+                        f"""UPDATE {SCHEMA}.issues
+                           SET lifecycle_state='closed_confirmed', review_state='confirmed',
+                               nonclosure_reason=NULL, reviewed_by_mxid=%s, reviewed_at=now(),
+                               closed_at=COALESCE(closed_at, now()),
+                               closure_detected_at=COALESCE(closure_detected_at, now())
+                           WHERE id=%s""",
+                        (actor, issue_id),
+                    )
+                    _history(cur, issue_id, "closure_confirmed",
+                             {"lifecycle_state": old_life, "review_state": old_review},
+                             {"lifecycle_state": "closed_confirmed", "review_state": "confirmed",
+                              "note": body.note}, actor)
+                elif body.action == "reopen":
+                    # Ball-in-court from who spoke last: we spoke last -> waiting on
+                    # the customer; otherwise it's back in our court.
+                    if issue.get("last_speaker") == "agent":
+                        new_life, new_nc = "awaiting_customer", None
+                    else:
+                        new_life, new_nc = "awaiting_agent", "unanswered_customer"
+                    cur.execute(
+                        f"""UPDATE {SCHEMA}.issues
+                           SET lifecycle_state=%s, review_state='confirmed',
+                               nonclosure_reason=%s, closure_reason=NULL, closed_at=NULL,
+                               closure_detected_at=NULL,
+                               reopened_count=COALESCE(reopened_count,0)+1,
+                               reviewed_by_mxid=%s, reviewed_at=now()
+                           WHERE id=%s""",
+                        (new_life, new_nc, actor, issue_id),
+                    )
+                    _history(cur, issue_id, "reopened_by_review",
+                             {"lifecycle_state": old_life, "review_state": old_review},
+                             {"lifecycle_state": new_life, "review_state": "confirmed",
+                              "note": body.note}, actor)
                 else:  # reject | dismiss
                     cur.execute(
                         f"""UPDATE {SCHEMA}.issues
