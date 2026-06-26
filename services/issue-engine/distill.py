@@ -115,7 +115,7 @@ SYSTEM_DISTILL = (
     "ones. Use \"Other\" if none fit.\n"
     "9. Output strictly valid JSON, nothing else, matching this shape exactly:\n"
     "   {\"issues\":[{\"external_id\":str,\"title\":str,\"status\":\"open\"|\"closed\","
-    "\"summary\":str,\"summary_zh\":str,\"closure_reason\":str|null,"
+    "\"summary\":str,\"summary_zh\":str,\"next_action_zh\":str,\"closure_reason\":str|null,"
     "\"products\":[str,...],"
     "\"roles\":{\"<msg_id>\":\"customer\"|\"agent\"|\"bot\"},"
     "\"evidence_msg_ids\":[str,...]}]}\n"
@@ -128,6 +128,10 @@ SYSTEM_DISTILL = (
     "based on what actually happened in the messages.\n"
     "12. roles MUST cover every msg_id in evidence_msg_ids, keyed by the "
     "verbatim message_id.\n"
+    "13. next_action_zh: 给我方支持同学的一句【可执行】下一步建议（简体中文，"
+    "<=60 字），基于聊天里真正缺的那一步。例如：『向客户确认是否仍复现，并索取最新"
+    "报错日志』『升级给后端排查 OCI 扩容失败根因』。若问题已闭环、确实无需我方再做任何"
+    "事，则置为空字符串 \"\"。不要写空话套话，要具体到这个问题。\n"
 )
 
 
@@ -464,6 +468,7 @@ def _upsert_issue(conn, channel: dict[str, Any], item: dict[str, Any]) -> Option
     status = item.get("status") or "open"
     summary = (item.get("summary") or "").strip()[:2000]
     summary_zh = (item.get("summary_zh") or "").strip()[:500]
+    next_action_zh = (item.get("next_action_zh") or "").strip()[:300]
     closure_reason = item.get("closure_reason")
     evidence = [str(x) for x in (item.get("evidence_msg_ids") or []) if x]
     products = _normalize_products(item.get("products"))
@@ -586,7 +591,7 @@ def _upsert_issue(conn, channel: dict[str, Any], item: dict[str, Any]) -> Option
             cr = None
 
     metadata = {"distill_external_id": ext, "summary": summary,
-                "summary_zh": summary_zh,
+                "summary_zh": summary_zh, "next_action_zh": next_action_zh,
                 "distilled": True, "evidence_count": len(evidence),
                 "products": products}
 

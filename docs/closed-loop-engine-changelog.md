@@ -160,6 +160,20 @@ the transcript roles). This is the hook a future **support shift-roster** will
 use to attribute who worked/resolved each issue by time. Frontend
 `renderTickets()` is a searchable, status-tabbed list → existing issue detail.
 
+## 11. Per-issue suggested next action (建议 TODO)
+
+distill now emits a `next_action_zh` per issue — a single actionable Chinese
+next-step for our support staff, derived from what the conversation is actually
+missing (rule 13 in `SYSTEM_DISTILL`; stored in `issues.metadata.next_action_zh`,
+≤300 chars; empty string when the issue is genuinely closed/no-action). The
+issue-detail page renders it as an amber "建议 TODO" callout next to the summary
+**and** again at the bottom (so a reviewer who scrolled the whole transcript
+sees the recommendation without scrolling back up).
+
+Existing open issues were backfilled in one pass (a small `llm._ask` over each
+issue's title + `summary_zh`, written via `metadata = metadata || …`) — 100
+open issues, all populated. New/changed issues get it inline from distill.
+
 ## Known follow-ups
 - Auto-discovery runs once per distill pass; detector can still create a few
   redundant heuristic issues in distill-owned channels (cleaned via
