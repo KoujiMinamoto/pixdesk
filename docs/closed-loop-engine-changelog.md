@@ -197,6 +197,18 @@ knowledge pixdesk already distills, via one drop-in skill.
   beyond shared English tokens) is the v2 upgrade: add a vector column + cosine,
   skill interface unchanged.
 
+## 13. Source connection-status bar (Slack / Discord)
+
+A small data-source status bar on the overview shows whether each source
+platform is still flowing. The dashboard runs on the Tencent mirror and can't
+ping the mautrix bridges directly, so status is **inferred from data freshness**
+— the newest message per platform (`/v1/dashboard/sources`: `max(ts)`,
+`age_seconds`, `channels_24h`). Health dot: 🟢 ≤1h (flowing) / 🟡 ≤6h
+(lagging/quiet) / 🔴 >6h (likely disconnected); the chip also shows the actual
+"最近 X 前" time + active-channel count. Windows are generous because busy
+multi-channel platforms have natural gaps — it's a flow proxy, not a bridge
+ping (a genuinely quiet period also ages the dot; tooltip says so).
+
 ## Known follow-ups
 - Auto-discovery runs once per distill pass; detector can still create a few
   redundant heuristic issues in distill-owned channels (cleaned via

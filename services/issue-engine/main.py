@@ -473,6 +473,35 @@ def dash_summary() -> Any:
     return out
 
 
+@app.get("/v1/dashboard/sources", dependencies=[Depends(require_secret)])
+def dash_sources() -> Any:
+    """Connection/data-flow status per source platform (Slack, Discord).
+
+    The dashboard runs on the Tencent mirror and can't ping the mautrix bridges
+    directly, so 'connection status' is inferred from data freshness: the newest
+    message we've received per platform. The UI shows the actual last-activity
+    time and a health dot derived from its age — green = clearly flowing,
+    amber = lagging/quiet, red = stale (likely disconnected). It's a flow proxy,
+    not a direct bridge ping (a genuinely quiet period also ages the dot)."""
+    with _PooledConn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT m.platform,
+                       max(m.ts) AS last_ts,
+                       EXTRACT(EPOCH FROM (now() - max(m.ts)))::bigint AS age_seconds,
+                       count(*) FILTER (WHERE m.ts >= now() - interval '24 hours') AS msgs_24h,
+                       count(DISTINCT m.channel_id)
+                         FILTER (WHERE m.ts >= now() - interval '24 hours') AS channels_24h
+                FROM agent.messages m
+                GROUP BY m.platform
+                ORDER BY m.platform
+                """
+            )
+            rows = _rows(cur)  # _rows already JSON-serialises datetimes to ISO strings
+    return {"sources": rows}
+
+
 @app.get("/v1/dashboard/shift", dependencies=[Depends(require_secret)])
 def dash_shift(hours: int = Query(8, ge=1, le=72)) -> Any:
     """Shift-review panel. Support runs 3 rotating 8h shifts; at clock-off a

@@ -886,6 +886,13 @@ async def dash_shift(request: Request, user: dict = Depends(require_dash_approve
     return _passthrough(resp)
 
 
+@app.get("/api/v1/dashboard/sources")
+async def dash_sources(user: dict = Depends(require_dash_approved)) -> Any:
+    """Per-platform connection / data-flow status (Slack, Discord)."""
+    resp = await _issue_proxy("GET", "/v1/dashboard/sources", "@anon:dashboard")
+    return _passthrough(resp)
+
+
 @app.get("/api/v1/dashboard/tickets")
 async def dash_tickets(request: Request, user: dict = Depends(require_dash_approved)) -> Any:
     """Ticket archive: flat list of every issue as a ticket record. Pass

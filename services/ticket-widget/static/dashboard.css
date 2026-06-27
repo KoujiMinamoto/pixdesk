@@ -110,6 +110,26 @@ body { background: #fafbfc; }
 .detail .actions button.warn { background: var(--color-amber); }
 .detail .actions button.warn:hover { background: #9a3d00; }
 
+/* data-source / connection status bar */
+.source-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  margin-bottom: 12px; }
+.source-bar .src-title { font-size: 12px; color: var(--color-muted); margin-right: 2px; }
+.src-chip { display: inline-flex; align-items: center; gap: 6px; font-size: 12px;
+  padding: 4px 10px; border-radius: 14px; border: 1px solid var(--color-border);
+  background: var(--color-card); }
+.src-chip .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.src-chip.live .dot { background: var(--color-green); box-shadow: 0 0 0 3px #1a7f3722; }
+.src-chip.lag  .dot { background: var(--color-amber); box-shadow: 0 0 0 3px #bc4c0022; }
+.src-chip.down .dot { background: var(--color-red);   box-shadow: 0 0 0 3px #cf222e22; }
+.src-chip.live { border-color: #b7e0c2; }
+.src-chip.lag  { border-color: #f0d9a8; }
+.src-chip.down { border-color: #f3b9bd; }
+.src-chip .src-state { font-weight: 600; }
+.src-chip.live .src-state { color: var(--color-green); }
+.src-chip.lag  .src-state { color: var(--color-amber); }
+.src-chip.down .src-state { color: var(--color-red); }
+.src-chip .src-meta { color: var(--color-muted); }
+
 /* 建议 TODO callout */
 .todo-block { display: flex; align-items: baseline; gap: 8px;
   background: #fff8e6; border: 1px solid #f5d98a; border-left: 3px solid var(--color-amber);

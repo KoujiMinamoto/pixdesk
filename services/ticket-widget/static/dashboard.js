@@ -20,6 +20,7 @@
   const $crumbs = document.getElementById("crumbs");
   const $strip = document.getElementById("summary-strip");
   const $nav = document.getElementById("main-nav");
+  const $sources = document.getElementById("source-bar");
   const $view = document.getElementById("view");
 
   // Top-level section tabs. `active` is one of: overview | shift | tickets,
@@ -192,10 +193,14 @@
     $view.innerHTML = "";
     $view.appendChild(el("div", { class: "loading" }, "加载中…"));
 
-    const [summary, rollup] = await Promise.all([
+    const [summary, rollup, sources] = await Promise.all([
       api("/api/v1/dashboard/summary"),
       api("/api/v1/dashboard/rollup"),
+      api("/api/v1/dashboard/sources").catch(() => ({ sources: [] })),
     ]);
+
+    // Data-source connection bar (Slack / Discord), inferred from data freshness.
+    renderSourceBar(sources.sources || []);
 
     // top strip — all metrics scoped to "this week" (since last Friday),
     // except 待我方 which is an always-current total.
@@ -292,6 +297,45 @@
     $view.appendChild(grid);
   }
 
+
+  function fmtAgeSecs(s) {
+    s = Math.max(0, +s || 0);
+    if (s < 60) return Math.round(s) + " 秒前";
+    if (s < 3600) return Math.round(s / 60) + " 分钟前";
+    if (s < 86400) return (s / 3600).toFixed(1) + " 小时前";
+    return (s / 86400).toFixed(0) + " 天前";
+  }
+
+  // Connection / data-flow status per source platform. Health is inferred from
+  // how long ago we last received a message (the mirror can't ping the bridges
+  // directly): <=1h flowing, <=6h lagging/quiet, else likely disconnected.
+  // Windows are generous because busy multi-channel platforms have natural
+  // gaps; the exact "最近 X 前" time is on the chip for nuance.
+  function renderSourceBar(sources) {
+    $sources.hidden = false;
+    $sources.innerHTML = "";
+    $sources.appendChild(el("span", { class: "src-title" }, "数据源"));
+    if (!sources.length) {
+      $sources.appendChild(el("span", { class: "src-chip down" }, "无数据"));
+      return;
+    }
+    for (const s of sources) {
+      const age = +s.age_seconds;
+      let cls = "live", label = "数据正常";
+      if (!(s.last_ts) || isNaN(age)) { cls = "down"; label = "无数据"; }
+      else if (age > 21600) { cls = "down"; label = "疑似断开"; }
+      else if (age > 3600) { cls = "lag"; label = "可能滞后"; }
+      const plat = PLATFORM_LABEL[s.platform] || s.platform || "?";
+      $sources.appendChild(el("span", { class: "src-chip " + cls,
+        title: "依据最近收到消息的时间推断，非直接探测桥接" },
+        el("span", { class: "dot" }),
+        el("b", null, plat),
+        el("span", { class: "src-state" }, label),
+        el("span", { class: "src-meta" },
+          "最近 " + fmtAgeSecs(age) +
+          (s.channels_24h != null ? " · " + s.channels_24h + " 活跃频道" : ""))));
+    }
+  }
 
   function card(label, value, kind, sub) {
     return el("div", { class: "summary-card " + (kind || "") },
@@ -822,10 +866,12 @@
   async function route() {
     const hash = location.hash || "#/";
     setStatus("");
-    // Filter bar belongs to the root view only; drop it on any navigation.
+    // Filter bar + source bar belong to the root view only; drop on any nav
+    // (renderRoot re-shows the source bar).
     if (hash !== "#/" && hash !== "#") {
       const fb = document.getElementById("filter-bar");
       if (fb) fb.remove();
+      $sources.hidden = true;
     }
     try {
       if (hash === "#/" || hash === "#") {
@@ -860,6 +906,7 @@
 
   function gateScreen(title, desc, btn) {
     $strip.style.display = "none";
+    $sources.hidden = true;
     renderNav(null);
     $crumbs.innerHTML = "";
     $back.hidden = true;
