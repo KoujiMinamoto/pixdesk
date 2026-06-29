@@ -612,6 +612,9 @@ def dash_shift_workload(
         "roster_covered": roster_n > 0,
         "people": rows,
     }
+
+
+@app.get("/v1/dashboard/sources", dependencies=[Depends(require_secret)])
 def dash_sources() -> Any:
     """Connection/data-flow status per source platform (Slack, Discord).
 
