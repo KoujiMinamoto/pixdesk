@@ -399,6 +399,30 @@ def rollup() -> Any:
     return {"items": items, "count": len(items)}
 
 
+_PERIOD_PRESETS = {
+    "today":      ("date_trunc('day', now())", "now()"),
+    "yesterday":  ("date_trunc('day', now()) - interval '1 day'", "date_trunc('day', now())"),
+    "this_week":  ("date_trunc('week', now())", "now()"),
+    "last_week":  ("date_trunc('week', now()) - interval '7 days'", "date_trunc('week', now())"),
+    "this_month": ("date_trunc('month', now())", "now()"),
+    "last_month": ("date_trunc('month', now()) - interval '1 month'", "date_trunc('month', now())"),
+}
+
+
+def _resolve_period(period: str, start: Optional[str], end: Optional[str]):
+    """Map a period preset (or 'custom') to ([win_start_sql, win_end_sql], params).
+    Half-open [win_start, win_end); weeks Mon→Mon, months 1st→1st; current presets
+    end at now(), past presets at the boundary. Raises HTTPException(400) on bad input."""
+    if period == "custom":
+        if not start:
+            raise HTTPException(400, "custom period requires start")
+        return "%s::timestamptz", "COALESCE(%s::timestamptz, now())", [start, end]
+    if period in _PERIOD_PRESETS:
+        s, e = _PERIOD_PRESETS[period]
+        return s, e, []
+    raise HTTPException(400, f"unknown period: {period}")
+
+
 @app.get("/v1/dashboard/summary", dependencies=[Depends(require_secret)])
 def dash_summary(
     period: str = Query("this_week"),
@@ -407,35 +431,10 @@ def dash_summary(
 ) -> Any:
     """Top-of-page numbers for the dashboard hero strip, scoped to a time window.
 
-    `period` picks a preset window: today / yesterday / this_week / last_week /
-    this_month / last_month / custom. All presets are computed in SQL relative to
-    now() (server UTC); weeks run Mon 00:00 → next Mon 00:00. `custom` uses the
-    `start`/`end` query params (ISO dates/datetimes; `end` exclusive, defaults to
-    now). Every window metric uses the half-open range [win_start, win_end);
+    `period`: today / yesterday / this_week / last_week / this_month / last_month
+    / custom (uses start/end). Window metrics use [win_start, win_end);
     `awaiting_us` is always the current total (not window-scoped)."""
-    # Resolve [win_start, win_end) as SQL expressions. now() upper bound for the
-    # current-period presets; explicit upper bound for past periods.
-    presets = {
-        "today":      ("date_trunc('day', now())", "now()"),
-        "yesterday":  ("date_trunc('day', now()) - interval '1 day'",
-                       "date_trunc('day', now())"),
-        "this_week":  ("date_trunc('week', now())", "now()"),
-        "last_week":  ("date_trunc('week', now()) - interval '7 days'",
-                       "date_trunc('week', now())"),
-        "this_month": ("date_trunc('month', now())", "now()"),
-        "last_month": ("date_trunc('month', now()) - interval '1 month'",
-                       "date_trunc('month', now())"),
-    }
-    params: list[Any] = []
-    if period == "custom":
-        if not start:
-            raise HTTPException(400, "custom period requires start")
-        win_start_sql, win_end_sql = "%s::timestamptz", "COALESCE(%s::timestamptz, now())"
-        params = [start, end]
-    elif period in presets:
-        win_start_sql, win_end_sql = presets[period]
-    else:
-        raise HTTPException(400, f"unknown period: {period}")
+    win_start_sql, win_end_sql, params = _resolve_period(period, start, end)
 
     # WHERE floor: keep the global TIME_FLOOR for the current-period presets, but
     # drop the floor to the window start when the window reaches further back
@@ -518,7 +517,101 @@ def dash_summary(
     return out
 
 
-@app.get("/v1/dashboard/sources", dependencies=[Depends(require_secret)])
+@app.get("/v1/dashboard/shift-workload", dependencies=[Depends(require_secret)])
+def dash_shift_workload(
+    period: str = Query("this_week"),
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+) -> Any:
+    """Per-colleague workload over a time window, attributed via the duty roster.
+
+    `support` is a shared login, so who actually handled a message can't come from
+    the sender — it comes from agent.shift_roster (the 排班表/轮班表 expanded into
+    absolute on-duty intervals). We join each agent-side message's timestamp into
+    the roster interval that contains it, then aggregate three measures per person:
+      handled_issues   — distinct issues they touched with an 我方 reply (main)
+      agent_msgs       — our reply messages they sent
+      closed_issues    — issues whose closure was detected during their shift
+    Same period presets as /summary. Rows sorted by handled_issues desc."""
+    win_start_sql, win_end_sql, params = _resolve_period(period, start, end)
+    with _PooledConn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # handled issues + agent message counts, attributed by roster interval.
+            cur.execute(
+                f"""
+                WITH bounds AS (SELECT {win_start_sql} AS ws, {win_end_sql} AS we),
+                agent_msgs AS (
+                  SELECT m.ts, im.issue_id
+                  FROM agent.messages m
+                  JOIN {SCHEMA}.issue_messages im
+                    ON im.platform=m.platform AND im.workspace_id=m.workspace_id
+                   AND im.channel_id=m.channel_id AND im.message_id=m.message_id
+                   AND im.role='agent'
+                  WHERE m.ts >= (SELECT ws FROM bounds) AND m.ts < (SELECT we FROM bounds)
+                ),
+                attributed AS (
+                  SELECT r.person, am.issue_id
+                  FROM agent_msgs am
+                  JOIN agent.shift_roster r
+                    ON am.ts >= r.start_ts AND am.ts < r.end_ts
+                )
+                SELECT person,
+                       count(*) AS agent_msgs,
+                       count(DISTINCT issue_id) AS handled_issues
+                FROM attributed
+                GROUP BY person
+                """,
+                params + params,  # win_start/end appear twice in the CTE
+            )
+            handled = {r["person"]: r for r in _rows(cur)}
+            # closures detected during each person's shift.
+            cur.execute(
+                f"""
+                WITH bounds AS (SELECT {win_start_sql} AS ws, {win_end_sql} AS we),
+                closures AS (
+                  SELECT COALESCE(closure_detected_at, closed_at, last_activity_at) AS cts
+                  FROM {SCHEMA}.issues
+                  WHERE lifecycle_state IN ('closed_inferred','closed_confirmed')
+                    AND COALESCE(closure_detected_at, closed_at, last_activity_at)
+                          >= (SELECT ws FROM bounds)
+                    AND COALESCE(closure_detected_at, closed_at, last_activity_at)
+                          <  (SELECT we FROM bounds)
+                )
+                SELECT r.person, count(*) AS closed_issues
+                FROM closures c
+                JOIN agent.shift_roster r ON c.cts >= r.start_ts AND c.cts < r.end_ts
+                GROUP BY r.person
+                """,
+                params + params,
+            )
+            closed = {r["person"]: r["closed_issues"] for r in _rows(cur)}
+            # window bounds (echo back for the UI), + roster coverage flag.
+            cur.execute(
+                f"SELECT {win_start_sql} AS ws, {win_end_sql} AS we", params)
+            b = cur.fetchone()
+            cur.execute(
+                """SELECT count(*) n FROM agent.shift_roster r
+                   WHERE r.end_ts > %s AND r.start_ts < %s""",
+                [b["ws"], b["we"]])
+            roster_n = cur.fetchone()["n"]
+    people = set(handled) | set(closed)
+    rows = []
+    for p in people:
+        h = handled.get(p, {})
+        rows.append({
+            "person": p,
+            "handled_issues": h.get("handled_issues", 0),
+            "agent_msgs": h.get("agent_msgs", 0),
+            "closed_issues": closed.get(p, 0),
+        })
+    rows.sort(key=lambda r: (r["handled_issues"], r["agent_msgs"]), reverse=True)
+    return {
+        "period": period,
+        "win_start": b["ws"].isoformat() if b and b.get("ws") else None,
+        "win_end": b["we"].isoformat() if b and b.get("we") else None,
+        "roster_covered": roster_n > 0,
+        "people": rows,
+    }
 def dash_sources() -> Any:
     """Connection/data-flow status per source platform (Slack, Discord).
 

@@ -110,6 +110,26 @@ body { background: #fafbfc; }
 .detail .actions button.warn { background: var(--color-amber); }
 .detail .actions button.warn:hover { background: #9a3d00; }
 
+/* shift-workload (per-colleague) panel */
+.wl-wrap { margin-bottom: 18px; }
+.wl-title { font-size: 15px; margin: 0 0 8px; }
+.wl-body { margin-top: 8px; }
+.wl-table { display: flex; flex-direction: column; gap: 2px; margin-top: 8px; }
+.wl-row { display: grid; grid-template-columns: 84px 1fr 56px 56px; align-items: center;
+  gap: 8px; padding: 5px 4px; border-bottom: 1px solid #f0f1f3; }
+.wl-row.wl-head { font-size: 11px; color: var(--color-muted); border-bottom: 1px solid var(--color-border); }
+.wl-name { font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden;
+  text-overflow: ellipsis; }
+.wl-bar-cell { position: relative; display: flex; align-items: center; gap: 6px;
+  background: var(--color-bg-soft); border-radius: 4px; height: 20px; padding: 0 6px; }
+.wl-bar { position: absolute; left: 0; top: 0; height: 100%; border-radius: 4px;
+  background: linear-gradient(90deg, #ddf4ff, #54aeff); z-index: 0; }
+.wl-bar-val { position: relative; z-index: 1; font-size: 12px; }
+.wl-row.wl-head .wl-bar-cell { background: none; height: auto; }
+.wl-n { text-align: right; font-size: 13px; font-variant-numeric: tabular-nums; }
+.wl-n.green { color: var(--color-green); }
+.wl-note { font-size: 11px; color: var(--color-muted); margin-top: 8px; line-height: 1.5; }
+
 /* time-window picker */
 .period-bar { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
 .period-bar .chip.apply { background: var(--color-blue); border-color: var(--color-blue);

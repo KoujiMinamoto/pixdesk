@@ -156,6 +156,9 @@
   let _rollupItems = [];
   // Shift-review window in hours (support runs 3 rotating 8h shifts).
   let shiftHours = 8;
+  // Shift-workload (per-colleague) panel: its own period selector, defaulting
+  // to last_week (a full past shift cycle is the common review unit).
+  let workloadPeriod = localStorage.getItem("wl_period") || "last_week";
   // Ticket-archive list filter state.
   const ticketFilter = { status: "all", q: "" };
 
@@ -797,6 +800,75 @@
   // View 4: shift review (8h rolling window) — end-of-shift handoff panel
   // -------------------------------------------------------------------------
 
+  // Per-colleague workload, attributed via the duty roster. Renders into
+  // #wl-wrap (created by renderShift). Its own period selector; refetches and
+  // repaints just this panel so it doesn't reload the whole shift view.
+  function workloadQuery() {
+    return "?period=" + workloadPeriod;
+  }
+  async function renderWorkload() {
+    const wrap = document.getElementById("wl-wrap");
+    if (!wrap) return;
+    wrap.innerHTML = "";
+    wrap.appendChild(el("h3", { class: "wl-title" }, "👥 值班同事工作量"));
+
+    // period selector (reuse the overview presets, minus 今日/昨日 which are too
+    // short for a shift-workload read — but keep them, a reviewer may want today).
+    const sel = el("div", { class: "chip-row" }, el("span", { class: "chip-label" }, "时间范围"));
+    for (const [key, label] of PERIODS) {
+      if (key === "custom") continue;  // keep this panel to presets for now
+      sel.appendChild(el("button",
+        { class: "chip" + (workloadPeriod === key ? " active" : ""),
+          onclick: () => {
+            workloadPeriod = key; localStorage.setItem("wl_period", key);
+            renderWorkload();
+          } }, label));
+    }
+    wrap.appendChild(sel);
+
+    const body = el("div", { class: "wl-body" }, el("div", { class: "loading" }, "加载中…"));
+    wrap.appendChild(body);
+    let data;
+    try {
+      data = await api("/api/v1/dashboard/shift-workload" + workloadQuery());
+    } catch (e) {
+      body.innerHTML = ""; body.appendChild(el("div", { class: "empty sm" }, String(e.message || e)));
+      return;
+    }
+    body.innerHTML = "";
+    if (data.win_start) {
+      body.appendChild(el("div", { class: "shift-since" },
+        "统计窗口：" + fmtDate(data.win_start) + " ~ " + fmtDate(data.win_end) +
+        (data.roster_covered ? "" : "（⚠️ 该时段无排班表数据）")));
+    }
+    const people = data.people || [];
+    if (!people.length) {
+      body.appendChild(el("div", { class: "empty sm" }, "该时段无可归属的工作量"));
+      return;
+    }
+    const max = Math.max(1, ...people.map((p) => p.handled_issues || 0));
+    const tbl = el("div", { class: "wl-table" });
+    tbl.appendChild(el("div", { class: "wl-row wl-head" },
+      el("span", { class: "wl-name" }, "同事"),
+      el("span", { class: "wl-bar-cell" }, "经手问题"),
+      el("span", { class: "wl-n" }, "回复"),
+      el("span", { class: "wl-n" }, "闭环")));
+    for (const p of people) {
+      const pct = Math.round((p.handled_issues || 0) * 100 / max);
+      tbl.appendChild(el("div", { class: "wl-row" },
+        el("span", { class: "wl-name" }, p.person),
+        el("span", { class: "wl-bar-cell" },
+          el("span", { class: "wl-bar", style: "width:" + pct + "%" }),
+          el("b", { class: "wl-bar-val" }, String(p.handled_issues || 0))),
+        el("span", { class: "wl-n" }, String(p.agent_msgs || 0)),
+        el("span", { class: "wl-n green" }, String(p.closed_issues || 0))));
+    }
+    body.appendChild(tbl);
+    body.appendChild(el("div", { class: "wl-note" },
+      "归属依据排班表（support 为共用账号，按值班时间推断经手人）。"
+      + "经手=该时段有我方回复的不同问题数；回复=我方消息数；闭环=该时段被判定闭环的问题数。"));
+  }
+
   async function renderShift() {
     $strip.style.display = "none";
     renderNav("shift");
@@ -809,9 +881,17 @@
     $crumbs.appendChild(document.createTextNode(" / 班次复盘"));
     $view.appendChild(el("div", { class: "loading" }, "加载中…"));
 
+    // Per-colleague workload panel (attributed via the duty roster), with its own
+    // period selector — this is the "谁在某时间段做了多少" view.
+    const wlWrap = el("div", { class: "wl-wrap", id: "wl-wrap" });
+
     const hours = shiftHours;
     const data = await api("/api/v1/dashboard/shift?hours=" + hours);
     $view.innerHTML = "";
+    $view.appendChild(wlWrap);
+    renderWorkload();
+
+    $view.appendChild(el("div", { class: "list-subhead" }, "—— 滚动窗口明细 ——"));
 
     // Window selector — default 8h, but a reviewer covering a long/handed-over
     // shift can widen it.

@@ -249,6 +249,28 @@ it: 今日 / 昨日 / 本周 / 上周 / 本月 / 上月 / 自定义 (two date in
   `localStorage`; metric-card labels follow the period (本周→今日/上月/区间…);
   changing the window refetches just the summary and repaints the strip.
 
+## 16. Shift-review: per-colleague workload via the duty roster
+
+The shift-review page now answers "谁在某个时间段做了多少". support is a
+**shared login**, so the real handler can't come from the message sender — it
+comes from the duty roster.
+
+- **Roster (`agent.shift_roster`):** `scripts/roster_expand.py` expands the
+  两张表 (排班表 shift-letter×weekday×slot + 轮班表 4-week rotation) into 768
+  absolute on-duty intervals (Asia/Shanghai → UTC) for 2026-06-15 .. 2027-01-24.
+  凌晨班 reads "morning-of" (the letter in 周W covers W-1 23:01→W 07:00);
+  weekends are the C(night)/A(day) pair. `--sql` mode emits DDL + INSERTs;
+  loaded into Tencent. DDL also in `sql/shift_roster_schema.sql`. Verified
+  against the source sheet (rotation blocks, cross-midnight, weekend, coverage).
+- **Engine `/v1/dashboard/shift-workload?period=…`:** joins each agent-side
+  message's `ts` into the roster interval containing it, aggregates per person:
+  `handled_issues` (distinct issues they replied in — main sort), `agent_msgs`
+  (our reply count), `closed_issues` (closures detected during their shift).
+  Same period presets as /summary (extracted into a shared `_resolve_period`).
+- **Frontend:** a 值班同事工作量 panel atop the shift-review page — its own
+  period selector + a per-person bar chart (经手问题) with 回复/闭环 columns;
+  the rolling-window issue detail stays below. Note explains the attribution.
+
 ## Known follow-ups
 - Auto-discovery runs once per distill pass; detector can still create a few
   redundant heuristic issues in distill-owned channels (cleaned via

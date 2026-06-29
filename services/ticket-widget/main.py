@@ -879,6 +879,14 @@ async def dash_summary(request: Request, user: dict = Depends(require_dash_appro
     return _passthrough(resp)
 
 
+@app.get("/api/v1/dashboard/shift-workload")
+async def dash_shift_workload(request: Request, user: dict = Depends(require_dash_approved)) -> Any:
+    """Per-colleague workload over ?period=…, attributed via the duty roster."""
+    params = dict(request.query_params)
+    resp = await _issue_proxy("GET", "/v1/dashboard/shift-workload", "@anon:dashboard", params=params)
+    return _passthrough(resp)
+
+
 @app.get("/api/v1/dashboard/shift")
 async def dash_shift(request: Request, user: dict = Depends(require_dash_approved)) -> Any:
     """Shift-review panel: issues new/active/closed in a rolling window (default
