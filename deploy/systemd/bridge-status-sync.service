@@ -1,0 +1,8 @@
+[Unit]
+Description=Bridge connection-status probe (mautrix logs -> Tencent agent.bridge_status)
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/beeper-matrix/bridge-status-sync.py
+TimeoutStartSec=180

@@ -477,12 +477,12 @@ def dash_summary() -> Any:
 def dash_sources() -> Any:
     """Connection/data-flow status per source platform (Slack, Discord).
 
-    The dashboard runs on the Tencent mirror and can't ping the mautrix bridges
-    directly, so 'connection status' is inferred from data freshness: the newest
-    message we've received per platform. The UI shows the actual last-activity
-    time and a health dot derived from its age — green = clearly flowing,
-    amber = lagging/quiet, red = stale (likely disconnected). It's a flow proxy,
-    not a direct bridge ping (a genuinely quiet period also ages the dot)."""
+    Primary signal is the REAL bridge connection status in agent.bridge_status,
+    pushed every ~3min from 185 (where the mautrix bridges run) by parsing their
+    gateway/RTM connection lifecycle. That distinguishes 'bridge disconnected'
+    from 'channel just quiet'. If that probe is missing or stale, we fall back to
+    data-freshness (newest message per platform). Each row carries status_source
+    ('bridge' | 'freshness') so the UI knows which it's showing."""
     with _PooledConn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
@@ -499,6 +499,35 @@ def dash_sources() -> Any:
                 """
             )
             rows = _rows(cur)  # _rows already JSON-serialises datetimes to ISO strings
+            # Real bridge connection status pushed from 185 (where the mautrix
+            # bridges run). When present and fresh, it's authoritative over the
+            # message-freshness heuristic — it distinguishes "bridge down" from
+            # "channel quiet". A stale probe row (185 stopped reporting) is
+            # ignored so we fall back to freshness rather than show a frozen state.
+            bridge = {}
+            try:
+                cur.execute(
+                    """SELECT platform, connected, last_event, last_event_at,
+                              reconnects_24h, detail,
+                              EXTRACT(EPOCH FROM (now() - reported_at))::bigint AS reported_age
+                       FROM agent.bridge_status"""
+                )
+                for b in _rows(cur):
+                    bridge[b["platform"]] = b
+            except Exception:
+                pass
+    for r in rows:
+        b = bridge.get(r["platform"])
+        # Probe considered live if it reported within the last 15 min.
+        if b and (b.get("reported_age") is None or b["reported_age"] <= 900):
+            r["bridge_connected"] = b["connected"]
+            r["bridge_event"] = b.get("last_event")
+            r["bridge_event_at"] = b.get("last_event_at")
+            r["bridge_reconnects_24h"] = b.get("reconnects_24h")
+            r["bridge_detail"] = b.get("detail")
+            r["status_source"] = "bridge"
+        else:
+            r["status_source"] = "freshness"
     return {"sources": rows}
 
 

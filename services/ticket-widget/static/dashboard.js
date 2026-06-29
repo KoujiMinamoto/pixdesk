@@ -306,11 +306,10 @@
     return (s / 86400).toFixed(0) + " 天前";
   }
 
-  // Connection / data-flow status per source platform. Health is inferred from
-  // how long ago we last received a message (the mirror can't ping the bridges
-  // directly): <=1h flowing, <=6h lagging/quiet, else likely disconnected.
-  // Windows are generous because busy multi-channel platforms have natural
-  // gaps; the exact "最近 X 前" time is on the chip for nuance.
+  // Connection status per source platform. Prefers the REAL bridge connection
+  // state (status_source==="bridge", from the 185 probe) — it tells "bridge
+  // down" apart from "channel quiet". Falls back to message-freshness when the
+  // probe is missing/stale (<=1h flowing / <=6h lagging / >6h likely down).
   function renderSourceBar(sources) {
     $sources.hidden = false;
     $sources.innerHTML = "";
@@ -320,20 +319,35 @@
       return;
     }
     for (const s of sources) {
-      const age = +s.age_seconds;
-      let cls = "live", label = "数据正常";
-      if (!(s.last_ts) || isNaN(age)) { cls = "down"; label = "无数据"; }
-      else if (age > 21600) { cls = "down"; label = "疑似断开"; }
-      else if (age > 3600) { cls = "lag"; label = "可能滞后"; }
+      let cls, label, meta;
+      if (s.status_source === "bridge") {
+        // Real bridge connection status from the 185 probe — authoritative.
+        const at = s.bridge_event_at;
+        const rc = s.bridge_reconnects_24h;
+        if (s.bridge_connected) { cls = "live"; label = "已连接"; }
+        else { cls = "down"; label = "桥接断开"; }
+        meta = "桥接" +
+          (at ? " · " + fmtAge(at) : "") +
+          (rc ? " · 24h重连" + rc + "次" : "");
+      } else {
+        // Fallback: data-freshness heuristic.
+        const age = +s.age_seconds;
+        cls = "live"; label = "数据正常";
+        if (!(s.last_ts) || isNaN(age)) { cls = "down"; label = "无数据"; }
+        else if (age > 21600) { cls = "down"; label = "疑似断开"; }
+        else if (age > 3600) { cls = "lag"; label = "可能滞后"; }
+        meta = "最近 " + fmtAgeSecs(age) +
+          (s.channels_24h != null ? " · " + s.channels_24h + " 活跃频道" : "");
+      }
       const plat = PLATFORM_LABEL[s.platform] || s.platform || "?";
-      $sources.appendChild(el("span", { class: "src-chip " + cls,
-        title: "依据最近收到消息的时间推断，非直接探测桥接" },
+      const tip = s.status_source === "bridge"
+        ? "实时桥接连接状态（来自 185 桥接日志）" + (s.bridge_detail ? "：" + s.bridge_detail : "")
+        : "依据最近收到消息的时间推断，非直接探测桥接";
+      $sources.appendChild(el("span", { class: "src-chip " + cls, title: tip },
         el("span", { class: "dot" }),
         el("b", null, plat),
         el("span", { class: "src-state" }, label),
-        el("span", { class: "src-meta" },
-          "最近 " + fmtAgeSecs(age) +
-          (s.channels_24h != null ? " · " + s.channels_24h + " 活跃频道" : ""))));
+        el("span", { class: "src-meta" }, meta)));
     }
   }
 

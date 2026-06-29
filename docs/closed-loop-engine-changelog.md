@@ -209,6 +209,29 @@ ping the mautrix bridges directly, so status is **inferred from data freshness**
 multi-channel platforms have natural gaps — it's a flow proxy, not a bridge
 ping (a genuinely quiet period also ages the dot; tooltip says so).
 
+## 14. Real bridge connection status (not just message freshness)
+
+§13's source bar inferred status from message freshness — which can't tell
+"bridge disconnected" from "channel just quiet" (Discord keeps a heartbeating
+websocket with zero business messages for hours). Now the **real** mautrix
+bridge connection state drives it:
+
+- **Probe (185):** `scripts/bridge-status-sync.py` parses the mautrix-discord /
+  mautrix-slack container logs for gateway/RTM connection lifecycle. Discord
+  logs explicit `Connected/Disconnected/resumed` lines; Slack (mautrix
+  bridgev2) streams RTM/event-loop activity instead, so the probe reconciles
+  the newest lifecycle marker against the newest RTM activity (traffic newer
+  than a stale `Disconnected` ⇒ socket recovered). Pushes `connected` /
+  `last_event` / `last_event_at` / `reconnects_24h` to Tencent
+  `agent.bridge_status` via the existing 185→Tencent SSH-out trust (same
+  plumbing as nova-sync). systemd `bridge-status-sync.{service,timer}`, every
+  3 min.
+- **Engine:** `/v1/dashboard/sources` returns the bridge row when the probe
+  reported within 15 min (authoritative), else falls back to message-freshness;
+  each row carries `status_source` (`bridge` | `freshness`).
+- **Frontend:** bridge mode shows 已连接 / 桥接断开 + last-event age + 24h
+  reconnect count; freshness mode unchanged. Tooltip says which signal it is.
+
 ## Known follow-ups
 - Auto-discovery runs once per distill pass; detector can still create a few
   redundant heuristic issues in distill-owned channels (cleaned via
