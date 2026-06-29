@@ -846,27 +846,89 @@
       body.appendChild(el("div", { class: "empty sm" }, "该时段无可归属的工作量"));
       return;
     }
-    const max = Math.max(1, ...people.map((p) => p.handled_issues || 0));
     const tbl = el("div", { class: "wl-table" });
     tbl.appendChild(el("div", { class: "wl-row wl-head" },
       el("span", { class: "wl-name" }, "同事"),
-      el("span", { class: "wl-bar-cell" }, "经手问题"),
+      el("span", { class: "wl-n" }, "经手"),
+      el("span", { class: "wl-n" }, "已闭环"),
+      el("span", { class: "wl-n" }, "待确认"),
+      el("span", { class: "wl-n" }, "进行中"),
       el("span", { class: "wl-n" }, "回复"),
-      el("span", { class: "wl-n" }, "闭环")));
+      el("span", { class: "wl-n" }, "闭环率")));
+    // status cell: clickable -> drilldown for (person, bucket)
+    const statCell = (p, bucket, val, cls) =>
+      el("span", { class: "wl-n wl-link " + (cls || ""),
+                   onclick: () => openWorkloadDrill(p.person, bucket) },
+        String(val || 0));
     for (const p of people) {
-      const pct = Math.round((p.handled_issues || 0) * 100 / max);
       tbl.appendChild(el("div", { class: "wl-row" },
         el("span", { class: "wl-name" }, p.person),
-        el("span", { class: "wl-bar-cell" },
-          el("span", { class: "wl-bar", style: "width:" + pct + "%" }),
-          el("b", { class: "wl-bar-val" }, String(p.handled_issues || 0))),
-        el("span", { class: "wl-n" }, String(p.agent_msgs || 0)),
-        el("span", { class: "wl-n green" }, String(p.closed_issues || 0))));
+        statCell(p, "all", p.handled_issues, "strong"),
+        statCell(p, "confirmed", p.confirmed, "green"),
+        statCell(p, "inferred", p.inferred, "amber"),
+        statCell(p, "open", p.open_n, "red"),
+        el("span", { class: "wl-n muted" }, String(p.agent_msgs || 0)),
+        el("span", { class: "wl-n" }, Math.round((p.close_rate || 0) * 100) + "%")));
+      // inline drilldown slot under each row
+      tbl.appendChild(el("div", { class: "wl-drill", id: "wl-drill-" + cssId(p.person) }));
     }
     body.appendChild(tbl);
     body.appendChild(el("div", { class: "wl-note" },
       "归属依据排班表（support 为共用账号，按值班时间推断经手人）。"
-      + "经手=该时段有我方回复的不同问题数；回复=我方消息数；闭环=该时段被判定闭环的问题数。"));
+      + "经手=该时段有我方回复的不同问题数；已闭环=人工已确认；待确认=系统判定的疑似闭环、"
+      + "需人工确认；进行中=仍未闭环；闭环率=(已闭环+待确认)/经手。点数字看明细。"));
+  }
+
+  // unique-ish id for a person name (Chinese -> safe token)
+  function cssId(s) {
+    return encodeURIComponent(s).replace(/[^a-zA-Z0-9]/g, "");
+  }
+
+  const BUCKET_LABEL = { all: "全部经手", confirmed: "已闭环",
+    inferred: "待确认（疑似闭环）", open: "进行中" };
+
+  // Toggle an inline list of the issues `person` handled in `bucket`, under
+  // their row. Click the same cell again to collapse.
+  async function openWorkloadDrill(person, bucket) {
+    const slot = document.getElementById("wl-drill-" + cssId(person));
+    if (!slot) return;
+    const key = person + ":" + bucket;
+    if (slot.dataset.open === key) { slot.innerHTML = ""; slot.dataset.open = ""; return; }
+    slot.dataset.open = key;
+    slot.innerHTML = "";
+    slot.appendChild(el("div", { class: "loading sm" }, "加载中…"));
+    const qs = new URLSearchParams({ person, period: workloadPeriod, bucket });
+    let data;
+    try {
+      data = await api("/api/v1/dashboard/shift-workload/issues?" + qs);
+    } catch (e) {
+      slot.innerHTML = ""; slot.appendChild(el("div", { class: "empty sm" }, String(e.message || e)));
+      return;
+    }
+    slot.innerHTML = "";
+    slot.appendChild(el("div", { class: "wl-drill-head" },
+      person + " · " + (BUCKET_LABEL[bucket] || bucket) + "（" + data.count + "）"));
+    if (!data.items.length) {
+      slot.appendChild(el("div", { class: "empty sm" }, "无"));
+      return;
+    }
+    const list = el("div", { class: "issue-list" });
+    for (const it of data.items) {
+      const stateLabel = STATE_LABEL[it.lifecycle_state] || it.lifecycle_state;
+      const summary = it.summary_zh || it.title || "";
+      list.appendChild(el("div", { class: "issue-row",
+                                   onclick: () => location.hash = "#/issues/" + it.id },
+        el("span", { class: "pill " + it.lifecycle_state }, stateLabel),
+        el("div", null,
+          el("div", { class: "cust-line" },
+            el("span", { class: "cust-chip" }, it.channel_name || it.customer_workspace_id || "?"),
+            it.code ? el("span", { class: "ticket-code" }, it.code) : null),
+          el("div", { class: "title" }, it.title || "(无标题)"),
+          summary ? el("div", { class: "summary" }, summary) : null,
+          el("div", { class: "who" }, "我方回复 " + (it.my_msgs || 0) + " 条")),
+        el("div", { class: "when" }, fmtAge(it.last_activity_at))));
+    }
+    slot.appendChild(list);
   }
 
   async function renderShift() {

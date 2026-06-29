@@ -114,20 +114,27 @@ body { background: #fafbfc; }
 .wl-wrap { margin-bottom: 18px; }
 .wl-title { font-size: 15px; margin: 0 0 8px; }
 .wl-body { margin-top: 8px; }
-.wl-table { display: flex; flex-direction: column; gap: 2px; margin-top: 8px; }
-.wl-row { display: grid; grid-template-columns: 84px 1fr 56px 56px; align-items: center;
-  gap: 8px; padding: 5px 4px; border-bottom: 1px solid #f0f1f3; }
-.wl-row.wl-head { font-size: 11px; color: var(--color-muted); border-bottom: 1px solid var(--color-border); }
+.wl-table { display: flex; flex-direction: column; gap: 0; margin-top: 8px; }
+.wl-row { display: grid;
+  grid-template-columns: 72px repeat(6, minmax(0, 1fr)); align-items: center;
+  gap: 6px; padding: 6px 4px; border-bottom: 1px solid #f0f1f3; }
+.wl-row.wl-head { font-size: 11px; color: var(--color-muted);
+  border-bottom: 1px solid var(--color-border); }
 .wl-name { font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden;
   text-overflow: ellipsis; }
-.wl-bar-cell { position: relative; display: flex; align-items: center; gap: 6px;
-  background: var(--color-bg-soft); border-radius: 4px; height: 20px; padding: 0 6px; }
-.wl-bar { position: absolute; left: 0; top: 0; height: 100%; border-radius: 4px;
-  background: linear-gradient(90deg, #ddf4ff, #54aeff); z-index: 0; }
-.wl-bar-val { position: relative; z-index: 1; font-size: 12px; }
-.wl-row.wl-head .wl-bar-cell { background: none; height: auto; }
 .wl-n { text-align: right; font-size: 13px; font-variant-numeric: tabular-nums; }
+.wl-n.strong { font-weight: 700; }
+.wl-n.muted { color: var(--color-muted); }
 .wl-n.green { color: var(--color-green); }
+.wl-n.amber { color: var(--color-amber); }
+.wl-n.red { color: var(--color-red); }
+.wl-link { cursor: pointer; border-radius: 4px; }
+.wl-link:hover { background: var(--color-bg-soft); text-decoration: underline; }
+.wl-drill { grid-column: 1 / -1; }
+.wl-drill:not(:empty) { padding: 4px 0 10px; }
+.wl-drill-head { font-size: 12px; font-weight: 600; color: var(--color-muted);
+  margin: 6px 2px; }
+.loading.sm, .empty.sm { padding: 8px; font-size: 12px; }
 .wl-note { font-size: 11px; color: var(--color-muted); margin-top: 8px; line-height: 1.5; }
 
 /* time-window picker */

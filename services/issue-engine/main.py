@@ -526,17 +526,22 @@ def dash_shift_workload(
     """Per-colleague workload over a time window, attributed via the duty roster.
 
     `support` is a shared login, so who actually handled a message can't come from
-    the sender — it comes from agent.shift_roster (the 排班表/轮班表 expanded into
+    the sender — it comes from agent.shift_roster (排班表/轮班表 expanded into
     absolute on-duty intervals). We join each agent-side message's timestamp into
-    the roster interval that contains it, then aggregate three measures per person:
-      handled_issues   — distinct issues they touched with an 我方 reply (main)
-      agent_msgs       — our reply messages they sent
-      closed_issues    — issues whose closure was detected during their shift
-    Same period presets as /summary. Rows sorted by handled_issues desc."""
+    the roster interval that contains it → person handled that issue. Per person:
+      handled_issues — distinct issues they replied in during their shift(s) (main)
+      agent_msgs     — our reply messages they sent
+    and the CURRENT status breakdown of *those handled issues* (this is the part
+    that makes a 闭环率 meaningful — it's their issues, not whatever closed on the
+    clock):
+      confirmed — now closed_confirmed (人工已确认闭环)
+      inferred  — now closed_inferred (疑似闭环，存疑待确认)
+      open_n    — still open (awaiting/active/…)
+    A cross-shift issue counts for every person who replied in it. Sorted by
+    handled_issues desc."""
     win_start_sql, win_end_sql, params = _resolve_period(period, start, end)
     with _PooledConn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            # handled issues + agent message counts, attributed by roster interval.
             cur.execute(
                 f"""
                 WITH bounds AS (SELECT {win_start_sql} AS ws, {win_end_sql} AS we),
@@ -550,60 +555,46 @@ def dash_shift_workload(
                   WHERE m.ts >= (SELECT ws FROM bounds) AND m.ts < (SELECT we FROM bounds)
                 ),
                 attributed AS (
-                  SELECT r.person, am.issue_id
+                  SELECT r.person, am.issue_id, count(*) AS msgs
                   FROM agent_msgs am
                   JOIN agent.shift_roster r
                     ON am.ts >= r.start_ts AND am.ts < r.end_ts
+                  GROUP BY r.person, am.issue_id
                 )
-                SELECT person,
-                       count(*) AS agent_msgs,
-                       count(DISTINCT issue_id) AS handled_issues
-                FROM attributed
-                GROUP BY person
-                """,
-                params + params,  # win_start/end appear twice in the CTE
-            )
-            handled = {r["person"]: r for r in _rows(cur)}
-            # closures detected during each person's shift.
-            cur.execute(
-                f"""
-                WITH bounds AS (SELECT {win_start_sql} AS ws, {win_end_sql} AS we),
-                closures AS (
-                  SELECT COALESCE(closure_detected_at, closed_at, last_activity_at) AS cts
-                  FROM {SCHEMA}.issues
-                  WHERE lifecycle_state IN ('closed_inferred','closed_confirmed')
-                    AND COALESCE(closure_detected_at, closed_at, last_activity_at)
-                          >= (SELECT ws FROM bounds)
-                    AND COALESCE(closure_detected_at, closed_at, last_activity_at)
-                          <  (SELECT we FROM bounds)
-                )
-                SELECT r.person, count(*) AS closed_issues
-                FROM closures c
-                JOIN agent.shift_roster r ON c.cts >= r.start_ts AND c.cts < r.end_ts
-                GROUP BY r.person
+                SELECT a.person,
+                       count(DISTINCT a.issue_id) AS handled_issues,
+                       COALESCE(sum(a.msgs), 0) AS agent_msgs,
+                       count(DISTINCT a.issue_id)
+                         FILTER (WHERE i.lifecycle_state = 'closed_confirmed') AS confirmed,
+                       count(DISTINCT a.issue_id)
+                         FILTER (WHERE i.lifecycle_state = 'closed_inferred') AS inferred,
+                       count(DISTINCT a.issue_id)
+                         FILTER (WHERE i.lifecycle_state NOT IN
+                                 ('closed_confirmed','closed_inferred','dismissed')) AS open_n
+                FROM attributed a
+                JOIN {SCHEMA}.issues i ON i.id = a.issue_id
+                WHERE i.lifecycle_state <> 'dismissed' AND i.review_state <> 'rejected'
+                GROUP BY a.person
                 """,
                 params + params,
             )
-            closed = {r["person"]: r["closed_issues"] for r in _rows(cur)}
-            # window bounds (echo back for the UI), + roster coverage flag.
-            cur.execute(
-                f"SELECT {win_start_sql} AS ws, {win_end_sql} AS we", params)
+            rows = _rows(cur)
+            cur.execute(f"SELECT {win_start_sql} AS ws, {win_end_sql} AS we", params)
             b = cur.fetchone()
             cur.execute(
                 """SELECT count(*) n FROM agent.shift_roster r
                    WHERE r.end_ts > %s AND r.start_ts < %s""",
                 [b["ws"], b["we"]])
             roster_n = cur.fetchone()["n"]
-    people = set(handled) | set(closed)
-    rows = []
-    for p in people:
-        h = handled.get(p, {})
-        rows.append({
-            "person": p,
-            "handled_issues": h.get("handled_issues", 0),
-            "agent_msgs": h.get("agent_msgs", 0),
-            "closed_issues": closed.get(p, 0),
-        })
+    for r in rows:
+        h = r.get("handled_issues") or 0
+        r["agent_msgs"] = int(r.get("agent_msgs") or 0)
+        # 闭环率 = (已确认 + 疑似闭环) / 经手. Inferred counts as resolved-pending
+        # because nobody clicks 确认闭环 yet — excluding it would read as 0% and
+        # understate the work. `confirmed` is surfaced separately so a reviewer
+        # still sees how many are human-verified vs awaiting confirmation.
+        done = (r.get("confirmed") or 0) + (r.get("inferred") or 0)
+        r["close_rate"] = round(done / h, 3) if h else 0.0
     rows.sort(key=lambda r: (r["handled_issues"], r["agent_msgs"]), reverse=True)
     return {
         "period": period,
@@ -612,6 +603,68 @@ def dash_shift_workload(
         "roster_covered": roster_n > 0,
         "people": rows,
     }
+
+
+@app.get("/v1/dashboard/shift-workload/issues", dependencies=[Depends(require_secret)])
+def dash_shift_workload_issues(
+    person: str = Query(...),
+    period: str = Query("this_week"),
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+    bucket: str = Query("all"),  # all | confirmed | inferred | open
+) -> Any:
+    """Drilldown: the issues `person` handled in the window (one row per issue),
+    optionally filtered to a status bucket (confirmed/inferred/open). Same roster
+    attribution as the summary; rows carry current state + zh summary + the
+    person's reply count on that issue, so the UI can list them and link to the
+    issue detail."""
+    win_start_sql, win_end_sql, params = _resolve_period(period, start, end)
+    bucket_sql = {
+        "confirmed": "AND i.lifecycle_state = 'closed_confirmed'",
+        "inferred":  "AND i.lifecycle_state = 'closed_inferred'",
+        "open":      "AND i.lifecycle_state NOT IN ('closed_confirmed','closed_inferred','dismissed')",
+        "all":       "",
+    }.get(bucket, "")
+    with _PooledConn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                f"""
+                WITH bounds AS (SELECT {win_start_sql} AS ws, {win_end_sql} AS we),
+                agent_msgs AS (
+                  SELECT m.ts, im.issue_id
+                  FROM agent.messages m
+                  JOIN {SCHEMA}.issue_messages im
+                    ON im.platform=m.platform AND im.workspace_id=m.workspace_id
+                   AND im.channel_id=m.channel_id AND im.message_id=m.message_id
+                   AND im.role='agent'
+                  WHERE m.ts >= (SELECT ws FROM bounds) AND m.ts < (SELECT we FROM bounds)
+                ),
+                attributed AS (
+                  SELECT am.issue_id, count(*) AS msgs
+                  FROM agent_msgs am
+                  JOIN agent.shift_roster r
+                    ON am.ts >= r.start_ts AND am.ts < r.end_ts AND r.person = %s
+                  GROUP BY am.issue_id
+                )
+                SELECT i.id, i.code, i.title, (i.metadata->>'summary_zh') AS summary_zh,
+                       i.lifecycle_state, i.nonclosure_reason, i.last_activity_at,
+                       i.customer_platform, i.customer_workspace_id, i.customer_channel_id,
+                       a.msgs AS my_msgs,
+                       (SELECT ch.channel_name FROM agent.channels ch
+                          WHERE ch.platform=i.customer_platform
+                            AND ch.workspace_id=i.customer_workspace_id
+                            AND ch.channel_id=i.customer_channel_id LIMIT 1) AS channel_name
+                FROM attributed a
+                JOIN {SCHEMA}.issues i ON i.id = a.issue_id
+                WHERE i.lifecycle_state <> 'dismissed' AND i.review_state <> 'rejected'
+                  {bucket_sql}
+                ORDER BY i.last_activity_at DESC NULLS LAST
+                """,
+                params + [person] + params,
+            )
+            items = _rows(cur)
+    return {"person": person, "period": period, "bucket": bucket,
+            "items": items, "count": len(items)}
 
 
 @app.get("/v1/dashboard/sources", dependencies=[Depends(require_secret)])

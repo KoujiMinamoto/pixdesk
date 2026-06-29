@@ -271,6 +271,24 @@ comes from the duty roster.
   period selector + a per-person bar chart (经手问题) with 回复/闭环 columns;
   the rolling-window issue detail stays below. Note explains the attribution.
 
+## 17. Shift-workload: per-person status breakdown + drilldown
+
+§16 counted "closures detected on the clock", which didn't tie to the issues a
+person actually handled (温迪 经手32 but 闭环107). Recut so the closure columns
+are the **current status of that person's handled issues**:
+
+- **Engine `/v1/dashboard/shift-workload`** now returns, per person:
+  `handled_issues`, `agent_msgs`, and the live status split of those issues —
+  `confirmed` (人工已确认闭环), `inferred` (疑似闭环/待确认), `open_n` (进行中) —
+  plus `close_rate` = (confirmed + inferred) / handled (inferred counts as
+  resolved-pending, since nobody clicks 确认闭环 yet; otherwise it'd read 0%).
+- **Drilldown `/v1/dashboard/shift-workload/issues?person=&period=&bucket=`**
+  (bucket = all/confirmed/inferred/open) lists the actual issues that person
+  handled in the window, with current state + zh summary + their reply count.
+- **Frontend:** the workload table now has 同事 / 经手 / 已闭环 / 待确认 / 进行中
+  / 回复 / 闭环率 columns; each status number is clickable → an inline list of
+  those issues under the row, each linking to the issue detail.
+
 ## Known follow-ups
 - Auto-discovery runs once per distill pass; detector can still create a few
   redundant heuristic issues in distill-owned channels (cleaned via
