@@ -110,6 +110,14 @@ body { background: #fafbfc; }
 .detail .actions button.warn { background: var(--color-amber); }
 .detail .actions button.warn:hover { background: #9a3d00; }
 
+/* time-window picker */
+.period-bar { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
+.period-bar .chip.apply { background: var(--color-blue); border-color: var(--color-blue);
+  color: #fff; }
+.period-date { font-size: 12px; padding: 3px 8px; border: 1px solid var(--color-border);
+  border-radius: 6px; background: var(--color-card); color: var(--color-text); }
+.period-sep { font-size: 12px; color: var(--color-muted); }
+
 /* data-source / connection status bar */
 .source-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
   margin-bottom: 12px; }

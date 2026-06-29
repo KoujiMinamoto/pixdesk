@@ -232,6 +232,23 @@ bridge connection state drives it:
 - **Frontend:** bridge mode shows 已连接 / 桥接断开 + last-event age + 24h
   reconnect count; freshness mode unchanged. Tooltip says which signal it is.
 
+## 15. Overview time-window picker
+
+The hero strip was hard-wired to "this week". Added a time-range picker above
+it: 今日 / 昨日 / 本周 / 上周 / 本月 / 上月 / 自定义 (two date inputs).
+
+- **Engine** `/v1/dashboard/summary?period=…` (+ `start`/`end` for `custom`).
+  All windows are half-open `[win_start, win_end)` computed in SQL relative to
+  `now()` (weeks Mon→Mon, months 1st→1st); current-period presets end at now,
+  past presets end at the boundary. The dashboard's global `TIME_FLOOR`
+  (2026-06-01) is widened with `LEAST(win_start, TIME_FLOOR)` so a past window
+  like 上月 (May) isn't blanked by the floor. `awaiting_us` (待我方回复) is a
+  separate TIME_FLOOR-pinned subquery — it stays the same live total under every
+  period (it's a "right now" backlog, not a window metric).
+- **Frontend** preset chips + custom date range; the chosen window persists in
+  `localStorage`; metric-card labels follow the period (本周→今日/上月/区间…);
+  changing the window refetches just the summary and repaints the strip.
+
 ## Known follow-ups
 - Auto-discovery runs once per distill pass; detector can still create a few
   redundant heuristic issues in distill-owned channels (cleaned via

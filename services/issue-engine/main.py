@@ -39,6 +39,7 @@ import closure_agent
 # use an alias and some don't:
 TIME_FLOOR_BARE = f"last_activity_at >= '{TIME_FLOOR}'" if TIME_FLOOR else "TRUE"
 TIME_FLOOR_ALIAS = f"i.last_activity_at >= '{TIME_FLOOR}'" if TIME_FLOOR else "TRUE"
+TIME_FLOOR_ALIAS_A = f"a.last_activity_at >= '{TIME_FLOOR}'" if TIME_FLOOR else "TRUE"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("issue-engine")
@@ -399,76 +400,120 @@ def rollup() -> Any:
 
 
 @app.get("/v1/dashboard/summary", dependencies=[Depends(require_secret)])
-def dash_summary() -> Any:
-    """Top-of-page numbers for the dashboard hero strip.
+def dash_summary(
+    period: str = Query("this_week"),
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+) -> Any:
+    """Top-of-page numbers for the dashboard hero strip, scoped to a time window.
 
-    "This week" = from the most recent Friday 00:00 (local-ish, server UTC) up to
-    now. We compute that Friday in SQL: date_trunc('week') is Monday; Friday is
-    Monday+4 days, and if that's still in the future (Mon-Thu) step back a week.
-    All week-scoped metrics share this `wk_start`. Plus one always-current
-    "awaiting us" total."""
+    `period` picks a preset window: today / yesterday / this_week / last_week /
+    this_month / last_month / custom. All presets are computed in SQL relative to
+    now() (server UTC); weeks run Mon 00:00 → next Mon 00:00. `custom` uses the
+    `start`/`end` query params (ISO dates/datetimes; `end` exclusive, defaults to
+    now). Every window metric uses the half-open range [win_start, win_end);
+    `awaiting_us` is always the current total (not window-scoped)."""
+    # Resolve [win_start, win_end) as SQL expressions. now() upper bound for the
+    # current-period presets; explicit upper bound for past periods.
+    presets = {
+        "today":      ("date_trunc('day', now())", "now()"),
+        "yesterday":  ("date_trunc('day', now()) - interval '1 day'",
+                       "date_trunc('day', now())"),
+        "this_week":  ("date_trunc('week', now())", "now()"),
+        "last_week":  ("date_trunc('week', now()) - interval '7 days'",
+                       "date_trunc('week', now())"),
+        "this_month": ("date_trunc('month', now())", "now()"),
+        "last_month": ("date_trunc('month', now()) - interval '1 month'",
+                       "date_trunc('month', now())"),
+    }
+    params: list[Any] = []
+    if period == "custom":
+        if not start:
+            raise HTTPException(400, "custom period requires start")
+        win_start_sql, win_end_sql = "%s::timestamptz", "COALESCE(%s::timestamptz, now())"
+        params = [start, end]
+    elif period in presets:
+        win_start_sql, win_end_sql = presets[period]
+    else:
+        raise HTTPException(400, f"unknown period: {period}")
+
+    # WHERE floor: keep the global TIME_FLOOR for the current-period presets, but
+    # drop the floor to the window start when the window reaches further back
+    # (e.g. 上月 = May, below the 2026-06-01 floor) so past windows aren't blanked.
+    # LEAST means current-period queries are unchanged; only past windows widen it.
+    floor_bare = (
+        f"last_activity_at >= LEAST((SELECT win_start FROM bounds), '{TIME_FLOOR}'::timestamptz)"
+        if TIME_FLOOR else "TRUE"
+    )
+
     with _PooledConn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 f"""
                 WITH bounds AS (
-                  SELECT CASE
-                    WHEN (date_trunc('week', now()) + interval '4 days') <= now()
-                      THEN date_trunc('week', now()) + interval '4 days'
-                      ELSE date_trunc('week', now()) + interval '4 days' - interval '7 days'
-                  END AS wk_start
+                  SELECT {win_start_sql} AS win_start, {win_end_sql} AS win_end
                 )
                 SELECT
-                  (SELECT wk_start FROM bounds) AS week_start,
-                  -- week-scoped: customers with any issue active this week
+                  (SELECT win_start FROM bounds) AS win_start,
+                  (SELECT win_end FROM bounds) AS win_end,
+                  -- customers with any issue active in window
                   count(DISTINCT (customer_platform, customer_workspace_id, customer_channel_id))
-                    FILTER (WHERE last_activity_at >= (SELECT wk_start FROM bounds)
+                    FILTER (WHERE last_activity_at >= (SELECT win_start FROM bounds)
+                              AND last_activity_at < (SELECT win_end FROM bounds)
                               AND lifecycle_state <> 'dismissed' AND review_state <> 'rejected')
                     AS active_customers,
-                  -- new issues opened this week
-                  count(*) FILTER (WHERE opened_at >= (SELECT wk_start FROM bounds)
+                  -- new issues opened in window
+                  count(*) FILTER (WHERE opened_at >= (SELECT win_start FROM bounds)
+                                     AND opened_at < (SELECT win_end FROM bounds)
                                      AND lifecycle_state <> 'dismissed' AND review_state <> 'rejected')
                     AS new_issues,
-                  -- issues active this week (touched in window, not closed/dismissed)
-                  count(*) FILTER (WHERE last_activity_at >= (SELECT wk_start FROM bounds)
+                  -- issues active in window (touched in window, not closed/dismissed)
+                  count(*) FILTER (WHERE last_activity_at >= (SELECT win_start FROM bounds)
+                                     AND last_activity_at < (SELECT win_end FROM bounds)
                                      AND lifecycle_state NOT IN ('closed_confirmed','closed_inferred','dismissed')
                                      AND review_state <> 'rejected')
                     AS active_issues,
-                  -- newly closed this week (inferred or confirmed, closure detected in window)
+                  -- newly closed in window (closure detected in window)
                   count(*) FILTER (WHERE lifecycle_state IN ('closed_inferred','closed_confirmed')
-                                     AND COALESCE(closure_detected_at, closed_at, last_activity_at) >= (SELECT wk_start FROM bounds))
+                                     AND COALESCE(closure_detected_at, closed_at, last_activity_at) >= (SELECT win_start FROM bounds)
+                                     AND COALESCE(closure_detected_at, closed_at, last_activity_at) < (SELECT win_end FROM bounds))
                     AS new_closed,
-                  -- always-current: awaiting our reply (not week-scoped)
-                  count(*) FILTER (WHERE nonclosure_reason IS NOT NULL
-                                     AND lifecycle_state NOT IN ('closed_confirmed','dismissed','closed_inferred')
-                                     AND review_state = 'unreviewed') AS awaiting_us
+                  -- always-current: awaiting our reply. Independent of the time
+                  -- window AND of the widened floor — a separate subquery pinned
+                  -- to the global TIME_FLOOR, so "待我方回复" is the same live
+                  -- number regardless of which period is selected.
+                  (SELECT count(*) FROM {SCHEMA}.issues a
+                     WHERE a.nonclosure_reason IS NOT NULL
+                       AND a.lifecycle_state NOT IN ('closed_confirmed','dismissed','closed_inferred')
+                       AND a.review_state = 'unreviewed'
+                       AND {TIME_FLOOR_ALIAS_A}) AS awaiting_us
                 FROM {SCHEMA}.issues
-                WHERE {TIME_FLOOR_BARE}
-                """
+                WHERE {floor_bare}
+                """,
+                params,
             )
             row = cur.fetchone()
-            # new conversations this week — from agent.conversations, limited to
+            # new conversations in window — from agent.conversations, limited to
             # customer channels that have at least one issue (matches dashboard scope).
             cur.execute(
                 f"""
                 WITH bounds AS (
-                  SELECT CASE
-                    WHEN (date_trunc('week', now()) + interval '4 days') <= now()
-                      THEN date_trunc('week', now()) + interval '4 days'
-                      ELSE date_trunc('week', now()) + interval '4 days' - interval '7 days'
-                  END AS wk_start
+                  SELECT {win_start_sql} AS win_start, {win_end_sql} AS win_end
                 )
                 SELECT count(*) AS new_conversations
                 FROM agent.conversations c
-                WHERE c.opened_at >= (SELECT wk_start FROM bounds)
+                WHERE c.opened_at >= (SELECT win_start FROM bounds)
+                  AND c.opened_at < (SELECT win_end FROM bounds)
                   AND EXISTS (SELECT 1 FROM {SCHEMA}.issues i
                               WHERE i.customer_platform = c.platform
                                 AND i.customer_workspace_id = c.workspace_id
                                 AND i.customer_channel_id = c.channel_id)
-                """
+                """,
+                params,
             )
             conv = cur.fetchone()
     out = dict(row) if row else {}
+    out["period"] = period
     out["new_conversations"] = (conv or {}).get("new_conversations", 0)
     return out
 

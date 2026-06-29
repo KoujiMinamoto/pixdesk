@@ -872,8 +872,10 @@ async def dash_issue_detail(issue_id: str, user: dict = Depends(require_dash_app
 
 
 @app.get("/api/v1/dashboard/summary")
-async def dash_summary(user: dict = Depends(require_dash_approved)) -> Any:
-    resp = await _issue_proxy("GET", "/v1/dashboard/summary", "@anon:dashboard")
+async def dash_summary(request: Request, user: dict = Depends(require_dash_approved)) -> Any:
+    """Hero-strip numbers, scoped to ?period= (today/yesterday/this_week/…/custom)."""
+    params = dict(request.query_params)
+    resp = await _issue_proxy("GET", "/v1/dashboard/summary", "@anon:dashboard", params=params)
     return _passthrough(resp)
 
 

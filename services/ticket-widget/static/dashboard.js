@@ -21,6 +21,7 @@
   const $strip = document.getElementById("summary-strip");
   const $nav = document.getElementById("main-nav");
   const $sources = document.getElementById("source-bar");
+  const $periodBar = document.getElementById("period-bar");
   const $view = document.getElementById("view");
 
   // Top-level section tabs. `active` is one of: overview | shift | tickets,
@@ -158,6 +159,35 @@
   // Ticket-archive list filter state.
   const ticketFilter = { status: "all", q: "" };
 
+  // Overview time-window selector. `period` is one of the preset keys or
+  // "custom" (then customStart/customEnd carry ISO dates). Persisted in
+  // localStorage so a reviewer's chosen window survives reloads.
+  const PERIODS = [
+    ["today", "今日"], ["yesterday", "昨日"],
+    ["this_week", "本周"], ["last_week", "上周"],
+    ["this_month", "本月"], ["last_month", "上月"],
+    ["custom", "自定义"],
+  ];
+  const PERIOD_LABEL = Object.fromEntries(PERIODS);
+  const overview = {
+    period: localStorage.getItem("ov_period") || "this_week",
+    start: localStorage.getItem("ov_start") || "",
+    end: localStorage.getItem("ov_end") || "",
+  };
+  // Short prefix for the metric cards ("本周活跃客户" etc.).
+  function periodPrefix() {
+    return overview.period === "custom" ? "区间" : (PERIOD_LABEL[overview.period] || "本周");
+  }
+  function summaryQuery() {
+    if (overview.period === "custom") {
+      const p = new URLSearchParams({ period: "custom" });
+      if (overview.start) p.set("start", overview.start);
+      if (overview.end) p.set("end", overview.end + "T23:59:59");  // inclusive end-of-day
+      return "?" + p.toString();
+    }
+    return "?period=" + overview.period;
+  }
+
   function platformPill(p) {
     return el("span", { class: "tag platform platform-" + (p || "other") },
       PLATFORM_LABEL[p] || p || "?");
@@ -184,6 +214,70 @@
   }
 
 
+  // Render the 6 metric cards from a summary payload, labelled by the active
+  // period prefix (本周/今日/区间…). Split out so the period picker can refresh
+  // just the strip without rebuilding the whole root view.
+  function renderStrip(summary) {
+    const px = periodPrefix();
+    $strip.innerHTML = "";
+    $strip.appendChild(card(px + "活跃客户", summary.active_customers || 0, ""));
+    $strip.appendChild(card(px + "新增问题", summary.new_issues || 0, ""));
+    $strip.appendChild(card(px + "活跃问题", summary.active_issues || 0, ""));
+    $strip.appendChild(card(px + "新增对话", summary.new_conversations || 0, ""));
+    $strip.appendChild(card(px + "新闭环", summary.new_closed || 0, "green"));
+    $strip.appendChild(card("待我方回复", summary.awaiting_us || 0, "red", "实时"));
+  }
+
+  // Re-fetch the summary for the current overview window and repaint the strip.
+  async function refreshStrip() {
+    $strip.style.opacity = "0.5";
+    try {
+      const summary = await api("/api/v1/dashboard/summary" + summaryQuery());
+      renderStrip(summary);
+    } catch (e) {
+      setStatus(String(e.message || e), "error");
+    } finally {
+      $strip.style.opacity = "";
+    }
+  }
+
+  // Time-window picker: preset chips + (for 自定义) two date inputs.
+  function renderPeriodBar() {
+    $periodBar.hidden = false;
+    $periodBar.innerHTML = "";
+    const row = el("div", { class: "chip-row" }, el("span", { class: "chip-label" }, "时间范围"));
+    for (const [key, label] of PERIODS) {
+      row.appendChild(el("button",
+        { class: "chip" + (overview.period === key ? " active" : ""),
+          onclick: () => {
+            overview.period = key;
+            localStorage.setItem("ov_period", key);
+            renderPeriodBar();             // repaint chips + show/hide custom inputs
+            if (key !== "custom" || (overview.start && overview.end)) refreshStrip();
+          } },
+        label));
+    }
+    $periodBar.appendChild(row);
+
+    if (overview.period === "custom") {
+      const mkDate = (val, on) => {
+        const i = el("input", { type: "date", class: "period-date", value: val || "" });
+        i.addEventListener("change", (e) => on(e.target.value));
+        return i;
+      };
+      const custom = el("div", { class: "chip-row" },
+        mkDate(overview.start, (v) => { overview.start = v; localStorage.setItem("ov_start", v); }),
+        el("span", { class: "period-sep" }, "至"),
+        mkDate(overview.end, (v) => { overview.end = v; localStorage.setItem("ov_end", v); }),
+        el("button", { class: "chip apply",
+          onclick: () => {
+            if (!overview.start || !overview.end) { setStatus("请选择起止日期", "error"); return; }
+            refreshStrip();
+          } }, "应用"));
+      $periodBar.appendChild(custom);
+    }
+  }
+
   async function renderRoot() {
     $title.textContent = "客户问题闭环看板";
     $back.hidden = true;
@@ -194,7 +288,7 @@
     $view.appendChild(el("div", { class: "loading" }, "加载中…"));
 
     const [summary, rollup, sources] = await Promise.all([
-      api("/api/v1/dashboard/summary"),
+      api("/api/v1/dashboard/summary" + summaryQuery()),
       api("/api/v1/dashboard/rollup"),
       api("/api/v1/dashboard/sources").catch(() => ({ sources: [] })),
     ]);
@@ -202,15 +296,10 @@
     // Data-source connection bar (Slack / Discord), inferred from data freshness.
     renderSourceBar(sources.sources || []);
 
-    // top strip — all metrics scoped to "this week" (since last Friday),
-    // except 待我方 which is an always-current total.
-    $strip.innerHTML = "";
-    $strip.appendChild(card("本周活跃客户", summary.active_customers || 0, ""));
-    $strip.appendChild(card("本周新增问题", summary.new_issues || 0, ""));
-    $strip.appendChild(card("本周活跃问题", summary.active_issues || 0, ""));
-    $strip.appendChild(card("本周新增对话", summary.new_conversations || 0, ""));
-    $strip.appendChild(card("本周新闭环", summary.new_closed || 0, "green"));
-    $strip.appendChild(card("待我方回复", summary.awaiting_us || 0, "red", "实时"));
+    // Time-window picker (今日/昨日/本周/上周/本月/上月/自定义) above the strip.
+    renderPeriodBar();
+    // top strip — window metrics scoped to the selected period; 待我方 always-current.
+    renderStrip(summary);
 
     const items = rollup.items || [];
     _rollupItems = items;
@@ -886,6 +975,7 @@
       const fb = document.getElementById("filter-bar");
       if (fb) fb.remove();
       $sources.hidden = true;
+      $periodBar.hidden = true;
     }
     try {
       if (hash === "#/" || hash === "#") {
@@ -921,6 +1011,7 @@
   function gateScreen(title, desc, btn) {
     $strip.style.display = "none";
     $sources.hidden = true;
+    $periodBar.hidden = true;
     renderNav(null);
     $crumbs.innerHTML = "";
     $back.hidden = true;
