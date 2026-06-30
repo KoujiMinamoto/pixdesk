@@ -76,6 +76,11 @@ FEISHU_APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "")
 FEISHU_ADMIN_EMAILS = tuple(
     s.strip().lower() for s in os.environ.get("FEISHU_ADMIN_EMAILS", "").split(",") if s.strip()
 )
+# Event subscription (capturing internal-group messages). Optional verification
+# token (set in the Feishu console "事件订阅"); if set, inbound events must match.
+# Encrypt Key is NOT used (events configured as plaintext) — keeps console setup
+# minimal. If you later enable Encrypt Key, decryption must be added here.
+FEISHU_VERIFICATION_TOKEN = os.environ.get("FEISHU_VERIFICATION_TOKEN", "")
 FEISHU_AUTHORIZE_URL = "https://open.feishu.cn/open-apis/authen/v1/authorize"
 FEISHU_APP_TOKEN_URL = "https://open.feishu.cn/open-apis/auth/v3/app_access_token/internal"
 FEISHU_USER_TOKEN_URL = "https://open.feishu.cn/open-apis/authen/v1/oidc/access_token"
@@ -562,9 +567,102 @@ def dash_decide(body: DashDecisionBody, admin: dict = Depends(require_dash_admin
     return {"email": row[0], "status": new_status}
 
 
-
-
 # ---------------------------------------------------------------------------
+# Feishu event subscription — capture internal-group messages.
+# The app (cli_aab1d30093a25bd6) is configured in the Feishu console with this
+# URL as its event request URL, subscribed to im.message.receive_v1, with the
+# im:message.group_msg permission (so it sees all group messages, not just @).
+# Events are plaintext (no Encrypt Key); optional Verification Token check.
+# We dedup on message_id, extract best-effort plain text, and store into
+# feishu.messages. No reply, no distill wiring yet — capture only.
+# ---------------------------------------------------------------------------
+
+def _feishu_extract_text(msg_type: str, content_raw: str) -> str:
+    """Best-effort plain text from a Feishu message content JSON string.
+    text -> {"text":"..."}; post (rich) -> walk blocks; else "" (raw kept)."""
+    import json as _json
+    try:
+        c = _json.loads(content_raw) if content_raw else {}
+    except Exception:
+        return ""
+    if msg_type == "text":
+        return (c.get("text") or "").strip()
+    if msg_type == "post":
+        # rich post: {title, content:[[{tag,text},...],...]} possibly nested under lang
+        out = []
+        blocks = c.get("content")
+        if blocks is None and c:  # sometimes wrapped by language: {"zh_cn":{...}}
+            first = next(iter(c.values()), {})
+            out.append(first.get("title") or "")
+            blocks = first.get("content")
+        for line in (blocks or []):
+            for seg in (line or []):
+                if isinstance(seg, dict) and seg.get("text"):
+                    out.append(seg["text"])
+        return " ".join(t for t in out if t).strip()
+    return ""  # image/file/etc — raw is preserved in the row
+
+
+@app.post("/api/feishu/events")
+async def feishu_events(request: Request) -> Any:
+    """Feishu event-subscription callback. Handles the one-time url_verification
+    challenge and im.message.receive_v1 message events."""
+    body = await request.json()
+    # 1) URL verification handshake (first save in console) — echo challenge.
+    if body.get("type") == "url_verification":
+        if FEISHU_VERIFICATION_TOKEN and body.get("token") != FEISHU_VERIFICATION_TOKEN:
+            raise HTTPException(403, "bad verification token")
+        return {"challenge": body.get("challenge", "")}
+    # 2) Event v2.0: {schema:"2.0", header:{event_type, token,...}, event:{...}}
+    header = body.get("header") or {}
+    if FEISHU_VERIFICATION_TOKEN:
+        tok = header.get("token") or body.get("token")
+        if tok != FEISHU_VERIFICATION_TOKEN:
+            raise HTTPException(403, "bad verification token")
+    if header.get("event_type") != "im.message.receive_v1":
+        return {"code": 0}  # ack anything else (we only capture messages)
+    return _feishu_store_message(body)
+
+
+def _feishu_store_message(body: dict) -> dict:
+    """Parse an im.message.receive_v1 event and upsert into feishu.messages.
+    Always returns {code:0} so Feishu doesn't retry on our parse hiccups (the
+    raw event is stored regardless, so nothing is lost)."""
+    import json as _json
+    ev = (body.get("event") or {})
+    msg = (ev.get("message") or {})
+    sender = (ev.get("sender") or {})
+    sid = sender.get("sender_id") or {}
+    message_id = msg.get("message_id")
+    if not message_id:
+        return {"code": 0}
+    create_ms = msg.get("create_time")  # string ms epoch
+    try:
+        create_ts = int(create_ms) / 1000.0 if create_ms else None
+    except (TypeError, ValueError):
+        create_ts = None
+    text = _feishu_extract_text(msg.get("message_type") or "", msg.get("content") or "")
+    try:
+        conn = _pg_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO feishu.messages
+                     (message_id, chat_id, chat_type, sender_id, sender_type,
+                      msg_type, text, create_time, raw, received_at)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,
+                           to_timestamp(%s), %s, now())
+                   ON CONFLICT (message_id) DO NOTHING""",
+                (message_id, msg.get("chat_id"), msg.get("chat_type"),
+                 sid.get("open_id") or sid.get("union_id") or sid.get("user_id"),
+                 sender.get("sender_type"),
+                 msg.get("message_type"), text, create_ts,
+                 _json.dumps(body, ensure_ascii=False)),
+            )
+        conn.commit()
+    except Exception as exc:
+        import sys
+        print(f"[feishu] store failed for {message_id}: {exc}", file=sys.stderr)
+    return {"code": 0}# ---------------------------------------------------------------------------
 # Reverse proxy helper
 # ---------------------------------------------------------------------------
 
