@@ -127,3 +127,18 @@ MERGE_WINDOW_DAYS = float(os.environ.get("ISSUE_MERGE_WINDOW_DAYS", "30"))
 BACKFILL = os.environ.get("ISSUE_BACKFILL", "").strip() in ("1", "true", "yes")
 # Optional floor for backfill so a re-run can skip ancient history.
 BACKFILL_SINCE = os.environ.get("ISSUE_BACKFILL_SINCE", "").strip()
+
+# --- Internal (Feishu) discussion context ----------------------------------
+# When on, distill injects our own team's INTERNAL Feishu-group discussion for a
+# customer as a separate read-only context block alongside the external
+# Slack/Discord transcript, so summaries reflect how WE saw the issue — never as
+# a source of new issues. Requires feishu.chat_map to link the external channel
+# (platform:workspace_id:channel_id) to a Feishu chat_id, and feishu.messages to
+# be populated (see services/feishu-collector/backfill.py). Off by default so
+# the change is fully reversible: when off, distill behaves exactly as before.
+INTERNAL_CONTEXT = os.environ.get(
+    "ISSUE_INTERNAL_CONTEXT", "").strip().lower() in ("1", "true", "yes", "on")
+# Cap on internal-discussion chars injected per window, so a chatty internal
+# group can't blow up the prompt. Oldest-trimmed, newest kept.
+INTERNAL_CONTEXT_MAX_CHARS = int(
+    os.environ.get("ISSUE_INTERNAL_CONTEXT_MAX_CHARS", "6000"))

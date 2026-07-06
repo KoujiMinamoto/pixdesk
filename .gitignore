@@ -19,6 +19,11 @@ __pycache__/
 .idea/
 .vscode/
 
+# Claude Code local settings (contains prod host credentials) + migration handoff
+.claude/
+pixdesk-handoff/
+pixdesk-handoff.tar.gz
+
 # Node / Electron client builds
 node_modules/
 dist/

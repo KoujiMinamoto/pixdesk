@@ -289,6 +289,54 @@ def _customer_label(channel: dict[str, Any]) -> str:
     return cleaned or name
 
 
+def _fetch_internal_discussion(conn, channel: dict[str, Any],
+                               win_start: Optional[dt.datetime],
+                               win_end: Optional[dt.datetime]) -> str:
+    """Our own team's INTERNAL Feishu-group chatter about this customer, for the
+    [win_start, win_end] window, as a formatted read-only block. Returns "" when
+    the feature is off, the channel isn't mapped in feishu.chat_map, or there's
+    nothing in range — so callers can treat "" as "no internal context".
+
+    The link is exact, not fuzzy: feishu.chat_map.customer_key holds the external
+    channel's `platform:workspace_id:channel_id`; we match on that."""
+    if not config.INTERNAL_CONTEXT:
+        return ""
+    plat, ws, cid = _channel_pk(channel)
+    key = f"{plat}:{ws}:{cid}"
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            "SELECT chat_id, chat_name FROM feishu.chat_map "
+            "WHERE customer_key=%s", (key,))
+        row = cur.fetchone()
+        if not row:
+            return ""
+        cur.execute(
+            """SELECT sender_id, text, create_time
+                 FROM feishu.messages
+                WHERE chat_id=%s
+                  AND text <> ''
+                  AND (%s IS NULL OR create_time >= %s)
+                  AND (%s IS NULL OR create_time <= %s)
+                ORDER BY create_time""",
+            (row["chat_id"], win_start, win_start, win_end, win_end),
+        )
+        msgs = cur.fetchall()
+    if not msgs:
+        return ""
+    lines = []
+    for m in msgs:
+        ts = m["create_time"].strftime("%Y-%m-%d %H:%M") if m["create_time"] else "?"
+        who = (m["sender_id"] or "?")[:10]
+        txt = (m["text"] or "").replace("\n", " ").strip()
+        if txt:
+            lines.append(f"[{ts}] [{who}] {txt}")
+    body = "\n".join(lines)
+    # Newest-kept trim: internal groups can be chatty; keep the tail within cap.
+    if len(body) > config.INTERNAL_CONTEXT_MAX_CHARS:
+        body = "…(older internal messages trimmed)…\n" + body[-config.INTERNAL_CONTEXT_MAX_CHARS:]
+    return body
+
+
 
 # ---------------------------------------------------------------------------
 # Window splitting
@@ -332,7 +380,8 @@ def windows(messages: list[dict[str, Any]], max_chars: int = WINDOW_MAX_CHARS,
 # ---------------------------------------------------------------------------
 
 def _build_user_prompt(memory_text: str, msgs: list[dict[str, Any]],
-                       *, bootstrap: bool, customer_label: str = "") -> str:
+                       *, bootstrap: bool, customer_label: str = "",
+                       internal_text: str = "") -> str:
     parts = []
     # Channel context: who the customer side is. In mixed channels (customer
     # staff + our support both present) the LLM otherwise can't tell a
@@ -347,6 +396,20 @@ def _build_user_prompt(memory_text: str, msgs: list[dict[str, Any]],
             "when they sound technical or collaborative. If a speaker ADDRESSES "
             "\"Novita\"/\"Novita Support\"/our team or asks us for help, they are a "
             "customer by definition.")
+        parts.append("")
+    # Internal-discussion context: our own team's Feishu chatter about THIS
+    # customer in the same time window. Read-only background — it sharpens the
+    # summary (what WE understood/decided) but must NOT itself spawn issues.
+    if internal_text:
+        parts.append("=== INTERNAL DISCUSSION (我方内部飞书讨论，仅供参考) ===")
+        parts.append(
+            "The following is OUR OWN team's internal Feishu discussion about "
+            "this customer, in the same time window as the messages below. Use it "
+            "ONLY as background to understand our side's diagnosis/decisions and "
+            "to enrich the summary. DO NOT open issues for anything that appears "
+            "only here — issues come exclusively from the customer-facing "
+            "transcript that follows.")
+        parts.append(internal_text)
         parts.append("")
     # Hints (non-authoritative): known staff names + the closed product enum.
     # The model is told in SYSTEM_DISTILL to trust conversation content over
@@ -396,13 +459,15 @@ def _parse_distill_response(raw: str) -> dict[str, Any]:
 
 
 def call_distiller(memory_text: str, msgs: list[dict[str, Any]],
-                   *, bootstrap: bool, customer_label: str = "") -> tuple[list[dict[str, Any]], dict[str, int]]:
+                   *, bootstrap: bool, customer_label: str = "",
+                   internal_text: str = "") -> tuple[list[dict[str, Any]], dict[str, int]]:
     """One GLM call. Returns (parsed issues list, token usage dict). On any
     failure returns ([], usage)."""
     if not llm.enabled():
         return [], {"prompt_tokens": 0, "completion_tokens": 0}
     user = _build_user_prompt(memory_text, msgs, bootstrap=bootstrap,
-                              customer_label=customer_label)
+                              customer_label=customer_label,
+                              internal_text=internal_text)
     out = llm._ask(SYSTEM_DISTILL, user, max_tokens=32768,
                    timeout=DISTILL_TIMEOUT_SECONDS)
     usage = {"prompt_tokens": int(out.get("prompt_tokens", 0)),
@@ -959,8 +1024,16 @@ def run(conn, channel: dict[str, Any], *, force_full: bool = False) -> dict[str,
     first_failed_ts: Optional[dt.datetime] = None
     last_msg = msgs[-1]
     for i, w in enumerate(wins):
+        # Internal Feishu discussion for THIS window's time span (read-only
+        # context layer; "" when the feature is off or the channel isn't mapped).
+        w_ts_all = [m["ts"] for m in w if m.get("ts") is not None]
+        internal_text = ""
+        if w_ts_all:
+            internal_text = _fetch_internal_discussion(
+                conn, channel, min(w_ts_all), max(w_ts_all))
         items, usage = call_distiller(memory_text, w, bootstrap=bootstrap,
-                                      customer_label=customer_label)
+                                      customer_label=customer_label,
+                                      internal_text=internal_text)
         win_tokens = usage["prompt_tokens"] + usage["completion_tokens"]
         total_tokens += win_tokens
         # A window that returned no items AND spent no tokens is an LLM failure
