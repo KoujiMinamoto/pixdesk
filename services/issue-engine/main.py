@@ -647,7 +647,8 @@ def dash_shift_workload_issues(
                   GROUP BY am.issue_id
                 )
                 SELECT i.id, i.code, i.title, (i.metadata->>'summary_zh') AS summary_zh,
-                       i.lifecycle_state, i.nonclosure_reason, i.last_activity_at,
+                       i.lifecycle_state, i.review_state, i.nonclosure_reason,
+                       i.escalated_ticket_id, i.escalated_at, i.last_activity_at,
                        i.customer_platform, i.customer_workspace_id, i.customer_channel_id,
                        a.msgs AS my_msgs,
                        (SELECT ch.channel_name FROM agent.channels ch
@@ -1033,7 +1034,7 @@ def _history(cur, issue_id: str, field: str, old: Any, new: Any, actor: str) -> 
 
 def _fetch_issue(cur, issue_id: str) -> Optional[dict]:
     cur.execute(
-        f"SELECT id, lifecycle_state, review_state, ticket_id, last_speaker FROM {SCHEMA}.issues WHERE id = %s",
+        f"SELECT id, lifecycle_state, review_state, ticket_id, last_speaker, escalated_ticket_id FROM {SCHEMA}.issues WHERE id = %s",
         (issue_id,),
     )
     row = cur.fetchone()
@@ -1041,8 +1042,9 @@ def _fetch_issue(cur, issue_id: str) -> Optional[dict]:
 
 
 class ReviewBody(BaseModel):
-    action: str            # confirm | reject | dismiss | close | reopen
+    action: str            # confirm | reject | dismiss | close | reopen | escalate
     note: Optional[str] = None
+    escalated_ticket_id: Optional[str] = None  # required when action == escalate
 
 
 @app.post("/v1/issues/{issue_id}/review", dependencies=[Depends(require_secret)])
@@ -1063,8 +1065,10 @@ def review_issue(issue_id: str, body: ReviewBody, actor: str = Depends(require_a
                   set to confirmed so the closure_agent won't silently re-close
                   it — a human now owns the close.
     """
-    if body.action not in ("confirm", "reject", "dismiss", "close", "reopen"):
-        raise HTTPException(400, "action must be confirm | reject | dismiss | close | reopen")
+    if body.action not in ("confirm", "reject", "dismiss", "close", "reopen", "escalate"):
+        raise HTTPException(400, "action must be confirm | reject | dismiss | close | reopen | escalate")
+    if body.action == "escalate" and not (body.escalated_ticket_id or "").strip():
+        raise HTTPException(400, "escalate requires escalated_ticket_id")
     with _PooledConn() as conn:
         try:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -1117,6 +1121,22 @@ def review_issue(issue_id: str, body: ReviewBody, actor: str = Depends(require_a
                              {"lifecycle_state": old_life, "review_state": old_review},
                              {"lifecycle_state": new_life, "review_state": "confirmed",
                               "note": body.note}, actor)
+                elif body.action == "escalate":
+                    # 升级 SRE: a MARKER only. Record the SRE ticket number (free
+                    # text), who escalated, and when. Lifecycle is UNCHANGED — the
+                    # issue stays in the unclosed list and keeps being tracked
+                    # (per user 2026-07-06); an SRE handoff is not a closure.
+                    ticket = body.escalated_ticket_id.strip()
+                    cur.execute(
+                        f"""UPDATE {SCHEMA}.issues
+                           SET escalated_ticket_id=%s, escalated_at=now(),
+                               escalated_by_mxid=%s
+                           WHERE id=%s""",
+                        (ticket, actor, issue_id),
+                    )
+                    _history(cur, issue_id, "escalated_sre",
+                             {"escalated_ticket_id": issue.get("escalated_ticket_id")},
+                             {"escalated_ticket_id": ticket, "note": body.note}, actor)
                 else:  # reject | dismiss
                     cur.execute(
                         f"""UPDATE {SCHEMA}.issues

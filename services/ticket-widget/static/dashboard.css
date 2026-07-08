@@ -316,3 +316,34 @@ body { background: #fafbfc; }
   .issue-row > .pill:first-child { grid-column: 1; justify-self: start; }
   .turn.agent { margin-left: 12px; }
 }
+
+/* 下班结算 (end-of-shift settlement) */
+.settle-entry { display: flex; align-items: center; gap: 12px; margin: 4px 0 14px; }
+.settle-btn { font-size: 14px; font-weight: 600; padding: 8px 18px; border-radius: 8px;
+  background: var(--color-blue); color: #fff; border: 0; cursor: pointer; }
+.settle-btn:hover { filter: brightness(1.05); }
+.settle-hint { font-size: 12px; color: var(--color-muted); }
+.settle-box { border: 1px solid var(--color-border); border-radius: 10px; padding: 14px;
+  margin-bottom: 16px; background: var(--color-bg-soft); }
+.settle-title { font-size: 15px; font-weight: 600; margin-bottom: 10px; }
+.settle-prog { font-size: 12px; font-weight: 600; color: var(--color-muted); margin: 6px 0 10px; }
+.settle-list .settle-item { display: grid; grid-template-columns: 1fr auto; gap: 12px;
+  align-items: center; }
+.settle-main { display: grid; grid-template-columns: 90px 1fr; gap: 10px; align-items: start; }
+.settle-item .title { cursor: pointer; }
+.settle-item .title:hover { text-decoration: underline; }
+.settle-acts { display: flex; gap: 6px; flex-shrink: 0; }
+.sbtn { font-size: 12.5px; font-weight: 600; padding: 6px 12px; border-radius: 7px;
+  border: 1px solid var(--color-border); background: #fff; cursor: pointer; white-space: nowrap; }
+.sbtn.green:hover { background: #dafbe1; border-color: var(--color-green); color: var(--color-green); }
+.sbtn.red:hover { background: #ffebe9; border-color: var(--color-red); color: var(--color-red); }
+.sbtn.amber:hover { background: #fff4e5; border-color: var(--color-amber); color: var(--color-amber); }
+.settle-item.busy { opacity: 0.5; pointer-events: none; }
+.settle-mark { margin-top: 4px; display: flex; gap: 8px; flex-wrap: wrap; }
+.settle-mark .mk { font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 10px; }
+.settle-mark .mk.green { background: #1a7f37; color: #fff; }
+.settle-mark .mk.amber { background: #fff4e5; color: var(--color-amber); }
+@media (max-width: 640px) {
+  .settle-list .settle-item { grid-template-columns: 1fr; }
+  .settle-acts { justify-content: flex-start; }
+}

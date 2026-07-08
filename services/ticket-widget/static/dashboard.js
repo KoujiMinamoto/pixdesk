@@ -931,6 +931,165 @@
     slot.appendChild(list);
   }
 
+  // -------------------------------------------------------------------------
+  // 下班结算：本人这班经手的问题，逐个标记闭环/非闭环/升级SRE。
+  // Period defaults to 今日 (today's shift); the person is resolved from the
+  // logged-in Feishu account via /whoami (support is a shared login).
+  // -------------------------------------------------------------------------
+  let settlePeriod = "today";
+
+  async function openSettlement() {
+    const wrap = document.getElementById("settle-wrap");
+    if (!wrap) return;
+    if (wrap.dataset.open === "1") { wrap.innerHTML = ""; wrap.dataset.open = ""; return; }
+    wrap.dataset.open = "1";
+    wrap.innerHTML = "";
+    wrap.appendChild(el("div", { class: "loading sm" }, "识别身份中…"));
+    let who;
+    try {
+      who = await api("/api/v1/dashboard/shift/whoami");
+    } catch (e) {
+      wrap.innerHTML = "";
+      wrap.appendChild(el("div", { class: "empty sm" }, String(e.message || e)));
+      return;
+    }
+    if (!who.person) {
+      wrap.innerHTML = "";
+      wrap.appendChild(el("div", { class: "settle-box" },
+        el("div", { class: "empty sm" },
+          "你（" + (who.name || who.email || "?") +
+          "）不在排班名单里，无法结算。请管理员在 roster_identity 配置你的账号。")));
+      return;
+    }
+    await renderSettlement(who.person);
+  }
+
+  async function renderSettlement(person) {
+    const wrap = document.getElementById("settle-wrap");
+    if (!wrap) return;
+    wrap.innerHTML = "";
+    const box = el("div", { class: "settle-box" });
+    wrap.appendChild(box);
+    box.appendChild(el("div", { class: "settle-title" },
+      "🕔 " + person + " 的下班结算"));
+    // period selector for the settlement scope
+    const sel = el("div", { class: "chip-row" }, el("span", { class: "chip-label" }, "结算范围"));
+    for (const [key, label] of [["today", "今日"], ["yesterday", "昨日"], ["this_week", "本周"]]) {
+      sel.appendChild(el("button",
+        { class: "chip" + (settlePeriod === key ? " active" : ""),
+          onclick: () => { settlePeriod = key; renderSettlement(person); } }, label));
+    }
+    box.appendChild(sel);
+    const body = el("div", { class: "settle-body" }, el("div", { class: "loading sm" }, "加载中…"));
+    box.appendChild(body);
+    let data;
+    try {
+      const qs = new URLSearchParams({ person, period: settlePeriod, bucket: "all" });
+      data = await api("/api/v1/dashboard/shift-workload/issues?" + qs);
+    } catch (e) {
+      body.innerHTML = ""; body.appendChild(el("div", { class: "empty sm" }, String(e.message || e)));
+      return;
+    }
+    body.innerHTML = "";
+    const items = data.items || [];
+    const prog = el("div", { class: "settle-prog", id: "settle-prog" });
+    body.appendChild(prog);
+    updateSettleProgress(items);
+    if (!items.length) {
+      body.appendChild(el("div", { class: "empty sm" }, "该时段没有你经手的问题"));
+      return;
+    }
+    const list = el("div", { class: "issue-list settle-list" });
+    for (const it of items) list.appendChild(settleRow(it));
+    body.appendChild(list);
+  }
+
+  function updateSettleProgress(items) {
+    const prog = document.getElementById("settle-prog");
+    if (!prog) return;
+    const total = items.length;
+    const done = items.filter(it =>
+      it.lifecycle_state === "closed_confirmed" ||
+      (it.escalated_ticket_id && String(it.escalated_ticket_id).trim())).length;
+    prog.textContent = "已处理 " + done + " / " + total;
+  }
+
+  // One settlement row: issue summary + current mark + three action buttons.
+  function settleRow(it) {
+    const row = el("div", { class: "issue-row settle-item", id: "settle-" + it.id });
+    const stateLabel = STATE_LABEL[it.lifecycle_state] || it.lifecycle_state;
+    const summary = it.summary_zh || it.title || "";
+    // current mark badge (闭环 / 已升级+工单号 / 其它状态)
+    const mark = el("span", { class: "settle-mark" });
+    renderMark(mark, it);
+    const acts = el("div", { class: "settle-acts" },
+      el("button", { class: "sbtn green", onclick: () => settleAct(it, "close") }, "闭环"),
+      el("button", { class: "sbtn red", onclick: () => settleAct(it, "reopen") }, "非闭环"),
+      el("button", { class: "sbtn amber", onclick: () => settleAct(it, "escalate") }, "升级SRE"));
+    row.appendChild(el("div", { class: "settle-main" },
+      el("span", { class: "pill " + it.lifecycle_state }, stateLabel),
+      el("div", null,
+        el("div", { class: "cust-line" },
+          el("span", { class: "cust-chip" }, it.channel_name || it.customer_workspace_id || "?"),
+          it.code ? el("span", { class: "ticket-code" }, it.code) : null),
+        el("div", { class: "title", onclick: () => location.hash = "#/issues/" + it.id },
+          it.title || "(无标题)"),
+        summary ? el("div", { class: "summary" }, summary) : null,
+        mark)));
+    row.appendChild(acts);
+    return row;
+  }
+
+  function renderMark(mark, it) {
+    mark.innerHTML = "";
+    if (it.lifecycle_state === "closed_confirmed") {
+      mark.appendChild(el("span", { class: "mk green" }, "✓ 已确认闭环"));
+    }
+    if (it.escalated_ticket_id && String(it.escalated_ticket_id).trim()) {
+      mark.appendChild(el("span", { class: "mk amber" },
+        "⬆ 已升级SRE · " + it.escalated_ticket_id));
+    }
+  }
+
+  // Apply a settlement action to one issue, then update just that row in place.
+  async function settleAct(it, action) {
+    let body = { action };
+    if (action === "escalate") {
+      const t = prompt("升级 SRE — 请输入工单号（如 WO-20260703-0038）：",
+        it.escalated_ticket_id || "");
+      if (t === null) return;               // cancelled
+      if (!t.trim()) { alert("工单号不能为空"); return; }
+      body.escalated_ticket_id = t.trim();
+    }
+    const row = document.getElementById("settle-" + it.id);
+    if (row) row.classList.add("busy");
+    try {
+      await api("/api/v1/dashboard/issues/" + it.id + "/review",
+        { method: "POST", json: body });
+    } catch (e) {
+      if (row) row.classList.remove("busy");
+      alert("操作失败：" + (e.message || e));
+      return;
+    }
+    // reflect new state locally (avoid a full refetch)
+    if (action === "close") { it.lifecycle_state = "closed_confirmed"; }
+    else if (action === "reopen") { it.lifecycle_state = "awaiting_agent"; }
+    else if (action === "escalate") { it.escalated_ticket_id = body.escalated_ticket_id; }
+    if (row) {
+      row.classList.remove("busy");
+      const fresh = settleRow(it);
+      row.replaceWith(fresh);
+    }
+    // refresh the progress counter: a row is "done" if it shows a closed/escalated mark
+    const progEl = document.getElementById("settle-prog");
+    if (progEl) {
+      const rows = document.querySelectorAll(".settle-item");
+      const doneRows = Array.from(rows)
+        .filter(r => r.querySelector(".mk.green, .mk.amber")).length;
+      progEl.textContent = "已处理 " + doneRows + " / " + rows.length;
+    }
+  }
+
   async function renderShift() {
     $strip.style.display = "none";
     renderNav("shift");
@@ -950,6 +1109,14 @@
     const hours = shiftHours;
     const data = await api("/api/v1/dashboard/shift?hours=" + hours);
     $view.innerHTML = "";
+    // 下班结算入口：逐个标记本人这班经手的问题（闭环/非闭环/升级SRE）。
+    $view.appendChild(el("div", { class: "settle-entry" },
+      el("button", { class: "settle-btn", onclick: () => openSettlement() },
+        "🕔 下班结算"),
+      el("span", { class: "settle-hint" },
+        "逐个标记你本班经手的问题：闭环 / 非闭环 / 升级SRE")));
+    const settleWrap = el("div", { class: "settle-wrap", id: "settle-wrap" });
+    $view.appendChild(settleWrap);
     $view.appendChild(wlWrap);
     renderWorkload();
 

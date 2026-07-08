@@ -1002,6 +1002,27 @@ async def dash_shift(request: Request, user: dict = Depends(require_dash_approve
     return _passthrough(resp)
 
 
+@app.get("/api/v1/dashboard/shift/whoami")
+async def dash_shift_whoami(user: dict = Depends(require_dash_approved)) -> Any:
+    """Resolve the logged-in Feishu user to their duty-roster nickname, so the
+    end-of-shift settlement window knows whose issues to list. `support` is a
+    shared login and the roster is keyed by nickname, so this mapping lives in
+    issue_tc.roster_identity (feishu_user_id -> person). Returns person=null when
+    the user isn't on the roster (UI then tells them to ask an admin)."""
+    person = None
+    fid = user.get("feishu_user_id")
+    if fid:
+        conn = _pg_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT person FROM issue_tc.roster_identity WHERE feishu_user_id=%s",
+                (fid,),
+            )
+            row = cur.fetchone()
+        person = row[0] if row else None
+    return {"person": person, "name": user.get("name"), "email": user.get("email")}
+
+
 @app.get("/api/v1/dashboard/sources")
 async def dash_sources(user: dict = Depends(require_dash_approved)) -> Any:
     """Per-platform connection / data-flow status (Slack, Discord)."""
@@ -1040,6 +1061,7 @@ async def dash_issue_transcript(issue_id: str, user: dict = Depends(require_dash
 class DashReviewBody(BaseModel):
     action: str
     note: Optional[str] = None
+    escalated_ticket_id: Optional[str] = None  # required when action == escalate
 
 
 def _actor_mxid(user: dict[str, Any]) -> str:
