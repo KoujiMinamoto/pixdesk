@@ -948,8 +948,10 @@ async def dash_unclosed(user: dict = Depends(require_dash_approved)) -> Any:
 
 
 @app.get("/api/v1/dashboard/rollup")
-async def dash_rollup(user: dict = Depends(require_dash_approved)) -> Any:
-    resp = await _issue_proxy("GET", "/v1/customers/rollup", "@anon:dashboard")
+async def dash_rollup(request: Request, user: dict = Depends(require_dash_approved)) -> Any:
+    params = dict(request.query_params)  # forward period/start/end so the customer
+    # list scopes to the selected window (matches the hero strip's 活跃客户 count).
+    resp = await _issue_proxy("GET", "/v1/customers/rollup", "@anon:dashboard", params=params)
     return _passthrough(resp)
 
 

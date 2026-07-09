@@ -231,12 +231,25 @@
     $strip.appendChild(card("待我方回复", summary.awaiting_us || 0, "red", "实时"));
   }
 
-  // Re-fetch the summary for the current overview window and repaint the strip.
+  // Re-fetch the summary AND customer rollup for the current overview window and
+  // repaint both the strip and the customer cards — they share the same period,
+  // so the 活跃客户 count and the card list stay consistent.
   async function refreshStrip() {
     $strip.style.opacity = "0.5";
     try {
-      const summary = await api("/api/v1/dashboard/summary" + summaryQuery());
+      const [summary, rollup] = await Promise.all([
+        api("/api/v1/dashboard/summary" + summaryQuery()),
+        api("/api/v1/dashboard/rollup" + summaryQuery()),
+      ]);
       renderStrip(summary);
+      _rollupItems = rollup.items || [];
+      if (!_rollupItems.length) {
+        $view.innerHTML = "";
+        $view.appendChild(el("div", { class: "empty" }, "🎉 该时段暂无客户问题"));
+      } else {
+        renderFilterBar();
+        renderGrid();
+      }
     } catch (e) {
       setStatus(String(e.message || e), "error");
     } finally {
@@ -292,7 +305,7 @@
 
     const [summary, rollup, sources] = await Promise.all([
       api("/api/v1/dashboard/summary" + summaryQuery()),
-      api("/api/v1/dashboard/rollup"),
+      api("/api/v1/dashboard/rollup" + summaryQuery()),
       api("/api/v1/dashboard/sources").catch(() => ({ sources: [] })),
     ]);
 

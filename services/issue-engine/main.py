@@ -348,11 +348,46 @@ def unclosed() -> Any:
 
 
 @app.get("/v1/customers/rollup", dependencies=[Depends(require_secret)])
-def rollup() -> Any:
+def rollup(
+    period: Optional[str] = Query(None),
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+) -> Any:
     """Per-channel rollup. One row per (platform, workspace_id, channel_id) so
     Slack workspaces with many ext channels show each one separately. Returns
     counts for both unclosed (ball in our court) and closed_inferred so the UI
-    can render a progress bar per customer."""
+    can render a progress bar per customer.
+
+    When `period` is given, only customers with activity in that window are shown
+    (a customer appears if ANY of its issues has last_activity_at in the window),
+    so the customer count matches the hero strip's 活跃客户. The per-customer
+    counts remain the customer's full current state (we filter WHICH customers to
+    show, not the counts inside each card). Without `period`, behaves as before
+    (all customers above TIME_FLOOR)."""
+    if period:
+        win_start_sql, win_end_sql, pp = _resolve_period(period, start, end)
+        # win_start_sql/win_end_sql are SQL fragments. For presets they contain no
+        # %s (pp==[]); for custom, win_start_sql has 1 %s (start) and win_end_sql
+        # has 1 %s (end). We reference win_start in the floor clause AND in the
+        # having-filter start, and win_end in the having-filter end — so params
+        # must be supplied in that textual order.
+        p_start = pp[0:1]  # [start] for custom, [] for presets
+        p_end = pp[1:2]    # [end] for custom, [] for presets
+        # Widen the TIME_FLOOR to the window start for past windows (上月=May,
+        # below the 2026-06-01 floor) — same LEAST trick as dash_summary.
+        if TIME_FLOOR:
+            floor_clause = f"i.last_activity_at >= LEAST({win_start_sql}, '{TIME_FLOOR}'::timestamptz)"
+        else:
+            floor_clause = "TRUE"
+        # WHICH customers: those with any issue whose last_activity is in-window.
+        window_having = (
+            f"AND count(*) FILTER (WHERE i.last_activity_at >= {win_start_sql} "
+            f"AND i.last_activity_at < {win_end_sql}) > 0"
+        )
+        # placeholder order in final SQL: floor(win_start), having(win_start), having(win_end)
+        wparams = p_start + p_start + p_end
+    else:
+        window_having, floor_clause, wparams = "", TIME_FLOOR_ALIAS, []
     with _PooledConn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
@@ -388,12 +423,14 @@ def rollup() -> Any:
                  AND ch.workspace_id = i.customer_workspace_id
                  AND ch.channel_id = i.customer_channel_id
                 WHERE i.lifecycle_state <> 'dismissed' AND i.review_state <> 'rejected'
-                  AND {TIME_FLOOR_ALIAS}
+                  AND {floor_clause}
                 GROUP BY i.customer_platform, i.customer_workspace_id,
                          i.customer_channel_id
                 HAVING count(*) > 0
+                {window_having}
                 ORDER BY unclosed DESC, suggested_closed DESC, most_recent_at DESC
-                """
+                """,
+                wparams,
             )
             items = _rows(cur)
     return {"items": items, "count": len(items)}
