@@ -1020,8 +1020,47 @@ def dash_issue_transcript(issue_id: str) -> Any:
                 (issue_id,),
             )
             history = _rows(cur)
+    # Deep link into the customer's original Slack/Discord conversation, anchored
+    # to the issue's opening message. Transcript rows carry is_segment_start +
+    # message_id, so reuse them as the message list.
+    issue["chat_deeplink"] = _chat_deeplink(transcript, issue)
     return {"issue": issue, "transcript": transcript, "history": history,
             "transcript_count": len(transcript)}
+
+
+def _chat_deeplink(messages: list[dict], issue: dict) -> Optional[str]:
+    """Build a deep link into the customer's original Slack/Discord conversation,
+    anchored to this issue's OPENING message when available, else the channel.
+
+    Slack: message_id IS the ts (verified), e.g. "1713787797.071579" →
+      https://app.slack.com/client/<team>/<channel>/thread/<channel>-<ts>
+    Discord: message_id IS the native message id; DMs/group-DMs use @me →
+      https://discord.com/channels/@me/<channel>/<message>
+
+    Returns None if the ids needed aren't present (UI hides the link then)."""
+    plat = issue.get("customer_platform")
+    ws = issue.get("customer_workspace_id")
+    chan = issue.get("customer_channel_id")
+    if not plat or not chan:
+        return None
+    # Prefer the issue's opening (segment-start) message; fall back to the first.
+    opening = next((m for m in messages if m.get("is_segment_start")), None)
+    if opening is None and messages:
+        opening = messages[0]
+    msg_id = (opening or {}).get("message_id")
+    if plat == "slack":
+        if not ws:
+            return None
+        if msg_id:
+            return (f"https://app.slack.com/client/{ws}/{chan}"
+                    f"/thread/{chan}-{msg_id}")
+        return f"https://app.slack.com/client/{ws}/{chan}"
+    if plat == "discord":
+        # bridge workspace_id is "direct:<n>" (not a guild) → DM/group-DM uses @me.
+        if msg_id:
+            return f"https://discord.com/channels/@me/{chan}/{msg_id}"
+        return f"https://discord.com/channels/@me/{chan}"
+    return None
 
 
 @app.get("/v1/issues/{issue_id}", dependencies=[Depends(require_secret)])
@@ -1046,6 +1085,10 @@ def issue_detail(issue_id: str) -> Any:
                 (issue_id,),
             )
             item["history"] = _rows(cur)
+    # Deep-link into the customer's original Slack/Discord conversation, anchored
+    # to this issue's opening message when we can identify one (falls back to the
+    # channel). None when it can't be built — the UI then hides the link.
+    item["chat_deeplink"] = _chat_deeplink(item.get("messages") or [], item)
     return item
 
 

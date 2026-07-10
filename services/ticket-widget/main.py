@@ -433,6 +433,32 @@ def require_dash_admin(email: str = Depends(require_dash_session)) -> dict[str, 
     return u
 
 
+def require_roster_member(email: str = Depends(require_dash_session)) -> dict[str, Any]:
+    """Gate issue WRITE actions (确认闭环/非闭环/升级SRE/驳回/合并/升级工单) to the
+    duty-roster team only. Reads are open to any approved user; only the people on
+    the shift roster (a row in issue_tc.roster_identity) — plus admins — may mutate
+    an issue's state. Keeps closure authority with the on-duty support team, not
+    every approved viewer."""
+    u = _dash_user_by_email(email)
+    if not u or u["status"] != "approved":
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "not approved")
+    if u.get("role") == "admin":
+        return u
+    fid = u.get("feishu_user_id")
+    on_roster = False
+    if fid:
+        conn = _pg_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM issue_tc.roster_identity WHERE feishu_user_id=%s",
+                (fid,))
+            on_roster = cur.fetchone() is not None
+    if not on_roster:
+        raise HTTPException(status.HTTP_403_FORBIDDEN,
+                            "只有排班同事可以确认/修改问题状态")
+    return u
+
+
 @app.get("/api/auth/feishu/login")
 def feishu_login(state: str = Query(default="/dashboard")) -> Response:
     if not FEISHU_APP_ID:
@@ -512,8 +538,23 @@ def dash_whoami(pixdesk_dash_session: Optional[str] = Cookie(default=None)) -> d
     u = _dash_user_by_email(email)
     if not u:
         return {"authed": True, "email": email, "status": "none"}
+    # roster_person: the duty-roster nickname this user settles/writes as, or null.
+    # The SPA uses it to show issue-write actions (确认闭环 etc.) only to roster
+    # members (admins can always write). Mirrors require_roster_member's gate.
+    roster_person = None
+    fid = u.get("feishu_user_id")
+    if fid:
+        conn = _pg_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT person FROM issue_tc.roster_identity WHERE feishu_user_id=%s",
+                (fid,))
+            row = cur.fetchone()
+        roster_person = row[0] if row else None
     return {"authed": True, "email": u["email"], "name": u["name"],
-            "status": u["status"], "role": u["role"]}
+            "status": u["status"], "role": u["role"],
+            "roster_person": roster_person,
+            "can_write": (u["role"] == "admin") or (roster_person is not None)}
 
 
 @app.post("/api/dashboard/apply")
@@ -1077,7 +1118,7 @@ def _actor_mxid(user: dict[str, Any]) -> str:
 
 @app.post("/api/v1/dashboard/issues/{issue_id}/review")
 async def dash_review(issue_id: str, body: DashReviewBody,
-                      user: dict = Depends(require_dash_approved)) -> Any:
+                      user: dict = Depends(require_roster_member)) -> Any:
     resp = await _issue_proxy(
         "POST", f"/v1/issues/{issue_id}/review", _actor_mxid(user),
         json_body=body.model_dump(),
@@ -1091,7 +1132,7 @@ class DashMergeBody(BaseModel):
 
 @app.post("/api/v1/dashboard/issues/{issue_id}/merge")
 async def dash_merge(issue_id: str, body: DashMergeBody,
-                     user: dict = Depends(require_dash_approved)) -> Any:
+                     user: dict = Depends(require_roster_member)) -> Any:
     resp = await _issue_proxy(
         "POST", f"/v1/issues/{issue_id}/merge", _actor_mxid(user),
         json_body=body.model_dump(),
@@ -1106,7 +1147,7 @@ class DashPromoteBody(BaseModel):
 
 @app.post("/api/v1/dashboard/issues/{issue_id}/promote", status_code=201)
 async def dash_promote(issue_id: str, body: DashPromoteBody,
-                       user: dict = Depends(require_dash_approved)) -> Any:
+                       user: dict = Depends(require_roster_member)) -> Any:
     """Promote an issue to a real ticket. Orchestration lives in the BFF: it
     reads the issue (for conversation_id + title), creates the ticket via
     ticket-api (the sole ticket write path), then links the issue to it via the

@@ -154,6 +154,8 @@
   // the grid without re-fetching.
   const filter = { platform: null, product: null, q: "" };
   let _rollupItems = [];
+  // Home customer view: "grid" (cards) or "list" (one row per customer).
+  let viewMode = localStorage.getItem("ov_view") || "grid";
   // Shift-review window in hours (support runs 3 rotating 8h shifts).
   let shiftHours = 8;
   // Shift-workload (per-colleague) panel: its own period selector, defaulting
@@ -356,7 +358,12 @@
       filter.q = e.target.value;
       renderGrid();  // grid only — don't rebuild the bar, keeps input focus
     });
-    bar.appendChild(el("div", { class: "chip-row" }, search));
+    const viewToggle = el("div", { class: "view-toggle" },
+      chip("▦ 卡片", viewMode === "grid",
+        () => { viewMode = "grid"; localStorage.setItem("ov_view", "grid"); renderGrid(); refreshChips(); }),
+      chip("☰ 列表", viewMode === "list",
+        () => { viewMode = "list"; localStorage.setItem("ov_view", "list"); renderGrid(); refreshChips(); }));
+    bar.appendChild(el("div", { class: "chip-row" }, search, viewToggle));
 
     const platRow = el("div", { class: "chip-row" }, el("span", { class: "chip-label" }, "平台"));
     platRow.appendChild(chip("全部", !filter.platform, () => { filter.platform = null; renderGrid(); refreshChips(); }));
@@ -397,9 +404,15 @@
       $view.appendChild(el("div", { class: "empty" }, "无匹配筛选的客户"));
       return;
     }
-    const grid = el("div", { class: "customer-grid" });
-    for (const c of shown) grid.appendChild(customerCard(c));
-    $view.appendChild(grid);
+    if (viewMode === "list") {
+      const list = el("div", { class: "customer-list" });
+      for (const c of shown) list.appendChild(customerRow(c));
+      $view.appendChild(list);
+    } else {
+      const grid = el("div", { class: "customer-grid" });
+      for (const c of shown) grid.appendChild(customerCard(c));
+      $view.appendChild(grid);
+    }
   }
 
 
@@ -494,6 +507,34 @@
         el("span", { class: "resolved", style: `width:${pctR}%` })),
       stale ? el("div", { class: "stale" + staleClass },
         "最久 ", stale, " 起未回") : null);
+  }
+
+  // One customer as a horizontal list row (compact alternative to the card).
+  // Same data as customerCard — just a denser layout for scanning many customers.
+  function customerRow(c) {
+    const key = customerKey(c);
+    const unclosed = +c.unclosed || 0;
+    const suggested = +c.suggested_closed || 0;
+    const closed = +c.closed || 0;
+    const total = +c.total || (unclosed + suggested + closed) || 1;
+    const pctU = unclosed * 100 / total, pctS = suggested * 100 / total,
+          pctR = closed * 100 / total;
+    const stale = unclosed > 0 ? fmtAge(c.oldest_unclosed_at) : null;
+    const staleClass = unclosed > 0 && c.oldest_unclosed_at &&
+      (Date.now() - new Date(c.oldest_unclosed_at).getTime()) > 86400000 ? " danger" : "";
+
+    return el("div", { class: "customer-row", onclick: () => location.hash = "#/customers/" + key },
+      el("div", { class: "cr-tags" }, platformPill(c.customer_platform), productPills(c.products)),
+      el("div", { class: "cr-name" }, customerLabel(c)),
+      el("div", { class: "cr-stats" },
+        el("span", { class: "cr-n red", title: "待回复" }, String(unclosed)),
+        el("span", { class: "cr-n amber", title: "待确认" }, String(suggested)),
+        el("span", { class: "cr-n green", title: "已闭环" }, String(closed))),
+      el("div", { class: "cr-bar bar" },
+        el("span", { class: "unclosed", style: `width:${pctU}%` }),
+        el("span", { class: "suggested", style: `width:${pctS}%` }),
+        el("span", { class: "resolved", style: `width:${pctR}%` })),
+      el("div", { class: "cr-stale" + staleClass }, stale ? "最久 " + stale + " 起未回" : ""));
   }
 
   // -------------------------------------------------------------------------
@@ -630,7 +671,13 @@
       it.code ? el("span", { class: "meta-item code" }, it.code) : null,
       it.external_party_name ? el("span", { class: "meta-item" }, "👤 " + it.external_party_name) : null,
       el("span", { class: "meta-item" }, (it.message_count || turns.length) + " 条消息"),
-      el("span", { class: "meta-item" }, "最后活动 " + fmtAge(it.last_activity_at)));
+      el("span", { class: "meta-item" }, "最后活动 " + fmtAge(it.last_activity_at)),
+      it.chat_deeplink
+        ? el("a", { class: "meta-item chat-link", href: it.chat_deeplink,
+                    target: "_blank", rel: "noopener",
+                    title: "在 " + (it.customer_platform === "discord" ? "Discord" : "Slack") + " 中打开原始对话" },
+            "↗ 打开对话")
+        : null);
     detail.appendChild(meta);
 
     const prods = (it.metadata && it.metadata.products) || [];
@@ -677,16 +724,16 @@
         ...handlers.map((h) => el("span", { class: "handler-chip" }, h))));
     }
 
-    // State-aware review actions.
-    //  - 疑似闭环 (closed_inferred): 确认闭环 / 未闭环 / 忽略
-    //  - 已闭环 (closed_confirmed): 重新打开
-    //  - 其它(进行中): 确认为真问题 / 标记已闭环 / 忽略
+    // State-aware review actions. Only roster members (+admins) can write; other
+    // approved viewers see the issue read-only (backend also enforces this).
     const actions = el("div", { class: "actions" });
     const btn = (label, action, cls) =>
       el("button", cls ? { class: cls, onclick: () => act(issueId, action) }
                         : { onclick: () => act(issueId, action) }, label);
     const st = it.lifecycle_state;
-    if (st === "closed_inferred") {
+    if (!canWrite()) {
+      // no action buttons for non-roster viewers
+    } else if (st === "closed_inferred") {
       actions.appendChild(btn("✓ 确认闭环", "close"));
       actions.appendChild(btn("✗ 未闭环", "reopen", "warn"));
       actions.appendChild(btn("✕ 忽略", "reject", "danger"));
@@ -697,7 +744,7 @@
       actions.appendChild(btn("✓ 标记已闭环", "close"));
       actions.appendChild(btn("✕ 忽略", "reject", "danger"));
     }
-    detail.appendChild(actions);
+    if (actions.childNodes.length) detail.appendChild(actions);
 
     // transcript
     const tx = el("div", { class: "transcript" });
@@ -1329,6 +1376,9 @@
 
   let _me = null;          // whoami result
   function isAdmin() { return _me && _me.role === "admin" && _me.status === "approved"; }
+  // Only roster members (+ admins) may write issue state; backend enforces the
+  // same via require_roster_member. Non-roster viewers see no action buttons.
+  function canWrite() { return _me && _me.can_write === true; }
 
   function gateScreen(title, desc, btn) {
     $strip.style.display = "none";

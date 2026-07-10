@@ -347,3 +347,34 @@ body { background: #fafbfc; }
   .settle-list .settle-item { grid-template-columns: 1fr; }
   .settle-acts { justify-content: flex-start; }
 }
+
+/* 打开原始对话 deep-link in issue detail meta */
+.meta-item.chat-link { color: var(--color-blue); text-decoration: none; font-weight: 600;
+  border: 1px solid var(--color-blue); border-radius: 6px; padding: 1px 8px; cursor: pointer; }
+.meta-item.chat-link:hover { background: #ddf4ff; }
+
+/* 首页 卡片/列表 视图切换 + 列表行 */
+.view-toggle { display: inline-flex; gap: 4px; margin-left: auto; }
+.customer-list { display: flex; flex-direction: column; gap: 8px; }
+.customer-row { display: grid;
+  grid-template-columns: minmax(200px, 1.4fr) minmax(120px, 1fr) 150px minmax(120px, 1fr) 150px;
+  gap: 14px; align-items: center; background: var(--color-card);
+  border: 1px solid var(--color-border); border-radius: 8px; padding: 10px 14px;
+  cursor: pointer; transition: box-shadow 120ms, border-color 120ms; }
+.customer-row:hover { box-shadow: 0 2px 8px rgba(0,0,0,.06); border-color: #b6bec7; }
+.customer-row .cr-tags { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+.customer-row .cr-name { font-size: 15px; font-weight: 600; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; }
+.customer-row .cr-stats { display: flex; gap: 12px; align-items: baseline;
+  font-variant-numeric: tabular-nums; }
+.customer-row .cr-n { font-size: 18px; font-weight: 700; }
+.customer-row .cr-n.red { color: var(--color-red); }
+.customer-row .cr-n.amber { color: var(--color-amber); }
+.customer-row .cr-n.green { color: var(--color-green); }
+.customer-row .cr-bar { margin: 0; }
+.customer-row .cr-stale { font-size: 12px; color: var(--color-muted); text-align: right; }
+.customer-row .cr-stale.danger { color: var(--color-red); }
+@media (max-width: 720px) {
+  .customer-row { grid-template-columns: 1fr auto; row-gap: 6px; }
+  .customer-row .cr-bar, .customer-row .cr-stale { grid-column: 1 / -1; }
+}
