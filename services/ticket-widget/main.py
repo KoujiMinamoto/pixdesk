@@ -352,7 +352,7 @@ def _dash_user_by_email(email: str) -> Optional[dict[str, Any]]:
     conn = _pg_conn()
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT feishu_user_id, email, name, status, role "
+            "SELECT feishu_user_id, email, name, status, role, can_write "
             "FROM issue_tc.dashboard_users WHERE lower(email)=lower(%s)",
             (email,),
         )
@@ -360,7 +360,7 @@ def _dash_user_by_email(email: str) -> Optional[dict[str, Any]]:
     if not row:
         return None
     return {"feishu_user_id": row[0], "email": row[1], "name": row[2],
-            "status": row[3], "role": row[4]}
+            "status": row[3], "role": row[4], "can_write": bool(row[5])}
 
 
 def _dash_user_upsert(feishu_user_id: str, email: str, name: str,
@@ -434,30 +434,19 @@ def require_dash_admin(email: str = Depends(require_dash_session)) -> dict[str, 
     return u
 
 
-def require_roster_member(email: str = Depends(require_dash_session)) -> dict[str, Any]:
-    """Gate issue WRITE actions (确认闭环/非闭环/升级SRE/驳回/合并/升级工单) to the
-    duty-roster team only. Reads are open to any approved user; only the people on
-    the shift roster (a row in issue_tc.roster_identity) — plus admins — may mutate
-    an issue's state. Keeps closure authority with the on-duty support team, not
-    every approved viewer."""
+def require_can_write(email: str = Depends(require_dash_session)) -> dict[str, Any]:
+    """Gate issue WRITE actions (确认闭环/非闭环/升级SRE/驳回/合并/升级工单).
+    Reads are open to any approved user; writes need the per-user can_write flag
+    (managed on the 成员管理 admin page) or the admin role. Decoupled from the
+    duty-roster nickname mapping — roster_identity only drives settlement
+    attribution now, not permission."""
     u = _dash_user_by_email(email)
     if not u or u["status"] != "approved":
         raise HTTPException(status.HTTP_403_FORBIDDEN, "not approved")
-    if u.get("role") == "admin":
+    if u.get("role") == "admin" or u.get("can_write"):
         return u
-    fid = u.get("feishu_user_id")
-    on_roster = False
-    if fid:
-        conn = _pg_conn()
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT 1 FROM issue_tc.roster_identity WHERE feishu_user_id=%s",
-                (fid,))
-            on_roster = cur.fetchone() is not None
-    if not on_roster:
-        raise HTTPException(status.HTTP_403_FORBIDDEN,
-                            "只有排班同事可以确认/修改问题状态")
-    return u
+    raise HTTPException(status.HTTP_403_FORBIDDEN,
+                        "无写权限：请管理员在成员管理页开启「可写」")
 
 
 @app.get("/api/auth/feishu/login")
@@ -539,9 +528,9 @@ def dash_whoami(pixdesk_dash_session: Optional[str] = Cookie(default=None)) -> d
     u = _dash_user_by_email(email)
     if not u:
         return {"authed": True, "email": email, "status": "none"}
-    # roster_person: the duty-roster nickname this user settles/writes as, or null.
-    # The SPA uses it to show issue-write actions (确认闭环 etc.) only to roster
-    # members (admins can always write). Mirrors require_roster_member's gate.
+    # roster_person: the duty-roster nickname this user settles as (attribution
+    # for the 下班结算 window), or null. Independent of write permission now —
+    # can_write is its own flag, managed on the 成员管理 admin page.
     roster_person = None
     fid = u.get("feishu_user_id")
     if fid:
@@ -555,7 +544,7 @@ def dash_whoami(pixdesk_dash_session: Optional[str] = Cookie(default=None)) -> d
     return {"authed": True, "email": u["email"], "name": u["name"],
             "status": u["status"], "role": u["role"],
             "roster_person": roster_person,
-            "can_write": (u["role"] == "admin") or (roster_person is not None)}
+            "can_write": (u["role"] == "admin") or bool(u.get("can_write"))}
 
 
 @app.post("/api/dashboard/apply")
@@ -607,6 +596,130 @@ def dash_decide(body: DashDecisionBody, admin: dict = Depends(require_dash_admin
     if not row:
         raise HTTPException(404, "user not found")
     return {"email": row[0], "status": new_status}
+
+
+# ---------------------------------------------------------------------------
+# 成员管理 (member admin): full user list + per-user permission management.
+# Everything here is admin-only. Permissions live in three places:
+#   role      reviewer|admin          (dashboard_users)
+#   status    pending|approved|rejected — rejected doubles as "停用"
+#   can_write bool                    (dashboard_users; admin implies writable)
+#   person    duty-roster nickname    (roster_identity; settlement attribution
+#                                      ONLY — not a permission)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/dashboard/members")
+def dash_members(admin: dict = Depends(require_dash_admin)) -> dict[str, Any]:
+    """Every user who has ever logged in, with their full permission state and
+    roster nickname. Also returns the distinct roster persons for the UI's
+    nickname dropdown."""
+    conn = _pg_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """SELECT d.feishu_user_id, d.name, d.email, d.avatar_url,
+                      d.status, d.role, d.can_write, ri.person,
+                      d.requested_at, d.decided_at, d.decided_by
+               FROM issue_tc.dashboard_users d
+               LEFT JOIN issue_tc.roster_identity ri
+                 ON ri.feishu_user_id = d.feishu_user_id
+               ORDER BY (d.status='pending') DESC, d.role='admin' DESC, d.name""")
+        members = [{
+            "feishu_user_id": r[0], "name": r[1], "email": r[2],
+            "avatar_url": r[3], "status": r[4], "role": r[5],
+            "can_write": bool(r[6]), "person": r[7],
+            "requested_at": r[8].isoformat() if r[8] else None,
+            "decided_at": r[9].isoformat() if r[9] else None,
+            "decided_by": r[10],
+        } for r in cur.fetchall()]
+        cur.execute("SELECT DISTINCT person FROM agent.shift_roster ORDER BY 1")
+        persons = [r[0] for r in cur.fetchall()]
+    return {"members": members, "roster_persons": persons,
+            "me": admin.get("feishu_user_id")}
+
+
+class MemberPatchBody(BaseModel):
+    feishu_user_id: str
+    role: Optional[str] = None        # reviewer | admin
+    status: Optional[str] = None      # approved | rejected (停用)
+    can_write: Optional[bool] = None
+    person: Optional[str] = None      # roster nickname; "" clears the mapping
+    person_set: bool = False          # explicit flag: person field is intended
+                                      # (so None/"" can mean "clear", not "untouched")
+
+
+@app.post("/api/dashboard/members/update")
+def dash_member_update(body: MemberPatchBody,
+                       admin: dict = Depends(require_dash_admin)) -> dict[str, Any]:
+    """Patch one member's permission fields. Guardrails: an admin cannot change
+    their OWN role/status (no locking yourself out), and the LAST admin cannot
+    be demoted or deactivated (no admin-less dashboard)."""
+    fid = body.feishu_user_id
+    conn = _pg_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT role, status FROM issue_tc.dashboard_users WHERE feishu_user_id=%s",
+            (fid,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "member not found")
+        cur_role, cur_status = row
+
+        is_self = fid == admin.get("feishu_user_id")
+        if is_self and (body.role is not None or body.status is not None):
+            raise HTTPException(400, "不能修改自己的角色/状态（防止把自己锁在门外）")
+
+        demoting_admin = (cur_role == "admin" and
+                          ((body.role is not None and body.role != "admin") or
+                           (body.status is not None and body.status != "approved")))
+        if demoting_admin:
+            cur.execute(
+                """SELECT count(*) FROM issue_tc.dashboard_users
+                   WHERE role='admin' AND status='approved' AND feishu_user_id<>%s""",
+                (fid,))
+            if cur.fetchone()[0] == 0:
+                raise HTTPException(400, "这是最后一位管理员，不能降级或停用")
+
+        sets, args = [], []
+        if body.role is not None:
+            if body.role not in ("reviewer", "admin"):
+                raise HTTPException(400, "role must be reviewer|admin")
+            sets.append("role=%s"); args.append(body.role)
+        if body.status is not None:
+            if body.status not in ("approved", "rejected"):
+                raise HTTPException(400, "status must be approved|rejected")
+            sets.append("status=%s"); args.append(body.status)
+            sets.append("decided_at=now()")
+            sets.append("decided_by=%s"); args.append(admin["email"])
+        if body.can_write is not None:
+            sets.append("can_write=%s"); args.append(body.can_write)
+        if sets:
+            sets.append("updated_at=now()")
+            cur.execute(
+                f"UPDATE issue_tc.dashboard_users SET {', '.join(sets)} WHERE feishu_user_id=%s",
+                args + [fid])
+
+        if body.person_set:
+            person = (body.person or "").strip()
+            if person:
+                cur.execute(
+                    """INSERT INTO issue_tc.roster_identity (feishu_user_id, person, email)
+                       VALUES (%s, %s, (SELECT email FROM issue_tc.dashboard_users WHERE feishu_user_id=%s))
+                       ON CONFLICT (feishu_user_id) DO UPDATE
+                         SET person=EXCLUDED.person, updated_at=now()""",
+                    (fid, person, fid))
+            else:
+                cur.execute(
+                    "DELETE FROM issue_tc.roster_identity WHERE feishu_user_id=%s",
+                    (fid,))
+
+        cur.execute(
+            """SELECT d.feishu_user_id, d.name, d.status, d.role, d.can_write, ri.person
+               FROM issue_tc.dashboard_users d
+               LEFT JOIN issue_tc.roster_identity ri ON ri.feishu_user_id=d.feishu_user_id
+               WHERE d.feishu_user_id=%s""", (fid,))
+        r = cur.fetchone()
+    return {"feishu_user_id": r[0], "name": r[1], "status": r[2],
+            "role": r[3], "can_write": bool(r[4]), "person": r[5]}
 
 
 # ---------------------------------------------------------------------------
@@ -1124,7 +1237,7 @@ def _actor_mxid(user: dict[str, Any]) -> str:
 
 @app.post("/api/v1/dashboard/issues/{issue_id}/review")
 async def dash_review(issue_id: str, body: DashReviewBody,
-                      user: dict = Depends(require_roster_member)) -> Any:
+                      user: dict = Depends(require_can_write)) -> Any:
     resp = await _issue_proxy(
         "POST", f"/v1/issues/{issue_id}/review", _actor_mxid(user),
         json_body=body.model_dump(),
@@ -1138,7 +1251,7 @@ class DashMergeBody(BaseModel):
 
 @app.post("/api/v1/dashboard/issues/{issue_id}/merge")
 async def dash_merge(issue_id: str, body: DashMergeBody,
-                     user: dict = Depends(require_roster_member)) -> Any:
+                     user: dict = Depends(require_can_write)) -> Any:
     resp = await _issue_proxy(
         "POST", f"/v1/issues/{issue_id}/merge", _actor_mxid(user),
         json_body=body.model_dump(),
@@ -1153,7 +1266,7 @@ class DashPromoteBody(BaseModel):
 
 @app.post("/api/v1/dashboard/issues/{issue_id}/promote", status_code=201)
 async def dash_promote(issue_id: str, body: DashPromoteBody,
-                       user: dict = Depends(require_roster_member)) -> Any:
+                       user: dict = Depends(require_can_write)) -> Any:
     """Promote an issue to a real ticket. Orchestration lives in the BFF: it
     reads the issue (for conversation_id + title), creates the ticket via
     ticket-api (the sole ticket write path), then links the issue to it via the

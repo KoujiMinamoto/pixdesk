@@ -819,31 +819,120 @@
     renderNav(null);
     $back.hidden = false;
     $back.onclick = () => location.hash = "#/";
-    $title.textContent = "待审批用户";
+    $title.textContent = "成员管理";
     $crumbs.innerHTML = "";
     $crumbs.appendChild(el("a", { onclick: () => location.hash = "#/" }, "全部客户"));
-    $crumbs.appendChild(document.createTextNode(" / 待审批"));
+    $crumbs.appendChild(document.createTextNode(" / 成员管理"));
     $view.innerHTML = "";
     $view.appendChild(el("div", { class: "loading" }, "加载中…"));
-    const data = await api("/api/dashboard/pending");
-    const items = data.items || [];
-    $view.innerHTML = "";
-    if (!items.length) {
-      $view.appendChild(el("div", { class: "empty" }, "暂无待审批申请"));
+    let data;
+    try {
+      data = await api("/api/dashboard/members");
+    } catch (e) {
+      $view.innerHTML = "";
+      $view.appendChild(el("div", { class: "empty" }, String(e.message || e)));
       return;
     }
-    const list = el("div", { class: "issue-list" });
-    for (const u of items) {
-      const row = el("div", { class: "issue-row" },
-        el("div", null,
-          el("div", { class: "title" }, (u.name || "") + " · " + u.email),
-          el("div", { class: "who" }, "申请于 " + (u.requested_at ? fmtDate(u.requested_at) : "—"))),
-        el("div", { class: "actions" },
-          el("button", { onclick: async () => { await decide(u.email, "approve"); } }, "✓ 批准"),
-          el("button", { class: "danger", onclick: async () => { await decide(u.email, "reject"); } }, "✕ 拒绝")));
-      list.appendChild(row);
+    $view.innerHTML = "";
+    const members = data.members || [];
+    const persons = data.roster_persons || [];
+    const meId = data.me;
+
+    const pending = members.filter((m) => m.status === "pending");
+    if (pending.length) {
+      $view.appendChild(el("div", { class: "list-subhead" },
+        "—— 待审批（" + pending.length + "）——"));
+      const plist = el("div", { class: "issue-list" });
+      for (const u of pending) {
+        plist.appendChild(el("div", { class: "issue-row" },
+          el("div", null,
+            el("div", { class: "title" }, (u.name || "") + " · " + u.email),
+            el("div", { class: "who" }, "申请于 " + (u.requested_at ? fmtDate(u.requested_at) : "—"))),
+          el("div", { class: "actions" },
+            el("button", { onclick: async () => { await decide(u.email, "approve"); } }, "✓ 批准"),
+            el("button", { class: "danger", onclick: async () => { await decide(u.email, "reject"); } }, "✕ 拒绝"))));
+      }
+      $view.appendChild(plist);
     }
-    $view.appendChild(list);
+
+    $view.appendChild(el("div", { class: "list-subhead" },
+      "—— 全部成员（" + members.length + "）——"));
+    $view.appendChild(el("div", { class: "member-note" },
+      "角色 admin = 全权限；「可写」= 能确认闭环/非闭环/升级SRE（admin 恒可写）；"
+      + "「排班花名」只决定下班结算归自己名下，与权限无关。停用 = 禁止登录看板。"));
+    const table = el("div", { class: "member-list" });
+    for (const m of members.filter((x) => x.status !== "pending")) {
+      table.appendChild(memberRow(m, persons, meId));
+    }
+    $view.appendChild(table);
+  }
+
+  // One member row with inline permission controls. Each change POSTs
+  // members/update and repaints the row in place from the server's response.
+  function memberRow(m, persons, meId) {
+    const isSelf = m.feishu_user_id === meId;
+    const row = el("div", { class: "member-row" + (m.status === "rejected" ? " off" : "") });
+
+    async function patch(p, label) {
+      row.classList.add("busy");
+      try {
+        const fresh = await api("/api/dashboard/members/update",
+          { method: "POST", json: Object.assign({ feishu_user_id: m.feishu_user_id }, p) });
+        Object.assign(m, fresh);
+        setStatus(label + " ✓", "ok"); setTimeout(() => setStatus(""), 1200);
+        row.replaceWith(memberRow(m, persons, meId));
+      } catch (e) {
+        row.classList.remove("busy");
+        alert("修改失败：" + (e.message || e));
+      }
+    }
+
+    // identity cell
+    row.appendChild(el("div", { class: "m-id" },
+      el("div", { class: "m-name" }, (m.name || "(未命名)") + (isSelf ? "（你自己）" : "")),
+      el("div", { class: "m-email" }, m.email || m.feishu_user_id)));
+
+    // role select
+    const roleSel = el("select", { class: "m-ctl" },
+      el("option", { value: "reviewer", selected: m.role === "reviewer" }, "reviewer"),
+      el("option", { value: "admin", selected: m.role === "admin" }, "admin"));
+    roleSel.disabled = isSelf;
+    roleSel.addEventListener("change", () => patch({ role: roleSel.value }, "角色"));
+    row.appendChild(el("div", { class: "m-cell" },
+      el("span", { class: "m-label" }, "角色"), roleSel));
+
+    // can_write toggle (admin implies writable, so show as locked-on)
+    const cw = el("input", { type: "checkbox" });
+    cw.checked = m.role === "admin" ? true : !!m.can_write;
+    cw.disabled = m.role === "admin";
+    cw.addEventListener("change", () => patch({ can_write: cw.checked }, "可写"));
+    row.appendChild(el("div", { class: "m-cell" },
+      el("span", { class: "m-label" }, "可写"), cw));
+
+    // roster person select ("" = 不参与结算)
+    const pSel = el("select", { class: "m-ctl" },
+      el("option", { value: "", selected: !m.person }, "（无）"));
+    for (const p of persons) {
+      pSel.appendChild(el("option", { value: p, selected: m.person === p }, p));
+    }
+    pSel.addEventListener("change", () =>
+      patch({ person: pSel.value, person_set: true }, "排班花名"));
+    row.appendChild(el("div", { class: "m-cell" },
+      el("span", { class: "m-label" }, "排班花名"), pSel));
+
+    // status: 停用 / 恢复
+    const isOff = m.status === "rejected";
+    const stBtn = el("button", { class: "m-ctl " + (isOff ? "" : "danger"),
+      onclick: () => {
+        if (!confirm((isOff ? "恢复 " : "停用 ") + (m.name || m.email) + "？")) return;
+        patch({ status: isOff ? "approved" : "rejected" }, isOff ? "恢复" : "停用");
+      } }, isOff ? "恢复" : "停用");
+    stBtn.disabled = isSelf;
+    row.appendChild(el("div", { class: "m-cell" },
+      isOff ? el("span", { class: "m-badge off" }, "已停用") : el("span", { class: "m-badge on" }, "正常"),
+      stBtn));
+
+    return row;
   }
 
   async function decide(email, action) {
@@ -1443,7 +1532,7 @@
     bar = el("div", { class: "user-chip", id: "user-chip" },
       el("span", { class: "uname" }, (_me.name || _me.email) + (isAdmin() ? " · 管理员" : "")));
     if (isAdmin()) {
-      bar.appendChild(el("a", { class: "link", onclick: () => location.hash = "#/admin" }, "待审批"));
+      bar.appendChild(el("a", { class: "link", onclick: () => location.hash = "#/admin" }, "成员管理"));
     }
     bar.appendChild(el("a", { class: "link", onclick: async () => {
       await api("/api/dashboard/logout", { method: "POST", json: {} }); boot();
