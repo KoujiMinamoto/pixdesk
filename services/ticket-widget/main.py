@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import time
 import uuid
 from typing import Any, Optional
@@ -1109,11 +1110,16 @@ class DashReviewBody(BaseModel):
 
 def _actor_mxid(user: dict[str, Any]) -> str:
     """Map a Feishu dashboard user to an mxid-shaped actor string the
-    issue-engine accepts (@local:server), so issue_history records who acted.
-    Email local/domain go into the two halves; '@' becomes '=' (allowed by the
-    engine's MXID regex, '@' is not)."""
-    email = (user.get("email") or "unknown").replace("@", "=")
-    return f"@{email}:feishu"
+    issue-engine accepts (@local:server, local part matches [A-Za-z0-9._=/+-]+),
+    so issue_history records who acted.
+
+    Prefer feishu_user_id (ou_… — already regex-safe). Fall back to email, but
+    SANITIZE it: real roster users have email = "feishu:ou_…" (set at login
+    upsert), whose colon would break the MXID regex — any char outside the
+    allowed local-part set (incl. ':' and '@') is replaced with '='."""
+    local = user.get("feishu_user_id") or user.get("email") or "unknown"
+    local = re.sub(r"[^A-Za-z0-9._=/+-]", "=", local)
+    return f"@{local}:feishu"
 
 
 @app.post("/api/v1/dashboard/issues/{issue_id}/review")

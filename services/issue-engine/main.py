@@ -336,7 +336,7 @@ def unclosed() -> Any:
                  AND ch.workspace_id = i.customer_workspace_id
                  AND ch.channel_id = i.customer_channel_id
                 WHERE i.nonclosure_reason IS NOT NULL
-                  AND i.review_state = 'unreviewed'
+                  AND i.review_state <> 'rejected'
                   AND i.lifecycle_state NOT IN ('closed_confirmed','dismissed')
                   AND {TIME_FLOOR_ALIAS}
                 ORDER BY i.last_activity_at ASC
@@ -406,16 +406,15 @@ def rollup(
                            AND i2.review_state <> 'rejected') AS products,
                        count(*) FILTER (WHERE i.nonclosure_reason IS NOT NULL
                                           AND i.lifecycle_state NOT IN ('closed_confirmed','dismissed','closed_inferred')
-                                          AND i.review_state = 'unreviewed') AS unclosed,
+                                          AND i.review_state <> 'rejected') AS unclosed,
                        count(*) FILTER (WHERE i.lifecycle_state = 'closed_inferred'
-                                          AND i.review_state = 'unreviewed') AS suggested_closed,
-                       count(*) FILTER (WHERE i.lifecycle_state IN ('closed_confirmed','closed_inferred')
-                                         OR i.review_state = 'confirmed') AS closed,
+                                          AND i.review_state <> 'rejected') AS suggested_closed,
+                       count(*) FILTER (WHERE i.lifecycle_state IN ('closed_confirmed','closed_inferred')) AS closed,
                        count(*) FILTER (WHERE i.lifecycle_state NOT IN ('dismissed')
                                           AND NOT (i.review_state='rejected')) AS total,
                        min(i.last_activity_at) FILTER (WHERE i.nonclosure_reason IS NOT NULL
                                           AND i.lifecycle_state NOT IN ('closed_confirmed','dismissed','closed_inferred')
-                                          AND i.review_state = 'unreviewed') AS oldest_unclosed_at,
+                                          AND i.review_state <> 'rejected') AS oldest_unclosed_at,
                        max(i.last_activity_at) AS most_recent_at
                 FROM {SCHEMA}.issues i
                 LEFT JOIN agent.channels ch
@@ -437,12 +436,21 @@ def rollup(
 
 
 _PERIOD_PRESETS = {
-    "today":      ("date_trunc('day', now())", "now()"),
-    "yesterday":  ("date_trunc('day', now()) - interval '1 day'", "date_trunc('day', now())"),
-    "this_week":  ("date_trunc('week', now())", "now()"),
-    "last_week":  ("date_trunc('week', now()) - interval '7 days'", "date_trunc('week', now())"),
-    "this_month": ("date_trunc('month', now())", "now()"),
-    "last_month": ("date_trunc('month', now()) - interval '1 month'", "date_trunc('month', now())"),
+    # Boundaries are computed on the Asia/Shanghai WALL CLOCK, not the DB
+    # timezone (the live DB runs UTC — plain date_trunc('day', now()) would
+    # start "today" at 08:00 Beijing time, dropping the whole overnight shift).
+    # Pattern: shift now() into local wall time, truncate (and do any interval
+    # arithmetic THERE — subtracting after converting back would be fine for
+    # fixed-length days but not for months), then shift back to timestamptz.
+    "today":      ("(date_trunc('day', now() AT TIME ZONE 'Asia/Shanghai')) AT TIME ZONE 'Asia/Shanghai'", "now()"),
+    "yesterday":  ("(date_trunc('day', now() AT TIME ZONE 'Asia/Shanghai') - interval '1 day') AT TIME ZONE 'Asia/Shanghai'",
+                   "(date_trunc('day', now() AT TIME ZONE 'Asia/Shanghai')) AT TIME ZONE 'Asia/Shanghai'"),
+    "this_week":  ("(date_trunc('week', now() AT TIME ZONE 'Asia/Shanghai')) AT TIME ZONE 'Asia/Shanghai'", "now()"),
+    "last_week":  ("(date_trunc('week', now() AT TIME ZONE 'Asia/Shanghai') - interval '7 days') AT TIME ZONE 'Asia/Shanghai'",
+                   "(date_trunc('week', now() AT TIME ZONE 'Asia/Shanghai')) AT TIME ZONE 'Asia/Shanghai'"),
+    "this_month": ("(date_trunc('month', now() AT TIME ZONE 'Asia/Shanghai')) AT TIME ZONE 'Asia/Shanghai'", "now()"),
+    "last_month": ("(date_trunc('month', now() AT TIME ZONE 'Asia/Shanghai') - interval '1 month') AT TIME ZONE 'Asia/Shanghai'",
+                   "(date_trunc('month', now() AT TIME ZONE 'Asia/Shanghai')) AT TIME ZONE 'Asia/Shanghai'"),
 }
 
 
@@ -521,7 +529,7 @@ def dash_summary(
                   (SELECT count(*) FROM {SCHEMA}.issues a
                      WHERE a.nonclosure_reason IS NOT NULL
                        AND a.lifecycle_state NOT IN ('closed_confirmed','dismissed','closed_inferred')
-                       AND a.review_state = 'unreviewed'
+                       AND a.review_state <> 'rejected'
                        AND {TIME_FLOOR_ALIAS_A}) AS awaiting_us
                 FROM {SCHEMA}.issues
                 WHERE {floor_bare}
@@ -613,7 +621,7 @@ def dash_shift_workload(
                 WHERE i.lifecycle_state <> 'dismissed' AND i.review_state <> 'rejected'
                 GROUP BY a.person
                 """,
-                params + params,
+                params,
             )
             rows = _rows(cur)
             cur.execute(f"SELECT {win_start_sql} AS ws, {win_end_sql} AS we", params)
@@ -698,7 +706,7 @@ def dash_shift_workload_issues(
                   {bucket_sql}
                 ORDER BY i.last_activity_at DESC NULLS LAST
                 """,
-                params + [person] + params,
+                params + [person],
             )
             items = _rows(cur)
     return {"person": person, "period": period, "bucket": bucket,
@@ -952,7 +960,6 @@ def dash_customer_issues(
     args = [platform, workspace_id, channel_id]
     if not include_closed:
         where.append("i.lifecycle_state NOT IN ('closed_confirmed','closed_inferred')")
-        where.append("i.review_state <> 'confirmed'")
     sql = f"""
         SELECT i.id, i.code, i.title, (i.metadata->>'summary') AS summary,
                (i.metadata->>'summary_zh') AS summary_zh,
@@ -1274,7 +1281,7 @@ def merge_issue(issue_id: str, body: MergeBody, actor: str = Depends(require_act
                 )
                 cur.execute(
                     f"""UPDATE {SCHEMA}.issues
-                       SET review_state='merged', lifecycle_state='dismissedf',
+                       SET review_state='merged', lifecycle_state='dismissed',
                            merged_into_issue_id=%s, nonclosure_reason=NULL,
                            reviewed_by_mxid=%s, reviewed_at=now(), closed_at=now()
                        WHERE id=%s""",
