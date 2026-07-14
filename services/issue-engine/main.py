@@ -240,6 +240,19 @@ def _alert_loop() -> None:
         try:
             conn = psycopg2.connect(config.DATABASE_URL)
             conn.autocommit = False
+            # LLM-verify a few just-active issues BEFORE alerting, so a card
+            # fires on the closure agent's judgment, not detector's mechanical
+            # "last speaker = customer". fetch_pending skips already-judged ones,
+            # so cost is bounded and quiet ticks are near-free.
+            if config.ALERT_LLM_VERIFY:
+                try:
+                    pend = closure_agent.fetch_pending(conn, config.ALERT_VERIFY_CAP)
+                    if pend:
+                        closure_agent.run_batch(conn, pend)
+                        log.info("alert-verify: closure-judged %d issue(s)", len(pend))
+                except Exception:
+                    conn.rollback()
+                    log.exception("alert closure-verify failed")
             try:
                 res = alerts.run(conn)
                 if res.get("sent") or res.get("bootstrap"):

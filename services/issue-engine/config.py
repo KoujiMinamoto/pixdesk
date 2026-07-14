@@ -165,6 +165,14 @@ ALERT_INTERVAL_SECONDS = int(os.environ.get("ISSUE_ALERT_INTERVAL_SECONDS", "300
 # lands inside the window; wider = tolerates an engine restart around handoff).
 ALERT_HANDOFF_WINDOW_MINUTES = int(
     os.environ.get("ISSUE_ALERT_HANDOFF_WINDOW_MINUTES", "30"))
+# Before each alert pass, re-run the closure agent (LLM) on a few just-active,
+# not-yet-audited issues, so alerts fire on LLM-verified state instead of the
+# detector's mechanical "last speaker = customer → unanswered". This is what
+# demotes e.g. a customer's "thanks" after we said we're on it from a false
+# SLA breach. Off → alerts use whatever state is already stored.
+ALERT_LLM_VERIFY = os.environ.get(
+    "ISSUE_ALERT_LLM_VERIFY", "1").strip().lower() in ("1", "true", "yes", "on")
+ALERT_VERIFY_CAP = int(os.environ.get("ISSUE_ALERT_VERIFY_CAP", "5"))
 # Feishu app creds — the engine has none of its own, so accept either the shared
 # ISSUE_-prefixed names or the plain FEISHU_ ones the collector/widget already use.
 FEISHU_APP_ID = (os.environ.get("ISSUE_FEISHU_APP_ID")
