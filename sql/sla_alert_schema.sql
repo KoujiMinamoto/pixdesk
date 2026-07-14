@@ -1,7 +1,7 @@
 -- Proactive-alert dedup log. One row per (issue, alert_type); sent_at is the
 -- last time we pushed this alert, so the cooldown check is now()-sent_at.
 CREATE TABLE IF NOT EXISTS issue_tc.sla_alert_log (
-    issue_id     text NOT NULL,
+    issue_id     uuid NOT NULL,               -- matches issue_tc.issues.id (uuid)
     alert_type   text NOT NULL,              -- 'sla' | 'handoff' (future)
     sent_at      timestamptz NOT NULL DEFAULT now(),
     on_duty      text,                        -- roster person at send time

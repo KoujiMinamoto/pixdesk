@@ -265,7 +265,7 @@ def _record(conn, rows: list[dict], person: Optional[str]) -> None:
             cur.execute(
                 f"""INSERT INTO {SCHEMA}.sla_alert_log
                         (issue_id, alert_type, sent_at, on_duty, wait_minutes)
-                    VALUES (%s, 'sla', now(), %s, %s)
+                    VALUES (%s::uuid, 'sla', now(), %s, %s)
                     ON CONFLICT (issue_id, alert_type)
                     DO UPDATE SET sent_at = now(), on_duty = EXCLUDED.on_duty,
                                   wait_minutes = EXCLUDED.wait_minutes""",
@@ -303,17 +303,23 @@ def run(conn) -> dict:
         return {"bootstrap": True, "eligible": len(rows),
                 "summarized": len(rows) if ok else 0, "on_duty": person}
 
-    # Realtime: only issues past the cooldown (or never alerted), capped.
+    # Realtime: a card fires for an issue that has NEVER been alerted (a newly
+    # breaching problem). An already-alerted issue is only RE-pushed if the
+    # customer has spoken again since our last alert (they're still waiting) AND
+    # the cooldown has passed — so silenced backlog the customer hasn't chased
+    # never gets re-@'d, but a live "还在等" thread isn't dropped. Capped per tick.
     cutoff_secs = config.ALERT_COOLDOWN_HOURS * 3600
+    now_ts = time.time()
     due = []
     for r in rows:
         last = r.get("last_alert_at")
         if last is None:
             due.append(r)
-        else:
-            age = time.time() - last.timestamp()
-            if age >= cutoff_secs:
-                due.append(r)
+            continue
+        lca = r.get("last_customer_at")
+        if (lca and lca.timestamp() > last.timestamp()
+                and (now_ts - last.timestamp()) >= cutoff_secs):
+            due.append(r)
     due = due[: config.ALERT_MAX_PER_TICK]
     sent = []
     for r in due:
