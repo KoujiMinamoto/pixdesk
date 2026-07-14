@@ -142,3 +142,26 @@ INTERNAL_CONTEXT = os.environ.get(
 # group can't blow up the prompt. Oldest-trimmed, newest kept.
 INTERNAL_CONTEXT_MAX_CHARS = int(
     os.environ.get("ISSUE_INTERNAL_CONTEXT_MAX_CHARS", "6000"))
+
+# --- Proactive SLA alerts (Feishu) -----------------------------------------
+# A background loop pushes an interactive card into the ops group and @-mentions
+# whoever is on duty (agent.shift_roster) when a customer's issue has waited on
+# us longer than ALERT_SLA_MINUTES and is still open. Deduped via
+# issue_tc.sla_alert_log with an ALERT_COOLDOWN_HOURS window; capped at
+# ALERT_MAX_PER_TICK cards per pass so a big backlog can't flood the group. On
+# the very first run (empty log) we send ONE summary card and silence the
+# existing backlog instead of firing a card per item. Off by default (needs
+# Feishu creds) so nothing pushes until explicitly enabled in prod.
+ALERT_ENABLED = os.environ.get(
+    "ISSUE_ALERT_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
+ALERT_CHAT_ID = os.environ.get("ISSUE_ALERT_CHAT_ID", "").strip()
+ALERT_SLA_MINUTES = int(os.environ.get("ISSUE_ALERT_SLA_MINUTES", "30"))
+ALERT_COOLDOWN_HOURS = float(os.environ.get("ISSUE_ALERT_COOLDOWN_HOURS", "4"))
+ALERT_MAX_PER_TICK = int(os.environ.get("ISSUE_ALERT_MAX_PER_TICK", "5"))
+ALERT_INTERVAL_SECONDS = int(os.environ.get("ISSUE_ALERT_INTERVAL_SECONDS", "300"))
+# Feishu app creds — the engine has none of its own, so accept either the shared
+# ISSUE_-prefixed names or the plain FEISHU_ ones the collector/widget already use.
+FEISHU_APP_ID = (os.environ.get("ISSUE_FEISHU_APP_ID")
+                 or os.environ.get("FEISHU_APP_ID", "")).strip()
+FEISHU_APP_SECRET = (os.environ.get("ISSUE_FEISHU_APP_SECRET")
+                     or os.environ.get("FEISHU_APP_SECRET", "")).strip()

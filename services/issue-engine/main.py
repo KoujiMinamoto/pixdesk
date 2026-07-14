@@ -33,6 +33,7 @@ import detector
 import distill
 import cluster_merge
 import closure_agent
+import alerts
 
 # Dashboard read endpoints filter by last_activity_at >= TIME_FLOOR. Built once
 # so every endpoint shares the same predicate. Two flavors because some queries
@@ -226,11 +227,42 @@ def _distill_loop() -> None:
         _stop.wait(interval)
 
 
+def _alert_loop() -> None:
+    """Proactive SLA-alert pass on its own connection + cadence. Opens a fresh
+    connection each tick (like _distill_loop) so a stuck alert send can't hold a
+    pooled read connection. No-op unless ISSUE_ALERT_ENABLED and a chat id are
+    set, so it's safe to always launch."""
+    if not config.ALERT_ENABLED:
+        log.info("alert loop disabled (ISSUE_ALERT_ENABLED unset)")
+        return
+    interval = config.ALERT_INTERVAL_SECONDS
+    while not _stop.is_set():
+        try:
+            conn = psycopg2.connect(config.DATABASE_URL)
+            conn.autocommit = False
+            try:
+                res = alerts.run(conn)
+                if res.get("sent") or res.get("bootstrap"):
+                    log.info("alert pass: %s", res)
+            except Exception:
+                conn.rollback()
+                log.exception("alert pass failed")
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        except Exception:
+            log.exception("alert loop connect failed")
+        _stop.wait(interval)
+
+
 @app.on_event("startup")
 def _startup() -> None:
     _get_pool()  # warm the read pool
     threading.Thread(target=_detector_loop, name="detector", daemon=True).start()
     threading.Thread(target=_distill_loop, name="distill", daemon=True).start()
+    threading.Thread(target=_alert_loop, name="alerts", daemon=True).start()
     log.info("issue-engine started")
 
 
