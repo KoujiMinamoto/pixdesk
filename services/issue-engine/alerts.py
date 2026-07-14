@@ -116,11 +116,14 @@ def _mention(person: Optional[str], open_id: Optional[str]) -> str:
 
 # --- eligible issues -------------------------------------------------------
 
-def _eligible(conn) -> list[dict]:
+def _eligible(conn, min_wait_minutes: Optional[int] = None) -> list[dict]:
     """Open issues where the ball is in our court (nonclosure_reason=
-    'unanswered_customer') and the customer has waited > SLA. Newest-waiting
-    first is least urgent, so order by last_customer_at ASC (stalest first).
-    Carries the last alert time so run() can apply the cooldown."""
+    'unanswered_customer') and the customer has waited > min_wait_minutes.
+    Defaults to the SLA threshold; the handoff digest passes 0 to include every
+    open unanswered issue regardless of wait. Stalest-first (last_customer_at
+    ASC). Carries the last alert time so run() can apply the cooldown."""
+    if min_wait_minutes is None:
+        min_wait_minutes = config.ALERT_SLA_MINUTES
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
             f"""
@@ -152,7 +155,7 @@ def _eligible(conn) -> list[dict]:
               AND i.last_customer_at <= now() - (%s * interval '1 minute')
             ORDER BY i.last_customer_at ASC
             """,
-            (config.ALERT_SLA_MINUTES,),
+            (min_wait_minutes,),
         )
         return [dict(r) for r in cur.fetchall()]
 
@@ -229,29 +232,51 @@ def _single_card(row: dict, person, open_id) -> dict:
 _SUMMARY_SHOW_MAX = 20
 
 
-def _summary_card(rows: list[dict], person, open_id) -> dict:
-    """Digest card for the bootstrap/backlog. Shows the stalest _SUMMARY_SHOW_MAX
-    (rows are already stalest-first) and notes the remainder — the whole backlog
-    is silenced by the caller regardless of what's shown."""
+def _digest_card(rows: list[dict], person, open_id, *, title: str, intro: str,
+                 template: str, rest_note: str) -> dict:
+    """Shared multi-item card (bootstrap backlog + shift handoff). Shows the
+    stalest _SUMMARY_SHOW_MAX (rows already stalest-first) and notes the
+    remainder. Empty rows → a clean ✅ line so a handoff still confirms 'nothing
+    pending' rather than sending a blank card."""
     shown = rows[:_SUMMARY_SHOW_MAX]
-    body = ("\n\n").join(_item_line(r) for r in shown)
+    body = ("\n\n").join(_item_line(r) for r in shown) if shown \
+        else "✅ 当前没有等待我方回复的未闭环客户。"
     elements = [
         {"tag": "div", "text": {"tag": "lark_md",
-                                "content": f"{_mention(person, open_id)} 以下客户仍在等待我方回复："}},
+                                "content": f"{_mention(person, open_id)} {intro}"}},
         {"tag": "hr"},
         {"tag": "div", "text": {"tag": "lark_md", "content": body}},
     ]
     if len(rows) > len(shown):
-        rest = len(rows) - len(shown)
         elements.append({"tag": "div", "text": {"tag": "lark_md",
-            "content": f"…以及其余 {rest} 条（已记录，稍后按实时单条逐个跟进）"}})
+            "content": rest_note.format(rest=len(rows) - len(shown))}})
     return {
         "config": {"wide_screen_mode": True},
-        "header": {"template": "red",
-                   "title": {"tag": "plain_text",
-                             "content": f"📋 待回复客户汇总 · 共 {len(rows)} 条"}},
+        "header": {"template": template,
+                   "title": {"tag": "plain_text", "content": title}},
         "elements": elements,
     }
+
+
+def _summary_card(rows: list[dict], person, open_id) -> dict:
+    """Bootstrap/backlog digest — the whole backlog is silenced by the caller."""
+    return _digest_card(
+        rows, person, open_id,
+        title=f"📋 待回复客户汇总 · 共 {len(rows)} 条",
+        intro="以下客户仍在等待我方回复：",
+        template="red",
+        rest_note="…以及其余 {rest} 条（已记录，稍后按实时单条逐个跟进）")
+
+
+def _handoff_card(rows: list[dict], person, open_id, shift_name: str) -> dict:
+    """Shift-handoff digest — @the person who just came on duty."""
+    tail = f" · {shift_name}" if shift_name else ""
+    return _digest_card(
+        rows, person, open_id,
+        title=f"🔄 接班简报{tail} · 共 {len(rows)} 条待跟进",
+        intro="你已接班，以下客户仍未闭环、等待我方跟进：",
+        template="blue",
+        rest_note="…以及其余 {rest} 条（完整清单见看板 · 班次复盘）")
 
 
 # --- log -------------------------------------------------------------------
@@ -328,3 +353,62 @@ def run(conn) -> dict:
     _record(conn, sent, person)
     return {"eligible": len(rows), "due": len(due), "sent": len(sent),
             "on_duty": person}
+
+
+# --- shift handoff ---------------------------------------------------------
+
+def _handoff_due(conn) -> Optional[dict]:
+    """The shift that just started (now within ALERT_HANDOFF_WINDOW_MINUTES of
+    its start_ts) and hasn't had a handoff digest sent yet, or None. Joins the
+    incoming person's Feishu open_id so run_handoff can @ them."""
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """SELECT r.start_ts, r.end_ts, r.person, r.shift_name,
+                      ri.feishu_user_id
+                 FROM agent.shift_roster r
+                 LEFT JOIN issue_tc.roster_identity ri ON ri.person = r.person
+                 LEFT JOIN issue_tc.handoff_log h
+                        ON h.shift_start = r.start_ts AND h.person = r.person
+                WHERE now() >= r.start_ts
+                  AND now() < r.start_ts + (%s * interval '1 minute')
+                  AND h.shift_start IS NULL
+                ORDER BY r.start_ts DESC LIMIT 1""",
+            (config.ALERT_HANDOFF_WINDOW_MINUTES,),
+        )
+        row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def _record_handoff(conn, shift_start, person: str, count: int) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """INSERT INTO issue_tc.handoff_log
+                   (shift_start, person, sent_at, issue_count)
+               VALUES (%s, %s, now(), %s)
+               ON CONFLICT (shift_start, person)
+               DO UPDATE SET sent_at = now(), issue_count = EXCLUDED.issue_count""",
+            (shift_start, person, count),
+        )
+    conn.commit()
+
+
+def run_handoff(conn) -> dict:
+    """Once per shift, near its start, @-mention the incoming person with every
+    still-open unanswered issue they're inheriting (no SLA threshold — full
+    handover). Deduped via handoff_log so a shift gets exactly one digest."""
+    if not config.ALERT_ENABLED or not config.ALERT_CHAT_ID:
+        return {"skipped": "disabled"}
+    due = _handoff_due(conn)
+    if not due:
+        return {"handoff": 0}
+    person = due["person"]
+    oid = due.get("feishu_user_id")
+    shift = due.get("shift_name") or ""
+    rows = _eligible(conn, min_wait_minutes=0)
+    ok = _send_card(config.ALERT_CHAT_ID,
+                    _handoff_card(rows, person, oid, shift))
+    if ok:
+        # Record even on an empty backlog, so we don't re-check this shift.
+        _record_handoff(conn, due["start_ts"], person, len(rows))
+    return {"handoff": 1, "person": person, "shift": shift,
+            "issues": len(rows), "sent": ok}

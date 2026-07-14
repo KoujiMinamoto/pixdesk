@@ -159,6 +159,12 @@ ALERT_SLA_MINUTES = int(os.environ.get("ISSUE_ALERT_SLA_MINUTES", "30"))
 ALERT_COOLDOWN_HOURS = float(os.environ.get("ISSUE_ALERT_COOLDOWN_HOURS", "4"))
 ALERT_MAX_PER_TICK = int(os.environ.get("ISSUE_ALERT_MAX_PER_TICK", "5"))
 ALERT_INTERVAL_SECONDS = int(os.environ.get("ISSUE_ALERT_INTERVAL_SECONDS", "300"))
+# Shift-handoff digest: when someone comes on duty, @-mention them with the list
+# of still-open customers they're inheriting. Fired once per shift, within this
+# many minutes of the shift's start (must exceed ALERT_INTERVAL_SECONDS so a tick
+# lands inside the window; wider = tolerates an engine restart around handoff).
+ALERT_HANDOFF_WINDOW_MINUTES = int(
+    os.environ.get("ISSUE_ALERT_HANDOFF_WINDOW_MINUTES", "30"))
 # Feishu app creds — the engine has none of its own, so accept either the shared
 # ISSUE_-prefixed names or the plain FEISHU_ ones the collector/widget already use.
 FEISHU_APP_ID = (os.environ.get("ISSUE_FEISHU_APP_ID")

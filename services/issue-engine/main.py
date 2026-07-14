@@ -247,6 +247,13 @@ def _alert_loop() -> None:
             except Exception:
                 conn.rollback()
                 log.exception("alert pass failed")
+            try:
+                ho = alerts.run_handoff(conn)
+                if ho.get("handoff"):
+                    log.info("handoff pass: %s", ho)
+            except Exception:
+                conn.rollback()
+                log.exception("handoff pass failed")
             finally:
                 try:
                     conn.close()
