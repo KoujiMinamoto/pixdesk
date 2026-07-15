@@ -1078,6 +1078,48 @@ def dash_customer_issues(
             "channel": dict(chrow) if chrow else None}
 
 
+@app.get("/v1/dashboard/stale-pending", dependencies=[Depends(require_secret)])
+def dash_stale_pending(days: Optional[int] = Query(None)) -> Any:
+    """The >N-day backlog (default ALERT_MAX_WAIT_DAYS): open issues where the
+    ball is in our court (nonclosure_reason='unanswered_customer') and the
+    customer has been waiting longer than N days. These are exactly the issues
+    the realtime SLA loop stops @-ing once past the cap (③a) — this list is their
+    home, where a human reviews and manually 审批关闭 (or reopens to follow up).
+    Cross-customer, stalest-first; rows carry the customer keys so the UI can
+    jump to a customer and open the issue detail."""
+    cutoff = days if (days and days > 0) else config.ALERT_MAX_WAIT_DAYS
+    with _PooledConn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                f"""
+                SELECT i.id, i.code, i.title,
+                       (i.metadata->>'summary_zh')     AS summary_zh,
+                       (i.metadata->>'summary')        AS summary,
+                       (i.metadata->>'next_action_zh') AS next_action_zh,
+                       i.lifecycle_state, i.review_state, i.nonclosure_reason,
+                       i.last_speaker, i.last_customer_at, i.last_activity_at,
+                       i.message_count, i.external_party_name,
+                       i.customer_platform, i.customer_workspace_id, i.customer_channel_id,
+                       EXTRACT(EPOCH FROM (now() - i.last_customer_at)) / 86400.0 AS wait_days,
+                       (SELECT ch.channel_name FROM agent.channels ch
+                          WHERE ch.platform = i.customer_platform
+                            AND ch.workspace_id = i.customer_workspace_id
+                            AND ch.channel_id = i.customer_channel_id LIMIT 1) AS channel_name
+                FROM {SCHEMA}.issues i
+                WHERE i.nonclosure_reason = 'unanswered_customer'
+                  AND i.review_state <> 'rejected'
+                  AND i.lifecycle_state NOT IN ('closed_confirmed','closed_inferred','dismissed')
+                  AND {TIME_FLOOR_ALIAS}
+                  AND i.last_customer_at IS NOT NULL
+                  AND i.last_customer_at < now() - (%s * interval '1 day')
+                ORDER BY i.last_customer_at ASC
+                """,
+                (cutoff,),
+            )
+            items = _rows(cur)
+    return {"items": items, "count": len(items), "cutoff_days": cutoff}
+
+
 @app.get("/v1/dashboard/issues/{issue_id}/transcript", dependencies=[Depends(require_secret)])
 def dash_issue_transcript(issue_id: str) -> Any:
     """Full chat transcript for ONE issue: every agent.messages row pinned to

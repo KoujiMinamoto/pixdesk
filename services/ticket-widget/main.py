@@ -1142,6 +1142,15 @@ async def dash_shift_workload(request: Request, user: dict = Depends(require_das
     return _passthrough(resp)
 
 
+@app.get("/api/v1/dashboard/stale-pending")
+async def dash_stale_pending(request: Request, user: dict = Depends(require_dash_approved)) -> Any:
+    """The >N-day (default 7) unanswered backlog — issues past the realtime-alert
+    cap (③a), listed for manual 审批关闭 review."""
+    params = dict(request.query_params)
+    resp = await _issue_proxy("GET", "/v1/dashboard/stale-pending", "@anon:dashboard", params=params)
+    return _passthrough(resp)
+
+
 @app.get("/api/v1/dashboard/shift-workload/issues")
 async def dash_shift_workload_issues(request: Request, user: dict = Depends(require_dash_approved)) -> Any:
     """Drilldown: issues a person handled in the window (?person=&period=&bucket=)."""

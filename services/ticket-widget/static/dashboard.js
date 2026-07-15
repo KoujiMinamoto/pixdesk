@@ -29,6 +29,7 @@
   // jumps but null hides it entirely).
   const NAV_TABS = [
     { key: "overview", label: "总览", hash: "#/" },
+    { key: "stale", label: "超7天待审批", hash: "#/stale" },
     { key: "shift", label: "班次复盘", hash: "#/shift" },
     { key: "tickets", label: "Ticket 记录", hash: "#/tickets" },
   ];
@@ -1271,6 +1272,89 @@
     }
   }
 
+  // -------------------------------------------------------------------------
+  // 超7天待审批: the >N-day unanswered backlog (past ③a's realtime-alert cap).
+  // A reviewer 审批关闭 inline, or opens the detail to follow up / reopen.
+  // -------------------------------------------------------------------------
+  async function renderStalePending() {
+    $strip.style.display = "none";
+    renderNav("stale");
+    $back.hidden = true;
+    $crumbs.innerHTML = "";
+    $title.textContent = "超7天待审批";
+    $view.innerHTML = "";
+    $view.appendChild(el("div", { class: "loading" }, "加载中…"));
+    let data;
+    try {
+      data = await api("/api/v1/dashboard/stale-pending");
+    } catch (e) {
+      $view.innerHTML = "";
+      $view.appendChild(el("div", { class: "empty" }, String(e.message || e)));
+      return;
+    }
+    const items = data.items || [];
+    const cutoff = data.cutoff_days || 7;
+    $view.innerHTML = "";
+    const wrap = el("div", { class: "detail" });
+    wrap.appendChild(el("h2", null, "超7天待审批"));
+    wrap.appendChild(el("div", { class: "summary-block" },
+      "客户已等待超过 " + cutoff + " 天、球在我方且未闭环的问题——已从实时告警移出。"
+      + "请人工复核后「审批关闭」，或点进详情跟进/重开。共 " + items.length + " 条。"));
+    if (!items.length) {
+      wrap.appendChild(el("div", { class: "empty" }, "✅ 没有超期待审批的问题。"));
+      $view.appendChild(wrap);
+      return;
+    }
+    const list = el("div", { class: "issue-list" });
+    for (const it of items) list.appendChild(staleRow(it));
+    wrap.appendChild(list);
+    $view.appendChild(wrap);
+  }
+
+  function staleRow(it) {
+    const summary = it.summary_zh || it.summary || "";
+    const waitDays = Math.floor(it.wait_days || 0);
+    const custChip = el("span", { class: "cust-chip",
+      onclick: (e) => { e.stopPropagation();
+        location.hash = "#/customers/" + customerKey(it); } },
+      customerLabel(it));
+    const row = el("div", { class: "issue-row stale-item", id: "stale-" + it.id,
+      onclick: () => location.hash = "#/issues/" + it.id },
+      el("span", { class: "pill " + it.lifecycle_state },
+        STATE_LABEL[it.lifecycle_state] || it.lifecycle_state),
+      el("div", null,
+        el("div", { class: "cust-line" }, custChip,
+          it.code ? el("span", { class: "ticket-code" }, it.code) : null),
+        el("div", { class: "title" }, it.title || "(无标题)"),
+        summary ? el("div", { class: "summary" }, summary) : null,
+        el("div", { class: "who" },
+          (it.message_count || 0) + " 条消息"
+          + (it.external_party_name ? " · " + it.external_party_name : ""))),
+      el("div", { class: "when danger" }, "等待 " + waitDays + " 天"));
+    if (canWrite()) {
+      row.appendChild(el("div", { class: "settle-acts" },
+        el("button", { class: "sbtn green",
+          onclick: (e) => { e.stopPropagation(); staleClose(it); } }, "✓ 审批关闭")));
+    }
+    return row;
+  }
+
+  async function staleClose(it) {
+    if (!confirm("确认「审批关闭」" + (it.code || "") + "「" + (it.title || "") + "」？")) return;
+    const row = document.getElementById("stale-" + it.id);
+    if (row) row.classList.add("busy");
+    try {
+      await api("/api/v1/dashboard/issues/" + it.id + "/review",
+        { method: "POST", json: { action: "close", note: "超7天人工审批关闭" } });
+    } catch (e) {
+      if (row) row.classList.remove("busy");
+      alert("操作失败：" + (e.message || e));
+      return;
+    }
+    if (row) row.remove();   // closed → drops out of the >7d pending list
+    setStatus("已审批关闭 · " + (it.code || it.id), "ok");
+  }
+
   async function renderShift() {
     $strip.style.display = "none";
     renderNav("shift");
@@ -1470,6 +1554,8 @@
     try {
       if (hash === "#/" || hash === "#") {
         await renderRoot();
+      } else if (hash === "#/stale") {
+        await renderStalePending();
       } else if (hash === "#/shift") {
         await renderShift();
       } else if (hash === "#/tickets") {
