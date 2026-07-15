@@ -159,6 +159,12 @@ ALERT_SLA_MINUTES = int(os.environ.get("ISSUE_ALERT_SLA_MINUTES", "30"))
 ALERT_COOLDOWN_HOURS = float(os.environ.get("ISSUE_ALERT_COOLDOWN_HOURS", "4"))
 ALERT_MAX_PER_TICK = int(os.environ.get("ISSUE_ALERT_MAX_PER_TICK", "5"))
 ALERT_INTERVAL_SECONDS = int(os.environ.get("ISSUE_ALERT_INTERVAL_SECONDS", "300"))
+# Realtime SLA alerts stop re-@-ing an issue once the customer has been waiting
+# longer than ALERT_MAX_WAIT_DAYS. Past that an issue is stale enough that a
+# daily ping doesn't help — it should go through dashboard manual review/close
+# instead of nagging on-duty. The shift-handoff digest ignores this cap (a full
+# handover still lists everything). 0/negative disables the cap.
+ALERT_MAX_WAIT_DAYS = int(os.environ.get("ISSUE_ALERT_MAX_WAIT_DAYS", "7"))
 # Shift-handoff digest: when someone comes on duty, @-mention them with the list
 # of still-open customers they're inheriting. Fired once per shift, within this
 # many minutes of the shift's start (must exceed ALERT_INTERVAL_SECONDS so a tick

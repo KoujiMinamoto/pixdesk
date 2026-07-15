@@ -116,14 +116,24 @@ def _mention(person: Optional[str], open_id: Optional[str]) -> str:
 
 # --- eligible issues -------------------------------------------------------
 
-def _eligible(conn, min_wait_minutes: Optional[int] = None) -> list[dict]:
+def _eligible(conn, min_wait_minutes: Optional[int] = None,
+              max_wait_days: Optional[int] = None) -> list[dict]:
     """Open issues where the ball is in our court (nonclosure_reason=
     'unanswered_customer') and the customer has waited > min_wait_minutes.
     Defaults to the SLA threshold; the handoff digest passes 0 to include every
-    open unanswered issue regardless of wait. Stalest-first (last_customer_at
-    ASC). Carries the last alert time so run() can apply the cooldown."""
+    open unanswered issue regardless of wait. When max_wait_days is set (> 0),
+    issues the customer has been waiting on for longer than that are excluded —
+    realtime SLA alerts stop nagging on stale issues (they belong in dashboard
+    manual review); the handoff digest passes None so a handover still lists
+    them. Stalest-first (last_customer_at ASC). Carries the last alert time so
+    run() can apply the cooldown."""
     if min_wait_minutes is None:
         min_wait_minutes = config.ALERT_SLA_MINUTES
+    params: list[Any] = [min_wait_minutes]
+    max_clause = ""
+    if max_wait_days and max_wait_days > 0:
+        max_clause = "AND i.last_customer_at >= now() - (%s * interval '1 day')"
+        params.append(max_wait_days)
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
             f"""
@@ -153,9 +163,10 @@ def _eligible(conn, min_wait_minutes: Optional[int] = None) -> list[dict]:
               AND {TIME_FLOOR_ALIAS}
               AND i.last_customer_at IS NOT NULL
               AND i.last_customer_at <= now() - (%s * interval '1 minute')
+              {max_clause}
             ORDER BY i.last_customer_at ASC
             """,
-            (min_wait_minutes,),
+            params,
         )
         return [dict(r) for r in cur.fetchall()]
 
@@ -315,7 +326,7 @@ def run(conn) -> dict:
         return {"skipped": "no_chat_id"}
 
     person, open_id = _on_duty(conn)
-    rows = _eligible(conn)
+    rows = _eligible(conn, max_wait_days=config.ALERT_MAX_WAIT_DAYS)
     if not rows:
         return {"eligible": 0, "sent": 0}
 

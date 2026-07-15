@@ -148,7 +148,25 @@
     unanswered_customer: "客户未获回复", idle_open: "长期无进展",
     awaiting_customer_stale: "等客户太久", reopened: "已重开",
   };
+  // issue_history.field → human label for the timeline (the human-review events;
+  // detector/distill fields fall through to the raw name).
+  const FIELD_LABEL = {
+    closure_confirmed: "确认闭环", review_confirmed: "确认为真问题",
+    reopened_by_review: "重新打开", escalated_sre: "升级 SRE", dismissed: "忽略",
+  };
   const PLATFORM_LABEL = { discord: "Discord", slack: "Slack", gmail: "Gmail" };
+
+  // Resolve an actor mxid to a 花名 using the server-provided map. Human reviewers
+  // are matrix mxids '@<open_id>:feishu'; system writers are '@issue-engine:<host>'.
+  // Falls back to the bare open_id for an unmapped reviewer, "系统" for the engine.
+  function actorLabel(mxid, names) {
+    if (!mxid) return "系统";
+    if (names && names[mxid]) return names[mxid];
+    const m = /^@(.*):feishu$/.exec(mxid);
+    if (m) return m[1];
+    if (/^@issue-engine:/.test(mxid)) return "系统";
+    return mxid;
+  }
 
   // Home-page filter state + the last rollup payload, so chip clicks re-render
   // the grid without re-fetching.
@@ -614,7 +632,8 @@
         el("div", { class: "who" },
           (it.message_count || 0) + " 条消息" +
           (it.external_party_name ? " · " + it.external_party_name : "") +
-          (it.last_speaker ? " · 最后 " + (it.last_speaker === "customer" ? "客户" : "我方") : "")
+          (it.last_speaker ? " · 最后 " + (it.last_speaker === "customer" ? "客户" : "我方") : "") +
+          (it.closed_by_name ? " · ✅ " + it.closed_by_name : "")
         )),
       el("div", { class: "when" + (isStale ? " danger" : "") }, ageVal),
       it.nonclosure_reason
@@ -643,6 +662,7 @@
     const it = data.issue || {};
     const turns = data.transcript || [];
     const hist = data.history || [];
+    const names = data.actor_names || {};
 
     const channelKey = customerKey({
       customer_platform: it.customer_platform,
@@ -679,6 +699,17 @@
             "↗ 打开对话")
         : null);
     detail.appendChild(meta);
+
+    // 谁点了闭环: authoritative source is the latest closure_confirmed history
+    // event (issues.reviewed_by_mxid can be overwritten by later system actions).
+    // hist is ts-DESC, so find() returns the most recent closure.
+    const closureEvt = it.lifecycle_state === "closed_confirmed"
+      ? hist.find((h) => h.field === "closure_confirmed") : null;
+    if (closureEvt) {
+      detail.appendChild(el("div", { class: "closed-by" },
+        "✅ 闭环人：" + actorLabel(closureEvt.actor_mxid, names)
+          + (closureEvt.ts ? " · " + fmtDate(closureEvt.ts) : "")));
+    }
 
     const prods = (it.metadata && it.metadata.products) || [];
     if (Array.isArray(prods) && prods.length) {
@@ -786,7 +817,8 @@
         el("strong", null, "时间线 (" + hist.length + " 条)")));
       for (const h of hist) {
         ul.appendChild(el("li", null,
-          fmtAge(h.ts) + " · " + h.field + " · " + (h.actor_mxid || "")));
+          fmtAge(h.ts) + " · " + (FIELD_LABEL[h.field] || h.field)
+            + " · " + actorLabel(h.actor_mxid, names)));
       }
       detail.appendChild(ul);
     }

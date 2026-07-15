@@ -328,6 +328,29 @@ def _rows(cur) -> list[dict[str, Any]]:
     return out
 
 
+def _actor_names(cur, mxids) -> dict[str, str]:
+    """Map human actor mxids of the form 'feishu:<open_id>' to their duty-roster
+    花名 via issue_tc.roster_identity, so the dashboard can show WHO reviewed/
+    closed an issue instead of a raw open_id. Non-feishu or unmapped actors
+    (system writes, reviewers with no roster row) are omitted — the caller falls
+    back to the raw id. cur must be a RealDictCursor."""
+    by_oid: dict[str, str] = {}
+    for m in {x for x in mxids if x}:
+        # Dashboard reviewers are matrix mxids '@<open_id>:feishu' (open_id = ou_…);
+        # system writers are '@issue-engine:<host>'. Only the former map to a 花名.
+        if m.startswith("@") and m.endswith(":feishu"):
+            by_oid[m[1:].rsplit(":", 1)[0]] = m
+    if not by_oid:
+        return {}
+    cur.execute(
+        "SELECT feishu_user_id, person FROM issue_tc.roster_identity "
+        "WHERE feishu_user_id = ANY(%s)",
+        (list(by_oid.keys()),),
+    )
+    return {by_oid[r["feishu_user_id"]]: r["person"]
+            for r in cur.fetchall() if r.get("person")}
+
+
 @app.get("/v1/issues", dependencies=[Depends(require_secret)])
 def list_issues(
     nonclosure_only: bool = Query(False),
@@ -1018,8 +1041,14 @@ def dash_customer_issues(
                i.lifecycle_state, i.review_state, i.nonclosure_reason,
                i.closure_reason, i.last_speaker, i.last_customer_at, i.last_agent_at,
                i.message_count, i.opened_at, i.last_activity_at, i.sla_due_at,
-               i.external_party_name, i.detector, (i.metadata->'products') AS products
+               i.external_party_name, i.detector, (i.metadata->'products') AS products,
+               cc.actor_mxid AS closed_by_mxid, cc.ts AS closed_at
         FROM {SCHEMA}.issues i
+        LEFT JOIN LATERAL (
+          SELECT actor_mxid, ts FROM {SCHEMA}.issue_history
+          WHERE issue_id = i.id AND field = 'closure_confirmed'
+          ORDER BY ts DESC LIMIT 1
+        ) cc ON true
         WHERE {' AND '.join(where)}
         ORDER BY
           CASE i.lifecycle_state
@@ -1035,6 +1064,9 @@ def dash_customer_issues(
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(sql, args)
             items = _rows(cur)
+            names = _actor_names(cur, [it.get("closed_by_mxid") for it in items])
+            for it in items:
+                it["closed_by_name"] = names.get(it.get("closed_by_mxid"))
             cur.execute(
                 """SELECT platform, workspace_id, channel_id, channel_name
                    FROM agent.channels
@@ -1079,12 +1111,13 @@ def dash_issue_transcript(issue_id: str) -> Any:
                 (issue_id,),
             )
             history = _rows(cur)
+            names = _actor_names(cur, [h.get("actor_mxid") for h in history])
     # Deep link into the customer's original Slack/Discord conversation, anchored
     # to the issue's opening message. Transcript rows carry is_segment_start +
     # message_id, so reuse them as the message list.
     issue["chat_deeplink"] = _chat_deeplink(transcript, issue)
     return {"issue": issue, "transcript": transcript, "history": history,
-            "transcript_count": len(transcript)}
+            "actor_names": names, "transcript_count": len(transcript)}
 
 
 def _chat_deeplink(messages: list[dict], issue: dict) -> Optional[str]:
