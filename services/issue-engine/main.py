@@ -637,6 +637,17 @@ def dash_summary(
     return out
 
 
+# A closure_confirmed whose latest confirming actor is a HUMAN Feishu account
+# ('@ou_…:feishu') with no duty-roster identity — i.e. an admin (辉二) doing
+# cleanup, not support closing their own issue. NULL-safe: no closure event or a
+# system actor ('@issue-engine:*') coalesces to false (counts as confirmed).
+# Requires the query to join `cc` (latest closure_confirmed actor) and `ri`
+# (roster_identity on that actor).
+_ADMIN_CLOSED = (
+    "COALESCE(cc.actor_mxid ~ '^@ou_.*:feishu$' AND ri.person IS NULL, false)"
+)
+
+
 @app.get("/v1/dashboard/shift-workload", dependencies=[Depends(require_secret)])
 def dash_shift_workload(
     period: str = Query("this_week"),
@@ -654,9 +665,16 @@ def dash_shift_workload(
     and the CURRENT status breakdown of *those handled issues* (this is the part
     that makes a 闭环率 meaningful — it's their issues, not whatever closed on the
     clock):
-      confirmed — now closed_confirmed (人工已确认闭环)
-      inferred  — now closed_inferred (疑似闭环，存疑待确认)
-      open_n    — still open (awaiting/active/…)
+      confirmed    — now closed_confirmed, confirmed by support (roster) or system
+      admin_closed — closed_confirmed, but the confirming click came from a human
+                     OUTSIDE the duty roster (辉二/admins doing cleanup, e.g. the
+                     超7天 approve-queue). Deliberately NOT in close_rate's
+                     numerator and still in the denominator, so an admin's click
+                     never moves anyone's 闭环率 in either direction.
+      inferred     — now closed_inferred (疑似闭环，存疑待确认)
+      open_n       — still open (awaiting/active/…)
+    The closer is the actor of the issue's latest closure_confirmed history
+    event ('@<open_id>:feishu'); no event / a system actor counts as confirmed.
     A cross-shift issue counts for every person who replied in it. Sorted by
     handled_issues desc."""
     win_start_sql, win_end_sql, params = _resolve_period(period, start, end)
@@ -685,7 +703,11 @@ def dash_shift_workload(
                        count(DISTINCT a.issue_id) AS handled_issues,
                        COALESCE(sum(a.msgs), 0) AS agent_msgs,
                        count(DISTINCT a.issue_id)
-                         FILTER (WHERE i.lifecycle_state = 'closed_confirmed') AS confirmed,
+                         FILTER (WHERE i.lifecycle_state = 'closed_confirmed'
+                                   AND NOT {_ADMIN_CLOSED}) AS confirmed,
+                       count(DISTINCT a.issue_id)
+                         FILTER (WHERE i.lifecycle_state = 'closed_confirmed'
+                                   AND {_ADMIN_CLOSED}) AS admin_closed,
                        count(DISTINCT a.issue_id)
                          FILTER (WHERE i.lifecycle_state = 'closed_inferred') AS inferred,
                        count(DISTINCT a.issue_id)
@@ -693,6 +715,13 @@ def dash_shift_workload(
                                  ('closed_confirmed','closed_inferred','dismissed')) AS open_n
                 FROM attributed a
                 JOIN {SCHEMA}.issues i ON i.id = a.issue_id
+                LEFT JOIN LATERAL (
+                  SELECT h.actor_mxid FROM {SCHEMA}.issue_history h
+                  WHERE h.issue_id = i.id AND h.field = 'closure_confirmed'
+                  ORDER BY h.ts DESC LIMIT 1
+                ) cc ON true
+                LEFT JOIN {SCHEMA}.roster_identity ri
+                  ON cc.actor_mxid = '@' || ri.feishu_user_id || ':feishu'
                 WHERE i.lifecycle_state <> 'dismissed' AND i.review_state <> 'rejected'
                 GROUP BY a.person
                 """,
@@ -713,6 +742,8 @@ def dash_shift_workload(
         # because nobody clicks 确认闭环 yet — excluding it would read as 0% and
         # understate the work. `confirmed` is surfaced separately so a reviewer
         # still sees how many are human-verified vs awaiting confirmation.
+        # admin_closed (辉二等非排班人员点的闭环) is deliberately outside the
+        # numerator but inside handled — an admin click never moves the rate.
         done = (r.get("confirmed") or 0) + (r.get("inferred") or 0)
         r["close_rate"] = round(done / h, 3) if h else 0.0
     rows.sort(key=lambda r: (r["handled_issues"], r["agent_msgs"]), reverse=True)
@@ -731,16 +762,18 @@ def dash_shift_workload_issues(
     period: str = Query("this_week"),
     start: Optional[str] = Query(None),
     end: Optional[str] = Query(None),
-    bucket: str = Query("all"),  # all | confirmed | inferred | open
+    bucket: str = Query("all"),  # all | confirmed | admin_closed | inferred | open
 ) -> Any:
     """Drilldown: the issues `person` handled in the window (one row per issue),
-    optionally filtered to a status bucket (confirmed/inferred/open). Same roster
-    attribution as the summary; rows carry current state + zh summary + the
-    person's reply count on that issue, so the UI can list them and link to the
-    issue detail."""
+    optionally filtered to a status bucket (confirmed/admin_closed/inferred/
+    open — same definitions as the summary, so cell counts match list lengths).
+    Same roster attribution as the summary; rows carry current state + zh
+    summary + the person's reply count on that issue, so the UI can list them
+    and link to the issue detail."""
     win_start_sql, win_end_sql, params = _resolve_period(period, start, end)
     bucket_sql = {
-        "confirmed": "AND i.lifecycle_state = 'closed_confirmed'",
+        "confirmed": f"AND i.lifecycle_state = 'closed_confirmed' AND NOT {_ADMIN_CLOSED}",
+        "admin_closed": f"AND i.lifecycle_state = 'closed_confirmed' AND {_ADMIN_CLOSED}",
         "inferred":  "AND i.lifecycle_state = 'closed_inferred'",
         "open":      "AND i.lifecycle_state NOT IN ('closed_confirmed','closed_inferred','dismissed')",
         "all":       "",
@@ -777,6 +810,13 @@ def dash_shift_workload_issues(
                             AND ch.channel_id=i.customer_channel_id LIMIT 1) AS channel_name
                 FROM attributed a
                 JOIN {SCHEMA}.issues i ON i.id = a.issue_id
+                LEFT JOIN LATERAL (
+                  SELECT h.actor_mxid FROM {SCHEMA}.issue_history h
+                  WHERE h.issue_id = i.id AND h.field = 'closure_confirmed'
+                  ORDER BY h.ts DESC LIMIT 1
+                ) cc ON true
+                LEFT JOIN {SCHEMA}.roster_identity ri
+                  ON cc.actor_mxid = '@' || ri.feishu_user_id || ':feishu'
                 WHERE i.lifecycle_state <> 'dismissed' AND i.review_state <> 'rejected'
                   {bucket_sql}
                 ORDER BY i.last_activity_at DESC NULLS LAST

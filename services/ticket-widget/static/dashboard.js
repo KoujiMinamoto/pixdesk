@@ -1042,6 +1042,7 @@
       el("span", { class: "wl-name" }, "同事"),
       el("span", { class: "wl-n" }, "经手"),
       el("span", { class: "wl-n" }, "已闭环"),
+      el("span", { class: "wl-n" }, "管理员关"),
       el("span", { class: "wl-n" }, "待确认"),
       el("span", { class: "wl-n" }, "进行中"),
       el("span", { class: "wl-n" }, "回复"),
@@ -1056,6 +1057,7 @@
         el("span", { class: "wl-name" }, p.person),
         statCell(p, "all", p.handled_issues, "strong"),
         statCell(p, "confirmed", p.confirmed, "green"),
+        statCell(p, "admin_closed", p.admin_closed, "muted"),
         statCell(p, "inferred", p.inferred, "amber"),
         statCell(p, "open", p.open_n, "red"),
         el("span", { class: "wl-n muted" }, String(p.agent_msgs || 0)),
@@ -1066,7 +1068,8 @@
     body.appendChild(tbl);
     body.appendChild(el("div", { class: "wl-note" },
       "归属依据排班表（support 为共用账号，按值班时间推断经手人）。"
-      + "经手=该时段有我方回复的不同问题数；已闭环=人工已确认；待确认=系统判定的疑似闭环、"
+      + "经手=该时段有我方回复的不同问题数；已闭环=support/系统确认；管理员关="
+      + "排班外管理员（如辉二）代为关闭、不计入闭环率；待确认=系统判定的疑似闭环、"
       + "需人工确认；进行中=仍未闭环；闭环率=(已闭环+待确认)/经手。点数字看明细。"));
   }
 
@@ -1076,6 +1079,7 @@
   }
 
   const BUCKET_LABEL = { all: "全部经手", confirmed: "已闭环",
+    admin_closed: "管理员关闭（不计闭环率）",
     inferred: "待确认（疑似闭环）", open: "进行中" };
 
   // Toggle an inline list of the issues `person` handled in `bucket`, under
