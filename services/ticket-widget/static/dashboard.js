@@ -696,8 +696,10 @@
       it.chat_deeplink
         ? el("a", { class: "meta-item chat-link", href: it.chat_deeplink,
                     target: "_blank", rel: "noopener",
-                    title: "在 " + (it.customer_platform === "discord" ? "Discord" : "Slack") + " 中打开原始对话" },
-            "↗ 打开对话")
+                    title: "在 " + (it.customer_platform === "discord" ? "Discord" : "Slack") + " 中打开原始对话"
+                      + (it.channel_name ? "：#" + it.channel_name : "")
+                      + "（若提示无权限，需先加入该频道）" },
+            "↗ 打开对话" + (it.channel_name ? " · #" + it.channel_name : ""))
         : null);
     detail.appendChild(meta);
 

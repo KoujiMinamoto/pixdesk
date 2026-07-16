@@ -1133,6 +1133,15 @@ def dash_issue_transcript(issue_id: str) -> Any:
                 raise HTTPException(404, "issue not found")
             issue = issue_rows[0]
             cur.execute(
+                """SELECT channel_name FROM agent.channels
+                   WHERE platform = %s AND workspace_id = %s AND channel_id = %s
+                   LIMIT 1""",
+                (issue.get("customer_platform"), issue.get("customer_workspace_id"),
+                 issue.get("customer_channel_id")),
+            )
+            chrow = cur.fetchone()
+            issue["channel_name"] = chrow["channel_name"] if chrow else None
+            cur.execute(
                 f"""SELECT im.role, im.signal_kind, im.is_segment_start,
                           am.platform, am.workspace_id, am.channel_id, am.message_id,
                           am.thread_id, am.sender_id, am.sender_name, am.text, am.ts
@@ -1168,6 +1177,9 @@ def _chat_deeplink(messages: list[dict], issue: dict) -> Optional[str]:
 
     Slack: message_id IS the ts (verified), e.g. "1713787797.071579" →
       https://app.slack.com/client/<team>/<channel>/thread/<channel>-<ts>
+      The /thread/ path only resolves when <ts> is a thread ROOT; a reply's ts
+      shows "Couldn't load thread" (火娃's ISS-91294 report), so anchor at the
+      message's thread_id (root) when it has one.
     Discord: message_id IS the native message id; DMs/group-DMs use @me →
       https://discord.com/channels/@me/<channel>/<message>
 
@@ -1186,8 +1198,9 @@ def _chat_deeplink(messages: list[dict], issue: dict) -> Optional[str]:
         if not ws:
             return None
         if msg_id:
+            root = (opening or {}).get("thread_id") or msg_id
             return (f"https://app.slack.com/client/{ws}/{chan}"
-                    f"/thread/{chan}-{msg_id}")
+                    f"/thread/{chan}-{root}")
         return f"https://app.slack.com/client/{ws}/{chan}"
     if plat == "discord":
         # bridge workspace_id is "direct:<n>" (not a guild) → DM/group-DM uses @me.
@@ -1207,9 +1220,16 @@ def issue_detail(issue_id: str) -> Any:
                 raise HTTPException(404, "issue not found")
             item = rows[0]
             cur.execute(
-                f"""SELECT platform, workspace_id, channel_id, message_id, role,
-                          signal_kind, is_segment_start, ts
-                   FROM {SCHEMA}.issue_messages WHERE issue_id = %s ORDER BY ts ASC""",
+                f"""SELECT im.platform, im.workspace_id, im.channel_id,
+                          im.message_id, im.role, im.signal_kind,
+                          im.is_segment_start, im.ts, am.thread_id
+                   FROM {SCHEMA}.issue_messages im
+                   LEFT JOIN agent.messages am
+                     ON am.platform = im.platform
+                    AND am.workspace_id = im.workspace_id
+                    AND am.channel_id = im.channel_id
+                    AND am.message_id = im.message_id
+                   WHERE im.issue_id = %s ORDER BY im.ts ASC""",
                 (issue_id,),
             )
             item["messages"] = _rows(cur)
