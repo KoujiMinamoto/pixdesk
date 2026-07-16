@@ -1120,6 +1120,105 @@ def dash_stale_pending(days: Optional[int] = Query(None)) -> Any:
     return {"items": items, "count": len(items), "cutoff_days": cutoff}
 
 
+# Drill-down WHERE/ORDER per hero-strip card. Each WHERE mirrors the matching
+# FILTER in dash_summary verbatim, so the list length equals the card's number.
+_METRIC_ISSUES = {
+    "new_issues": (
+        "i.opened_at >= (SELECT win_start FROM bounds)"
+        " AND i.opened_at < (SELECT win_end FROM bounds)"
+        " AND i.lifecycle_state <> 'dismissed' AND i.review_state <> 'rejected'",
+        "i.opened_at DESC",
+    ),
+    "active_issues": (
+        "i.last_activity_at >= (SELECT win_start FROM bounds)"
+        " AND i.last_activity_at < (SELECT win_end FROM bounds)"
+        " AND i.lifecycle_state NOT IN ('closed_confirmed','closed_inferred','dismissed')"
+        " AND i.review_state <> 'rejected'",
+        "i.last_activity_at DESC",
+    ),
+    "new_closed": (
+        "i.lifecycle_state IN ('closed_inferred','closed_confirmed')"
+        " AND COALESCE(i.closure_detected_at, i.closed_at, i.last_activity_at)"
+        "     >= (SELECT win_start FROM bounds)"
+        " AND COALESCE(i.closure_detected_at, i.closed_at, i.last_activity_at)"
+        "     < (SELECT win_end FROM bounds)",
+        "COALESCE(i.closure_detected_at, i.closed_at, i.last_activity_at) DESC",
+    ),
+    "awaiting_us": (
+        "i.nonclosure_reason IS NOT NULL"
+        " AND i.lifecycle_state NOT IN ('closed_confirmed','dismissed','closed_inferred')"
+        " AND i.review_state <> 'rejected'",
+        "i.last_customer_at ASC NULLS LAST",
+    ),
+}
+
+
+@app.get("/v1/dashboard/metric-issues", dependencies=[Depends(require_secret)])
+def dash_metric_issues(
+    metric: str = Query(...),
+    period: str = Query("this_week"),
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+) -> Any:
+    """The issue list behind one hero-strip card, so the numbers are clickable.
+    Window metrics (new_issues / active_issues / new_closed) take the same
+    period params as /summary; awaiting_us is the live backlog (window ignored,
+    same pinned TIME_FLOOR as the card). Cross-customer; rows carry customer
+    keys + channel_name so the UI can chip-jump."""
+    if metric not in _METRIC_ISSUES:
+        raise HTTPException(400, f"unknown metric: {metric}")
+    where, order = _METRIC_ISSUES[metric]
+    win_start_sql, win_end_sql, params = _resolve_period(period, start, end)
+    if metric == "awaiting_us":
+        floor = TIME_FLOOR_ALIAS
+    else:
+        # Same widened floor as dash_summary: past windows (e.g. 上月) reach
+        # below the global TIME_FLOOR without affecting current presets.
+        floor = (
+            f"i.last_activity_at >= LEAST((SELECT win_start FROM bounds),"
+            f" '{TIME_FLOOR}'::timestamptz)"
+            if TIME_FLOOR else "TRUE"
+        )
+    with _PooledConn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                f"""
+                WITH bounds AS (
+                  SELECT {win_start_sql} AS win_start, {win_end_sql} AS win_end
+                )
+                SELECT i.id, i.code, i.title,
+                       (i.metadata->>'summary_zh') AS summary_zh,
+                       (i.metadata->>'summary')    AS summary,
+                       i.lifecycle_state, i.review_state, i.nonclosure_reason,
+                       i.last_speaker, i.message_count, i.opened_at,
+                       i.last_activity_at, i.last_customer_at, i.external_party_name,
+                       i.customer_platform, i.customer_workspace_id, i.customer_channel_id,
+                       (i.metadata->'products') AS products,
+                       cc.actor_mxid AS closed_by_mxid, cc.ts AS closed_at,
+                       (SELECT ch.channel_name FROM agent.channels ch
+                          WHERE ch.platform = i.customer_platform
+                            AND ch.workspace_id = i.customer_workspace_id
+                            AND ch.channel_id = i.customer_channel_id LIMIT 1) AS channel_name
+                FROM {SCHEMA}.issues i
+                LEFT JOIN LATERAL (
+                  SELECT actor_mxid, ts FROM {SCHEMA}.issue_history
+                  WHERE issue_id = i.id AND field = 'closure_confirmed'
+                  ORDER BY ts DESC LIMIT 1
+                ) cc ON true
+                WHERE {floor}
+                  AND {where}
+                ORDER BY {order}
+                LIMIT 300
+                """,
+                params,
+            )
+            items = _rows(cur)
+            names = _actor_names(cur, [it.get("closed_by_mxid") for it in items])
+            for it in items:
+                it["closed_by_name"] = names.get(it.get("closed_by_mxid"))
+    return {"items": items, "count": len(items), "metric": metric}
+
+
 @app.get("/v1/dashboard/issues/{issue_id}/transcript", dependencies=[Depends(require_secret)])
 def dash_issue_transcript(issue_id: str) -> Any:
     """Full chat transcript for ONE issue: every agent.messages row pinned to

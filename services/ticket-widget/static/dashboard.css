@@ -136,6 +136,10 @@ input:focus, select:focus, textarea:focus {
 .summary-card.red .value { color: var(--red); }
 .summary-card.amber .value { color: var(--amber); }
 .summary-card.green .value { color: var(--green); }
+.summary-card.clickable { cursor: pointer;
+  transition: box-shadow .12s ease, transform .12s ease, border-color .12s ease; }
+.summary-card.clickable:hover { box-shadow: var(--shadow-2, 0 4px 12px rgba(0,0,0,.08));
+  transform: translateY(-1px); border-color: var(--ink-3); }
 
 /* -------- filter bars / chips -------- */
 .filter-bar { display: flex; flex-direction: column; gap: 8px; margin: 2px 0 16px; }

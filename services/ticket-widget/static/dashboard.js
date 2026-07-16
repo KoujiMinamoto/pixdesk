@@ -34,7 +34,9 @@
     { key: "tickets", label: "Ticket 记录", hash: "#/tickets" },
   ];
   function renderNav(active) {
-    if (!active) { $nav.hidden = true; $nav.innerHTML = ""; return; }
+    // Tabs stay visible on every view (detail pages pass active=null — no tab
+    // highlighted, but you can still jump anywhere); only the login gate hides
+    // them via gateScreen.
     $nav.hidden = false;
     $nav.innerHTML = "";
     for (const t of NAV_TABS) {
@@ -243,13 +245,16 @@
   // just the strip without rebuilding the whole root view.
   function renderStrip(summary) {
     const px = periodPrefix();
+    const drill = (key) => () => location.hash = "#/metric/" + key;
     $strip.innerHTML = "";
+    // 活跃客户 has no drill-down — the customer grid below IS its list; 新增对话
+    // counts conversations, which have no issue-list equivalent.
     $strip.appendChild(card(px + "活跃客户", summary.active_customers || 0, ""));
-    $strip.appendChild(card(px + "新增问题", summary.new_issues || 0, ""));
-    $strip.appendChild(card(px + "活跃问题", summary.active_issues || 0, ""));
+    $strip.appendChild(card(px + "新增问题", summary.new_issues || 0, "", null, drill("new_issues")));
+    $strip.appendChild(card(px + "活跃问题", summary.active_issues || 0, "", null, drill("active_issues")));
     $strip.appendChild(card(px + "新增对话", summary.new_conversations || 0, ""));
-    $strip.appendChild(card(px + "新闭环", summary.new_closed || 0, "green"));
-    $strip.appendChild(card("待我方回复", summary.awaiting_us || 0, "red", "实时"));
+    $strip.appendChild(card(px + "新闭环", summary.new_closed || 0, "green", null, drill("new_closed")));
+    $strip.appendChild(card("待我方回复", summary.awaiting_us || 0, "red", "实时", drill("awaiting_us")));
   }
 
   // Re-fetch the summary AND customer rollup for the current overview window and
@@ -488,8 +493,11 @@
     }
   }
 
-  function card(label, value, kind, sub) {
-    return el("div", { class: "summary-card " + (kind || "") },
+  function card(label, value, kind, sub, onClick) {
+    return el("div", {
+      class: "summary-card " + (kind || "") + (onClick ? " clickable" : ""),
+      title: onClick ? "点击查看列表" : null,
+      onclick: onClick || null },
       el("div", { class: "label" }, label),
       el("div", { class: "value" }, String(value)),
       sub ? el("div", { class: "sub" }, sub) : null);
@@ -567,7 +575,7 @@
     $view.innerHTML = "";
     $view.appendChild(el("div", { class: "loading" }, "加载中…"));
     $back.hidden = false;
-    $back.onclick = () => location.hash = "#/";
+    $back.onclick = () => goBack("#/");
 
     const params = new URLSearchParams({
       platform, workspace_id, channel_id,
@@ -654,10 +662,8 @@
     $view.appendChild(el("div", { class: "loading" }, "加载中…"));
     $back.hidden = false;
     // Provisional: until we know the parent channel, fall back to home. Replaced
-    // below once the issue's channel is known. (history.back() is unreliable —
-    // direct loads / re-renders leave nothing to go back to, so the button
-    // appeared dead.)
-    $back.onclick = () => location.hash = "#/";
+    // below once the issue's channel is known.
+    $back.onclick = () => goBack("#/");
 
     const data = await api("/api/v1/dashboard/issues/" + encodeURIComponent(issueId) + "/transcript");
     const it = data.issue || {};
@@ -670,8 +676,9 @@
       customer_workspace_id: it.customer_workspace_id,
       customer_channel_id: it.customer_channel_id,
     });
-    // Back → the customer's issue list this issue belongs to.
-    $back.onclick = () => location.hash = "#/customers/" + channelKey;
+    // Back → wherever you came from (stale queue, shift page, metric list…);
+    // direct loads fall back to the customer's issue list.
+    $back.onclick = () => goBack("#/customers/" + channelKey);
 
     $title.textContent = it.title || "(无标题)";
     $crumbs.innerHTML = "";
@@ -853,7 +860,7 @@
     $strip.style.display = "none";
     renderNav(null);
     $back.hidden = false;
-    $back.onclick = () => location.hash = "#/";
+    $back.onclick = () => goBack("#/");
     $title.textContent = "成员管理";
     $crumbs.innerHTML = "";
     $crumbs.appendChild(el("a", { onclick: () => location.hash = "#/" }, "全部客户"));
@@ -1275,6 +1282,60 @@
   }
 
   // -------------------------------------------------------------------------
+  // Metric drill-down: the issue list behind one hero-strip card. Window
+  // metrics follow the overview period selection; awaiting_us is live.
+  // -------------------------------------------------------------------------
+  const METRIC_LABEL = {
+    new_issues: "新增问题", active_issues: "活跃问题",
+    new_closed: "新闭环", awaiting_us: "待我方回复",
+  };
+
+  async function renderMetricIssues(key) {
+    const label = METRIC_LABEL[key];
+    if (!label) { location.hash = "#/"; return; }
+    $strip.style.display = "none";
+    renderNav("overview");
+    $back.hidden = false;
+    $back.onclick = () => goBack("#/");
+    const px = key === "awaiting_us" ? "实时 · " : periodPrefix() + " · ";
+    $title.textContent = px + label;
+    $crumbs.innerHTML = "";
+    $crumbs.appendChild(el("a", { onclick: () => location.hash = "#/" }, "全部客户"));
+    $crumbs.appendChild(document.createTextNode(" / " + px + label));
+    $view.innerHTML = "";
+    $view.appendChild(el("div", { class: "loading" }, "加载中…"));
+
+    const qs = new URLSearchParams(summaryQuery().slice(1));
+    qs.set("metric", key);
+    let data;
+    try {
+      data = await api("/api/v1/dashboard/metric-issues?" + qs);
+    } catch (e) {
+      $view.innerHTML = "";
+      $view.appendChild(el("div", { class: "empty" }, String(e.message || e)));
+      return;
+    }
+    const items = data.items || [];
+    $view.innerHTML = "";
+    const wrap = el("div", { class: "detail" });
+    wrap.appendChild(el("div", { class: "list-subhead" },
+      "共 " + items.length + " 条" +
+      (key === "awaiting_us"
+        ? "（实时口径，与总览卡片一致）"
+        : "（" + periodPrefix() + "口径，与总览卡片一致）") +
+      (items.length >= 300 ? "，仅显示前 300 条" : "")));
+    if (!items.length) {
+      wrap.appendChild(el("div", { class: "empty" }, "该时段没有对应的问题。"));
+      $view.appendChild(wrap);
+      return;
+    }
+    const list = el("div", { class: "issue-list" });
+    for (const it of items) list.appendChild(issueRow(it, { showCustomer: true }));
+    wrap.appendChild(list);
+    $view.appendChild(wrap);
+  }
+
+  // -------------------------------------------------------------------------
   // 超7天待审批: the >N-day unanswered backlog (past ③a's realtime-alert cap).
   // A reviewer 审批关闭 inline, or opens the detail to follow up / reopen.
   // -------------------------------------------------------------------------
@@ -1301,7 +1362,9 @@
     wrap.appendChild(el("h2", null, "超7天待审批"));
     wrap.appendChild(el("div", { class: "summary-block" },
       "客户已等待超过 " + cutoff + " 天、球在我方且未闭环的问题——已从实时告警移出。"
-      + "请人工复核后「审批关闭」，或点进详情跟进/重开。共 " + items.length + " 条。"));
+      + "请人工复核后「审批关闭」，或点进详情跟进/重开。共 ",
+      el("span", { id: "stale-count" }, String(items.length)),
+      " 条。"));
     if (!items.length) {
       wrap.appendChild(el("div", { class: "empty" }, "✅ 没有超期待审批的问题。"));
       $view.appendChild(wrap);
@@ -1354,6 +1417,8 @@
       return;
     }
     if (row) row.remove();   // closed → drops out of the >7d pending list
+    const cnt = document.getElementById("stale-count");
+    if (cnt) cnt.textContent = String(Math.max(0, (+cnt.textContent || 1) - 1));
     setStatus("已审批关闭 · " + (it.code || it.id), "ok");
   }
 
@@ -1361,8 +1426,8 @@
     $strip.style.display = "none";
     renderNav("shift");
     $view.innerHTML = "";
-    $back.hidden = false;
-    $back.onclick = () => location.hash = "#/";
+    // Top-level tab like 超7天/Ticket记录 — the nav is the way around, no ←.
+    $back.hidden = true;
     $title.textContent = "班次复盘";
     $crumbs.innerHTML = "";
     $crumbs.appendChild(el("a", { onclick: () => location.hash = "#/" }, "全部客户"));
@@ -1556,6 +1621,8 @@
     try {
       if (hash === "#/" || hash === "#") {
         await renderRoot();
+      } else if (hash.startsWith("#/metric/")) {
+        await renderMetricIssues(hash.slice("#/metric/".length));
       } else if (hash === "#/stale") {
         await renderStalePending();
       } else if (hash === "#/shift") {
@@ -1577,7 +1644,26 @@
     }
   }
 
-  window.addEventListener("hashchange", route);
+  // In-app navigation stack so ← returns to where you actually came from (the
+  // stale queue, shift page, a metric list…), not a hardcoded parent. Detects
+  // "back" (browser button or ours) as a transition to the previous stack entry
+  // and pops; anything else pushes. goBack() uses real history.back() when we
+  // have somewhere to go, so browser-back and the ← button stay consistent;
+  // direct loads (empty stack) fall back to the view's hierarchical parent.
+  const navStack = [location.hash || "#/"];
+  function goBack(fallback) {
+    if (navStack.length >= 2) history.back();
+    else location.hash = fallback || "#/";
+  }
+  window.addEventListener("hashchange", () => {
+    const h = location.hash || "#/";
+    if (navStack.length >= 2 && navStack[navStack.length - 2] === h) {
+      navStack.pop();
+    } else if (navStack[navStack.length - 1] !== h) {
+      navStack.push(h);
+    }
+    route();
+  });
 
   // -------------------------------------------------------------------------
   // Feishu login / approval gate — runs before the dashboard renders.
@@ -1593,7 +1679,8 @@
     $strip.style.display = "none";
     $sources.hidden = true;
     $periodBar.hidden = true;
-    renderNav(null);
+    $nav.hidden = true;
+    $nav.innerHTML = "";
     $crumbs.innerHTML = "";
     $back.hidden = true;
     $view.innerHTML = "";
