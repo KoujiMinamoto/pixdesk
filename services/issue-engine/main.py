@@ -351,6 +351,23 @@ def _actor_names(cur, mxids) -> dict[str, str]:
             for r in cur.fetchall() if r.get("person")}
 
 
+def _account_tier(cur, platform, workspace_id, channel_id) -> Optional[dict]:
+    """Key-account (重点客户) tier for ONE customer channel → {'tier','key_sales'}
+    or None. Highest level wins when a channel maps to several accounts."""
+    if not (platform and channel_id):
+        return None
+    cur.execute(
+        f"""SELECT ka.level AS tier, ka.sales_name AS key_sales
+            FROM {SCHEMA}.key_account_channels kac
+            JOIN {SCHEMA}.key_accounts ka ON ka.uuid = kac.uuid
+            WHERE kac.platform = %s AND kac.workspace_id = %s AND kac.channel_id = %s
+            ORDER BY ka.level DESC LIMIT 1""",
+        (platform, workspace_id or "", channel_id),
+    )
+    r = cur.fetchone()
+    return dict(r) if r else None
+
+
 @app.get("/v1/issues", dependencies=[Depends(require_secret)])
 def list_issues(
     nonclosure_only: bool = Query(False),
@@ -490,7 +507,23 @@ def rollup(
                        min(i.last_activity_at) FILTER (WHERE i.nonclosure_reason IS NOT NULL
                                           AND i.lifecycle_state NOT IN ('closed_confirmed','dismissed','closed_inferred')
                                           AND i.review_state <> 'rejected') AS oldest_unclosed_at,
-                       max(i.last_activity_at) AS most_recent_at
+                       max(i.last_activity_at) AS most_recent_at,
+                       -- 重点客户 tier (L5/L6/L7) via the key-account channel map;
+                       -- 'L7'>'L6' sorts right as text. NULL for non-key customers.
+                       (SELECT ka.level
+                          FROM {SCHEMA}.key_account_channels kac
+                          JOIN {SCHEMA}.key_accounts ka ON ka.uuid = kac.uuid
+                         WHERE kac.platform = i.customer_platform
+                           AND kac.workspace_id = i.customer_workspace_id
+                           AND kac.channel_id = i.customer_channel_id
+                         ORDER BY ka.level DESC LIMIT 1) AS tier,
+                       (SELECT ka.sales_name
+                          FROM {SCHEMA}.key_account_channels kac
+                          JOIN {SCHEMA}.key_accounts ka ON ka.uuid = kac.uuid
+                         WHERE kac.platform = i.customer_platform
+                           AND kac.workspace_id = i.customer_workspace_id
+                           AND kac.channel_id = i.customer_channel_id
+                         ORDER BY ka.level DESC LIMIT 1) AS key_sales
                 FROM {SCHEMA}.issues i
                 LEFT JOIN agent.channels ch
                   ON ch.platform = i.customer_platform
@@ -1114,8 +1147,11 @@ def dash_customer_issues(
                 (platform, workspace_id, channel_id),
             )
             chrow = cur.fetchone()
+            tier = _account_tier(cur, platform, workspace_id, channel_id)
     return {"items": items, "count": len(items),
-            "channel": dict(chrow) if chrow else None}
+            "channel": dict(chrow) if chrow else None,
+            "tier": (tier or {}).get("tier"),
+            "key_sales": (tier or {}).get("key_sales")}
 
 
 @app.get("/v1/dashboard/stale-pending", dependencies=[Depends(require_secret)])
@@ -1280,6 +1316,11 @@ def dash_issue_transcript(issue_id: str) -> Any:
             )
             chrow = cur.fetchone()
             issue["channel_name"] = chrow["channel_name"] if chrow else None
+            tier = _account_tier(cur, issue.get("customer_platform"),
+                                 issue.get("customer_workspace_id"),
+                                 issue.get("customer_channel_id"))
+            issue["tier"] = (tier or {}).get("tier")
+            issue["key_sales"] = (tier or {}).get("key_sales")
             cur.execute(
                 f"""SELECT im.role, im.signal_kind, im.is_segment_start,
                           am.platform, am.workspace_id, am.channel_id, am.message_id,

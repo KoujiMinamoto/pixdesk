@@ -173,7 +173,7 @@
 
   // Home-page filter state + the last rollup payload, so chip clicks re-render
   // the grid without re-fetching.
-  const filter = { platform: null, product: null, q: "" };
+  const filter = { platform: null, product: null, q: "", keyOnly: false };
   let _rollupItems = [];
   // Home customer view: "grid" (cards) or "list" (one row per customer).
   let viewMode = localStorage.getItem("ov_view") || "grid";
@@ -224,7 +224,20 @@
     return arr.map((p) => el("span", { class: "tag product" }, p));
   }
 
+  // 重点客户徽章 — L7 白金 / L6 金 / L5 银, with the level text on the badge.
+  const TIER_CLASS = { L7: "platinum", L6: "gold", L5: "silver" };
+  const TIER_NAME = { L7: "白金", L6: "金", L5: "银" };
+  function tierBadge(tier, sales) {
+    if (!tier) return null;
+    return el("span", {
+      class: "tier-badge tier-" + (TIER_CLASS[tier] || "silver"),
+      title: "重点客户 · " + (TIER_NAME[tier] || "") + "牌" +
+             (sales ? " · 销售 " + sales : "") },
+      el("span", { class: "tier-medal" }, "★"), tier);
+  }
+
   function matchesFilter(c) {
+    if (filter.keyOnly && !c.tier) return false;
     if (filter.platform && c.customer_platform !== filter.platform) return false;
     if (filter.product) {
       const prods = Array.isArray(c.products) ? c.products : [];
@@ -395,6 +408,11 @@
       platRow.appendChild(chip(PLATFORM_LABEL[p] || p, filter.platform === p,
         () => { filter.platform = p; renderGrid(); refreshChips(); }));
     }
+    platRow.appendChild(el("span", { class: "chip-label" }, "客户级"));
+    platRow.appendChild(chip("全部", !filter.keyOnly,
+      () => { filter.keyOnly = false; renderGrid(); refreshChips(); }));
+    platRow.appendChild(chip("★ 重点客户", filter.keyOnly,
+      () => { filter.keyOnly = true; renderGrid(); refreshChips(); }));
     bar.appendChild(platRow);
 
     if (products.length) {
@@ -517,7 +535,7 @@
 
     return el("div", { class: "customer-card", onclick: () => location.hash = "#/customers/" + key },
       el("div", { class: "tags" }, platformPill(c.customer_platform), productPills(c.products)),
-      el("div", { class: "name" }, customerLabel(c)),
+      el("div", { class: "name" }, customerLabel(c), tierBadge(c.tier, c.key_sales)),
       el("div", { class: "stats" },
         el("span", null,
           el("span", { class: "big red" }, String(unclosed)),
@@ -552,7 +570,7 @@
 
     return el("div", { class: "customer-row", onclick: () => location.hash = "#/customers/" + key },
       el("div", { class: "cr-tags" }, platformPill(c.customer_platform), productPills(c.products)),
-      el("div", { class: "cr-name" }, customerLabel(c)),
+      el("div", { class: "cr-name" }, customerLabel(c), tierBadge(c.tier, c.key_sales)),
       el("div", { class: "cr-stats" },
         el("span", { class: "cr-n red", title: "待回复" }, String(unclosed)),
         el("span", { class: "cr-n amber", title: "待确认" }, String(suggested)),
@@ -587,6 +605,8 @@
                         workspace_id;
 
     $title.textContent = channelName;
+    const custTier = tierBadge(data.tier, data.key_sales);
+    if (custTier) $title.appendChild(custTier);
     $crumbs.innerHTML = "";
     $crumbs.appendChild(el("a", { onclick: () => location.hash = "#/" }, "全部客户"));
     $crumbs.appendChild(document.createTextNode(" / " + channelName));
@@ -696,6 +716,7 @@
       el("span", { class: "pill " + it.lifecycle_state },
         STATE_LABEL[it.lifecycle_state] || it.lifecycle_state),
       platformPill(it.customer_platform),
+      tierBadge(it.tier, it.key_sales),
       it.code ? el("span", { class: "meta-item code" }, it.code) : null,
       it.external_party_name ? el("span", { class: "meta-item" }, "👤 " + it.external_party_name) : null,
       el("span", { class: "meta-item" }, (it.message_count || turns.length) + " 条消息"),
