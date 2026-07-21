@@ -149,6 +149,25 @@ def _eligible(conn, min_wait_minutes: Optional[int] = None,
                    (SELECT im.message_id FROM {SCHEMA}.issue_messages im
                      WHERE im.issue_id = i.id AND im.is_segment_start
                      ORDER BY im.ts ASC LIMIT 1) AS opening_msg,
+                   -- Slack /thread/ links must anchor at the thread ROOT; a
+                   -- reply's ts shows "Couldn't load thread" (same fix as
+                   -- main._chat_deeplink).
+                   (SELECT am.thread_id FROM {SCHEMA}.issue_messages im2
+                      JOIN agent.messages am
+                        ON am.platform = im2.platform
+                       AND am.workspace_id = im2.workspace_id
+                       AND am.channel_id = im2.channel_id
+                       AND am.message_id = im2.message_id
+                     WHERE im2.issue_id = i.id AND im2.is_segment_start
+                     ORDER BY im2.ts ASC LIMIT 1) AS opening_thread,
+                   -- 重点客户 tier (L5/L6/L7); NULL for regular customers.
+                   (SELECT ka.level
+                      FROM {SCHEMA}.key_account_channels kac
+                      JOIN {SCHEMA}.key_accounts ka ON ka.uuid = kac.uuid
+                     WHERE kac.platform = i.customer_platform
+                       AND kac.workspace_id = i.customer_workspace_id
+                       AND kac.channel_id = i.customer_channel_id
+                     ORDER BY ka.level DESC LIMIT 1) AS tier,
                    a.sent_at AS last_alert_at
             FROM {SCHEMA}.issues i
             LEFT JOIN agent.channels ch
@@ -183,7 +202,8 @@ def _deeplink(row: dict) -> Optional[str]:
         if not ws:
             return None
         base = f"https://app.slack.com/client/{ws}/{chan}"
-        return f"{base}/thread/{chan}-{msg}" if msg else base
+        root = row.get("opening_thread") or msg
+        return f"{base}/thread/{chan}-{root}" if root else base
     if plat == "discord":
         base = f"https://discord.com/channels/@me/{chan}"
         return f"{base}/{msg}" if msg else base
@@ -208,13 +228,32 @@ def _fmt_wait(minutes: float) -> str:
 
 # --- cards -----------------------------------------------------------------
 
+_TIER_NAME = {"L7": "白金", "L6": "金", "L5": "银"}
+
+
+def _tier_tag(row: dict) -> str:
+    """'⭐L7 ' prefix for key accounts (重点客户), empty otherwise."""
+    t = row.get("tier")
+    return f"⭐{t} " if t else ""
+
+
+def _key_first(rows: list[dict]) -> list[dict]:
+    """重点客户置顶: tier desc (L7 > L6 > L5 > none), stalest-first within each
+    tier — the digest's stalest-first ordering is preserved inside groups."""
+    def k(r):
+        t = r.get("tier") or ""
+        lvl = int(t[1:]) if t.startswith("L") and t[1:].isdigit() else 0
+        return (-lvl, r.get("last_customer_at"))
+    return sorted(rows, key=k)
+
+
 def _item_line(row: dict) -> str:
     cust = _cust_name(row)
     zh = (row.get("summary_zh") or row.get("title") or "").strip()
     todo = (row.get("next_action_zh") or "").strip()
     wait = _fmt_wait(row.get("wait_min"))
     link = _deeplink(row)
-    head = f"**{cust}** · 等待 {wait} · `{row['code']}`"
+    head = f"{_tier_tag(row)}**{cust}** · 等待 {wait} · `{row['code']}`"
     if link:
         head += f" · [打开对话]({link})"
     parts = [head]
@@ -226,11 +265,14 @@ def _item_line(row: dict) -> str:
 
 
 def _single_card(row: dict, person, open_id) -> dict:
+    tier = row.get("tier")
+    head = f"⏰ 超时未回复 · {_fmt_wait(row.get('wait_min'))}"
+    if tier:
+        head += f" · ⭐{tier}重点客户（{_TIER_NAME.get(tier, '')}）"
     return {
         "config": {"wide_screen_mode": True},
-        "header": {"template": "orange",
-                   "title": {"tag": "plain_text",
-                             "content": f"⏰ 超时未回复 · {_fmt_wait(row.get('wait_min'))}"}},
+        "header": {"template": "red" if tier else "orange",
+                   "title": {"tag": "plain_text", "content": head}},
         "elements": [
             {"tag": "div", "text": {"tag": "lark_md", "content": _item_line(row)}},
             {"tag": "hr"},
@@ -280,12 +322,16 @@ def _summary_card(rows: list[dict], person, open_id) -> dict:
 
 
 def _handoff_card(rows: list[dict], person, open_id, shift_name: str) -> dict:
-    """Shift-handoff digest — @the person who just came on duty."""
+    """Shift-handoff digest — @the person who just came on duty. 重点客户置顶
+    (tier desc), then stalest-first within each tier."""
+    rows = _key_first(rows)
     tail = f" · {shift_name}" if shift_name else ""
+    n_key = sum(1 for r in rows if r.get("tier"))
+    key_note = f"（含 ⭐重点客户 {n_key} 条，已置顶）" if n_key else ""
     return _digest_card(
         rows, person, open_id,
         title=f"🔄 接班简报{tail} · 共 {len(rows)} 条待跟进",
-        intro="你已接班，以下客户仍未闭环、等待我方跟进：",
+        intro=f"你已接班，以下客户仍未闭环、等待我方跟进{key_note}：",
         template="blue",
         rest_note="…以及其余 {rest} 条（完整清单见看板 · 班次复盘）")
 
