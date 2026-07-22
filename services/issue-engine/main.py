@@ -1109,6 +1109,195 @@ def dash_tickets(
             "status": status, "limit": limit, "offset": offset}
 
 
+# ---------------------------------------------------------------------------
+# Open ticket API (官网工单系统): read-only, consumed by the Novita website
+# through the ticket-widget's /openapi/v1/* gateway (API-key auth there; the
+# engine itself stays behind require_secret). Tickets carry the CRM account
+# object (uuid/company/level/sales) so the website can join tickets to its own
+# account system by uuid. Non-customer channels (标记系统) are excluded.
+# ---------------------------------------------------------------------------
+
+_OPEN_ACCOUNT_SQL = """
+    (SELECT jsonb_build_object('uuid', ka.uuid, 'company', ka.company,
+                               'level', ka.level, 'sales', ka.sales_name)
+       FROM {schema}.key_account_channels kac
+       JOIN {schema}.key_accounts ka ON ka.uuid = kac.uuid
+      WHERE kac.platform = i.customer_platform
+        AND kac.workspace_id = i.customer_workspace_id
+        AND kac.channel_id = i.customer_channel_id
+      ORDER BY ka.level DESC LIMIT 1) AS account
+"""
+
+
+def _open_ticket_select() -> str:
+    return f"""
+        SELECT i.id, i.code, i.title,
+               (i.metadata->>'summary')        AS summary,
+               (i.metadata->>'summary_zh')     AS summary_zh,
+               (i.metadata->>'next_action_zh') AS next_action_zh,
+               i.lifecycle_state, i.review_state, i.nonclosure_reason,
+               i.closure_reason,
+               CASE WHEN i.lifecycle_state IN ('closed_confirmed','closed_inferred')
+                    THEN 'closed' ELSE 'open' END AS status,
+               i.last_speaker, i.last_customer_at, i.last_agent_at,
+               i.message_count, i.opened_at, i.last_activity_at,
+               COALESCE(i.closed_at, i.closure_detected_at) AS closed_at,
+               i.external_party_name, i.reopened_count, i.escalated_ticket_id,
+               (i.metadata->'products') AS products,
+               i.customer_platform, i.customer_workspace_id, i.customer_channel_id,
+               (SELECT ch.channel_name FROM agent.channels ch
+                  WHERE ch.platform = i.customer_platform
+                    AND ch.workspace_id = i.customer_workspace_id
+                    AND ch.channel_id = i.customer_channel_id LIMIT 1) AS channel_name,
+               cc.actor_mxid AS closed_by_mxid,
+               {_OPEN_ACCOUNT_SQL.format(schema=SCHEMA)}
+        FROM {SCHEMA}.issues i
+        LEFT JOIN LATERAL (
+          SELECT actor_mxid FROM {SCHEMA}.issue_history
+          WHERE issue_id = i.id AND field = 'closure_confirmed'
+          ORDER BY ts DESC LIMIT 1
+        ) cc ON true
+    """
+
+
+def _open_ticket_polish(cur, items: list[dict]) -> list[dict]:
+    """Resolve closed_by 花名 and fold channel fields into a customer object."""
+    names = _actor_names(cur, [it.get("closed_by_mxid") for it in items])
+    for it in items:
+        it["closed_by"] = names.get(it.get("closed_by_mxid"))
+        it.pop("closed_by_mxid", None)
+        it["customer"] = {
+            "platform": it.pop("customer_platform", None),
+            "workspace_id": it.pop("customer_workspace_id", None),
+            "channel_id": it.pop("customer_channel_id", None),
+            "channel_name": it.pop("channel_name", None),
+            "contact_name": it.get("external_party_name"),
+            "account": it.pop("account", None),
+        }
+    return items
+
+
+@app.get("/v1/open/tickets", dependencies=[Depends(require_secret)])
+def open_tickets(
+    status: str = Query("all"),                 # all | open | closed
+    customer_uuid: Optional[str] = Query(None),  # CRM account uuid
+    platform: Optional[str] = Query(None),
+    updated_after: Optional[str] = Query(None),  # ISO ts, incremental sync
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+) -> Any:
+    """Ticket list for the website. Newest-activity-first; `updated_after`
+    enables incremental sync (last_activity_at strictly greater)."""
+    where = ["i.lifecycle_state <> 'dismissed'", "i.review_state <> 'rejected'",
+             TIME_FLOOR_ALIAS, _cust_chan_sql("i")]
+    args: list[Any] = []
+    if status == "open":
+        where.append("i.lifecycle_state NOT IN ('closed_confirmed','closed_inferred')")
+    elif status == "closed":
+        where.append("i.lifecycle_state IN ('closed_confirmed','closed_inferred')")
+    if platform:
+        where.append("i.customer_platform = %s")
+        args.append(platform)
+    if customer_uuid:
+        where.append(
+            f"""EXISTS (SELECT 1 FROM {SCHEMA}.key_account_channels kac
+                 WHERE kac.uuid = %s::uuid
+                   AND kac.platform = i.customer_platform
+                   AND kac.workspace_id = i.customer_workspace_id
+                   AND kac.channel_id = i.customer_channel_id)""")
+        args.append(customer_uuid)
+    if updated_after:
+        where.append("i.last_activity_at > %s::timestamptz")
+        args.append(updated_after)
+    with _PooledConn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                f"SELECT count(*) AS n FROM {SCHEMA}.issues i WHERE {' AND '.join(where)}",
+                args)
+            total = cur.fetchone()["n"]
+            cur.execute(
+                _open_ticket_select()
+                + f" WHERE {' AND '.join(where)}"
+                + " ORDER BY i.last_activity_at DESC NULLS LAST LIMIT %s OFFSET %s",
+                args + [limit, offset])
+            items = _open_ticket_polish(cur, _rows(cur))
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+
+@app.get("/v1/open/tickets/{ticket_id}", dependencies=[Depends(require_secret)])
+def open_ticket_detail(ticket_id: str) -> Any:
+    with _PooledConn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(_open_ticket_select() + " WHERE i.id = %s::uuid", (ticket_id,))
+            items = _open_ticket_polish(cur, _rows(cur))
+    if not items:
+        raise HTTPException(404, "ticket not found")
+    return items[0]
+
+
+@app.get("/v1/open/tickets/{ticket_id}/transcript", dependencies=[Depends(require_secret)])
+def open_ticket_transcript(ticket_id: str) -> Any:
+    """Chronological chat transcript of one ticket (role customer/agent)."""
+    with _PooledConn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(f"SELECT 1 FROM {SCHEMA}.issues WHERE id = %s::uuid", (ticket_id,))
+            if cur.fetchone() is None:
+                raise HTTPException(404, "ticket not found")
+            cur.execute(
+                f"""SELECT am.ts, im.role, am.sender_name, am.text
+                    FROM {SCHEMA}.issue_messages im
+                    LEFT JOIN agent.messages am
+                      ON am.platform = im.platform AND am.workspace_id = im.workspace_id
+                     AND am.channel_id = im.channel_id AND am.message_id = im.message_id
+                    WHERE im.issue_id = %s::uuid
+                    ORDER BY am.ts NULLS LAST""",
+                (ticket_id,))
+            msgs = _rows(cur)
+    return {"ticket_id": ticket_id, "messages": msgs, "count": len(msgs)}
+
+
+@app.get("/v1/open/customers", dependencies=[Depends(require_secret)])
+def open_customers() -> Any:
+    """Customer registry for the website. `customers` = one row per chat channel
+    that has tickets (with its CRM account link when mapped); `accounts` = the
+    full CRM key-account list (incl. companies with no chat channel), so the
+    website always has every uuid/name pair."""
+    with _PooledConn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                f"""
+                SELECT i.customer_platform AS platform,
+                       i.customer_workspace_id AS workspace_id,
+                       i.customer_channel_id AS channel_id,
+                       (SELECT ch.channel_name FROM agent.channels ch
+                          WHERE ch.platform = i.customer_platform
+                            AND ch.workspace_id = i.customer_workspace_id
+                            AND ch.channel_id = i.customer_channel_id LIMIT 1) AS channel_name,
+                       count(*) AS total_tickets,
+                       count(*) FILTER (WHERE i.lifecycle_state NOT IN
+                           ('closed_confirmed','closed_inferred')) AS open_tickets,
+                       min(i.opened_at) AS first_ticket_at,
+                       max(i.last_activity_at) AS last_activity_at,
+                       {_OPEN_ACCOUNT_SQL.format(schema=SCHEMA)}
+                FROM {SCHEMA}.issues i
+                WHERE i.lifecycle_state <> 'dismissed' AND i.review_state <> 'rejected'
+                  AND {TIME_FLOOR_ALIAS} AND {_cust_chan_sql('i')}
+                GROUP BY i.customer_platform, i.customer_workspace_id, i.customer_channel_id
+                ORDER BY last_activity_at DESC
+                """)
+            customers = _rows(cur)
+            cur.execute(
+                f"""SELECT ka.uuid, ka.company, ka.level, ka.sales_name AS sales,
+                           ka.updated_at,
+                           count(kac.channel_id) AS mapped_channels
+                    FROM {SCHEMA}.key_accounts ka
+                    LEFT JOIN {SCHEMA}.key_account_channels kac ON kac.uuid = ka.uuid
+                    GROUP BY ka.uuid ORDER BY ka.level DESC, ka.company""")
+            accounts = _rows(cur)
+    return {"customers": customers, "accounts": accounts,
+            "customer_count": len(customers), "account_count": len(accounts)}
+
+
 @app.get("/v1/dashboard/customers/issues", dependencies=[Depends(require_secret)])
 def dash_customer_issues(
     platform: str = Query(...),

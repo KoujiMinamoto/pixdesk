@@ -28,6 +28,7 @@ from fastapi import (
     Cookie,
     Depends,
     FastAPI,
+    Header,
     HTTPException,
     Query,
     Request,
@@ -1156,6 +1157,50 @@ async def dash_metric_issues(request: Request, user: dict = Depends(require_dash
     """Drill-down list behind a hero-strip card (?metric=&period=...)."""
     params = dict(request.query_params)
     resp = await _issue_proxy("GET", "/v1/dashboard/metric-issues", "@anon:dashboard", params=params)
+    return _passthrough(resp)
+
+
+# ---------------------------------------------------------------------------
+# Open ticket API gateway (官网工单系统): server-to-server, Bearer API key.
+# Keys live in TICKET_OPENAPI_KEYS (comma-separated, rotate by adding a new one
+# then dropping the old). Fail closed: no keys configured → 503 for everyone.
+# ---------------------------------------------------------------------------
+OPENAPI_KEYS = {k.strip() for k in
+                os.environ.get("TICKET_OPENAPI_KEYS", "").split(",") if k.strip()}
+
+
+def require_openapi_key(authorization: str = Header(default="")) -> None:
+    if not OPENAPI_KEYS:
+        raise HTTPException(503, "open ticket API not enabled")
+    if not authorization.startswith("Bearer ") \
+            or authorization[7:].strip() not in OPENAPI_KEYS:
+        raise HTTPException(401, "invalid API key")
+
+
+@app.get("/openapi/v1/tickets", dependencies=[Depends(require_openapi_key)])
+async def open_tickets(request: Request) -> Any:
+    resp = await _issue_proxy("GET", "/v1/open/tickets", "@openapi:website",
+                              params=dict(request.query_params))
+    return _passthrough(resp)
+
+
+@app.get("/openapi/v1/tickets/{ticket_id}", dependencies=[Depends(require_openapi_key)])
+async def open_ticket_detail(ticket_id: str) -> Any:
+    resp = await _issue_proxy("GET", f"/v1/open/tickets/{ticket_id}", "@openapi:website")
+    return _passthrough(resp)
+
+
+@app.get("/openapi/v1/tickets/{ticket_id}/transcript",
+         dependencies=[Depends(require_openapi_key)])
+async def open_ticket_transcript(ticket_id: str) -> Any:
+    resp = await _issue_proxy("GET", f"/v1/open/tickets/{ticket_id}/transcript",
+                              "@openapi:website")
+    return _passthrough(resp)
+
+
+@app.get("/openapi/v1/customers", dependencies=[Depends(require_openapi_key)])
+async def open_customers() -> Any:
+    resp = await _issue_proxy("GET", "/v1/open/customers", "@openapi:website")
     return _passthrough(resp)
 
 
