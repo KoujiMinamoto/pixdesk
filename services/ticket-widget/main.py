@@ -1159,6 +1159,26 @@ async def dash_metric_issues(request: Request, user: dict = Depends(require_dash
     return _passthrough(resp)
 
 
+class ChannelClassBody(BaseModel):
+    platform: str
+    workspace_id: str
+    channel_id: str
+    channel_class: str     # customer | supplier | internal | ignore
+    note: Optional[str] = None
+
+
+@app.post("/api/v1/dashboard/channel-class")
+async def dash_channel_class(body: ChannelClassBody,
+                             user: dict = Depends(require_dash_admin)) -> Any:
+    """标记系统 (admin only): classify a channel — supplier/internal/ignore
+    drop it from every customer-facing view; 'customer' restores it."""
+    resp = await _issue_proxy(
+        "POST", "/v1/dashboard/channel-class", _actor_mxid(user),
+        json_body=body.model_dump(),
+    )
+    return _passthrough(resp)
+
+
 @app.get("/api/v1/dashboard/shift-workload/issues")
 async def dash_shift_workload_issues(request: Request, user: dict = Depends(require_dash_approved)) -> Any:
     """Drilldown: issues a person handled in the window (?person=&period=&bucket=)."""

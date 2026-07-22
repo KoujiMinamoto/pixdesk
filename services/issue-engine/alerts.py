@@ -180,6 +180,12 @@ def _eligible(conn, min_wait_minutes: Optional[int] = None,
               AND i.review_state <> 'rejected'
               AND i.lifecycle_state NOT IN ('closed_confirmed','dismissed')
               AND {TIME_FLOOR_ALIAS}
+              -- 标记系统: channels classed supplier/internal/ignore never alert
+              AND NOT EXISTS (SELECT 1 FROM {SCHEMA}.channel_class cx
+                    WHERE cx.platform = i.customer_platform
+                      AND cx.workspace_id = i.customer_workspace_id
+                      AND cx.channel_id = i.customer_channel_id
+                      AND cx.class <> 'customer')
               AND i.last_customer_at IS NOT NULL
               AND i.last_customer_at <= now() - (%s * interval '1 minute')
               {max_clause}

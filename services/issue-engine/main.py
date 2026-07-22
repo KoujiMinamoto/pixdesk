@@ -42,6 +42,20 @@ TIME_FLOOR_BARE = f"last_activity_at >= '{TIME_FLOOR}'" if TIME_FLOOR else "TRUE
 TIME_FLOOR_ALIAS = f"i.last_activity_at >= '{TIME_FLOOR}'" if TIME_FLOOR else "TRUE"
 TIME_FLOOR_ALIAS_A = f"a.last_activity_at >= '{TIME_FLOOR}'" if TIME_FLOOR else "TRUE"
 
+# Channel classification (标记系统): a channel marked anything other than
+# 'customer' in issue_tc.channel_class (supplier 供应商 / internal / ignore) is
+# excluded from every customer-facing surface — rollup, summary, metric lists,
+# stale queue, shift stats, tickets, SLA alerts. No row = customer (default).
+CHANNEL_CLASSES = ("customer", "supplier", "internal", "ignore")
+
+
+def _cust_chan_sql(alias: str = "i") -> str:
+    return (f"NOT EXISTS (SELECT 1 FROM {SCHEMA}.channel_class cx"
+            f" WHERE cx.platform = {alias}.customer_platform"
+            f" AND cx.workspace_id = {alias}.customer_workspace_id"
+            f" AND cx.channel_id = {alias}.customer_channel_id"
+            f" AND cx.class <> 'customer')")
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("issue-engine")
 
@@ -531,6 +545,7 @@ def rollup(
                  AND ch.channel_id = i.customer_channel_id
                 WHERE i.lifecycle_state <> 'dismissed' AND i.review_state <> 'rejected'
                   AND {floor_clause}
+                  AND {_cust_chan_sql('i')}
                 GROUP BY i.customer_platform, i.customer_workspace_id,
                          i.customer_channel_id
                 HAVING count(*) > 0
@@ -638,9 +653,11 @@ def dash_summary(
                      WHERE a.nonclosure_reason IS NOT NULL
                        AND a.lifecycle_state NOT IN ('closed_confirmed','dismissed','closed_inferred')
                        AND a.review_state <> 'rejected'
-                       AND {TIME_FLOOR_ALIAS_A}) AS awaiting_us
-                FROM {SCHEMA}.issues
+                       AND {TIME_FLOOR_ALIAS_A}
+                       AND {_cust_chan_sql('a')}) AS awaiting_us
+                FROM {SCHEMA}.issues i
                 WHERE {floor_bare}
+                  AND {_cust_chan_sql('i')}
                 """,
                 params,
             )
@@ -756,6 +773,7 @@ def dash_shift_workload(
                 LEFT JOIN {SCHEMA}.roster_identity ri
                   ON cc.actor_mxid = '@' || ri.feishu_user_id || ':feishu'
                 WHERE i.lifecycle_state <> 'dismissed' AND i.review_state <> 'rejected'
+                  AND {_cust_chan_sql('i')}
                 GROUP BY a.person
                 """,
                 params,
@@ -851,6 +869,7 @@ def dash_shift_workload_issues(
                 LEFT JOIN {SCHEMA}.roster_identity ri
                   ON cc.actor_mxid = '@' || ri.feishu_user_id || ':feishu'
                 WHERE i.lifecycle_state <> 'dismissed' AND i.review_state <> 'rejected'
+                  AND {_cust_chan_sql('i')}
                   {bucket_sql}
                 ORDER BY i.last_activity_at DESC NULLS LAST
                 """,
@@ -967,6 +986,7 @@ def dash_shift(hours: int = Query(8, ge=1, le=72)) -> Any:
                 FROM {SCHEMA}.issues i
                 WHERE i.lifecycle_state <> 'dismissed'
                   AND i.review_state <> 'rejected'
+                  AND {_cust_chan_sql('i')}
                   AND (
                     -- closed in window (any open-date)
                     (i.lifecycle_state IN ('closed_inferred','closed_confirmed')
@@ -1013,7 +1033,7 @@ def dash_tickets(
     distinct agent-side senders on the issue, plus the most recent one as the
     `last_handler`. A future shift-roster can then attribute work by time."""
     where = ["i.lifecycle_state <> 'dismissed'", "i.review_state <> 'rejected'",
-             TIME_FLOOR_ALIAS]
+             TIME_FLOOR_ALIAS, _cust_chan_sql("i")]
     args: list[Any] = []
     if status == "open":
         where.append("i.lifecycle_state NOT IN ('closed_confirmed','closed_inferred')")
@@ -1148,10 +1168,49 @@ def dash_customer_issues(
             )
             chrow = cur.fetchone()
             tier = _account_tier(cur, platform, workspace_id, channel_id)
+            cur.execute(
+                f"""SELECT class, note FROM {SCHEMA}.channel_class
+                    WHERE platform=%s AND workspace_id=%s AND channel_id=%s""",
+                (platform, workspace_id, channel_id),
+            )
+            clrow = cur.fetchone()
     return {"items": items, "count": len(items),
             "channel": dict(chrow) if chrow else None,
             "tier": (tier or {}).get("tier"),
-            "key_sales": (tier or {}).get("key_sales")}
+            "key_sales": (tier or {}).get("key_sales"),
+            "channel_class": clrow["class"] if clrow else "customer",
+            "channel_class_note": clrow["note"] if clrow else None}
+
+
+class ChannelClassBody(BaseModel):
+    platform: str
+    workspace_id: str
+    channel_id: str
+    channel_class: str     # customer | supplier | internal | ignore
+    note: Optional[str] = None
+
+
+@app.post("/v1/dashboard/channel-class", dependencies=[Depends(require_secret)])
+def set_channel_class(body: ChannelClassBody, actor: str = Depends(require_actor)) -> Any:
+    """Mark a channel's classification (标记系统). Anything except 'customer'
+    removes it from all customer-facing surfaces; setting back to 'customer'
+    restores it. Upsert keyed on the channel triple; records who marked it."""
+    if body.channel_class not in CHANNEL_CLASSES:
+        raise HTTPException(400, f"class must be one of {CHANNEL_CLASSES}")
+    with _PooledConn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                f"""INSERT INTO {SCHEMA}.channel_class
+                        (platform, workspace_id, channel_id, class, note, marked_by, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, now())
+                    ON CONFLICT (platform, workspace_id, channel_id)
+                    DO UPDATE SET class = EXCLUDED.class, note = EXCLUDED.note,
+                                  marked_by = EXCLUDED.marked_by, updated_at = now()""",
+                (body.platform, body.workspace_id, body.channel_id,
+                 body.channel_class, body.note, actor),
+            )
+        conn.commit()
+    return {"ok": True, "channel_class": body.channel_class}
 
 
 @app.get("/v1/dashboard/stale-pending", dependencies=[Depends(require_secret)])
@@ -1186,6 +1245,7 @@ def dash_stale_pending(days: Optional[int] = Query(None)) -> Any:
                   AND i.review_state <> 'rejected'
                   AND i.lifecycle_state NOT IN ('closed_confirmed','closed_inferred','dismissed')
                   AND {TIME_FLOOR_ALIAS}
+                  AND {_cust_chan_sql('i')}
                   AND i.last_customer_at IS NOT NULL
                   AND i.last_customer_at < now() - (%s * interval '1 day')
                 ORDER BY i.last_customer_at ASC
@@ -1282,6 +1342,7 @@ def dash_metric_issues(
                   ORDER BY ts DESC LIMIT 1
                 ) cc ON true
                 WHERE {floor}
+                  AND {_cust_chan_sql('i')}
                   AND {where}
                 ORDER BY {order}
                 LIMIT 300

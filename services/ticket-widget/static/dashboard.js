@@ -224,6 +224,12 @@
     return arr.map((p) => el("span", { class: "tag product" }, p));
   }
 
+  // 标记系统: channel classification labels (供应商 etc. are hidden from all
+  // customer-facing views; only admins can change the class, on the customer page).
+  const CHANNEL_CLASS_LABEL = {
+    customer: "客户", supplier: "供应商", internal: "内部", ignore: "忽略",
+  };
+
   // 重点客户徽章 — L7 白金 / L6 金 / L5 银, with the level text on the badge.
   const TIER_CLASS = { L7: "platinum", L6: "gold", L5: "silver" };
   const TIER_NAME = { L7: "白金", L6: "金", L5: "银" };
@@ -612,6 +618,37 @@
     $crumbs.appendChild(document.createTextNode(" / " + channelName));
 
     $view.innerHTML = "";
+
+    // 标记系统: current class + (admin-only) reclassify chips. Non-customer
+    // classes are hidden from every customer-facing list/alert/stat.
+    const cls = data.channel_class || "customer";
+    if (cls !== "customer") {
+      $view.appendChild(el("div", { class: "summary-block" },
+        "🏷 该频道已标记为「" + (CHANNEL_CLASS_LABEL[cls] || cls) + "」" +
+        "——不出现在客户列表、指标、SLA 告警和统计中（直接访问本页仍可查看）。"));
+    }
+    if (isAdmin()) {
+      const selRow = el("div", { class: "chip-row chan-class-row" },
+        el("span", { class: "chip-label" }, "频道类型"));
+      for (const [k, label] of Object.entries(CHANNEL_CLASS_LABEL)) {
+        selRow.appendChild(el("button", { class: "chip" + (cls === k ? " active" : ""),
+          onclick: async () => {
+            if (k === cls) return;
+            const warn = k === "customer"
+              ? "将重新出现在客户记录中。"
+              : "将从客户列表、指标、SLA 告警和统计中隐藏。";
+            if (!confirm("将「" + channelName + "」标记为「" + label + "」？" + warn)) return;
+            try {
+              await api("/api/v1/dashboard/channel-class", { method: "POST",
+                json: { platform, workspace_id, channel_id, channel_class: k } });
+            } catch (e) { alert("标记失败：" + (e.message || e)); return; }
+            setStatus("已标记为「" + label + "」", "ok");
+            renderCustomer(key);
+          } }, label));
+      }
+      $view.appendChild(selRow);
+    }
+
     if (!items.length) {
       $view.appendChild(el("div", { class: "empty" }, "暂无问题"));
       return;
