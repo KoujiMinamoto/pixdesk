@@ -1586,6 +1586,55 @@ def dash_issue_transcript(issue_id: str) -> Any:
                 (issue_id,),
             )
             transcript = _rows(cur)
+            for t in transcript:
+                t["is_context"] = False
+            # 线程上下文补全: distill assigns messages per-TOPIC, so one Slack
+            # thread can span several issues (ISS-91394's replies drifted into
+            # the older RPM issue ISS-90618) — which reads as "记录没抓全" in
+            # the drawer. Pull every message of every thread this issue
+            # participates in; ones pinned elsewhere (or nowhere) come back as
+            # context rows the UI greys out with a "→ 已归入 ISS-xxxx" badge.
+            # Topic attribution and every stat stay untouched.
+            cur.execute(
+                f"""
+                WITH mine AS (
+                  SELECT am.message_id, am.thread_id
+                  FROM {SCHEMA}.issue_messages im
+                  JOIN agent.messages am
+                    ON am.platform = im.platform AND am.workspace_id = im.workspace_id
+                   AND am.channel_id = im.channel_id AND am.message_id = im.message_id
+                  WHERE im.issue_id = %s
+                ),
+                roots AS (
+                  SELECT DISTINCT COALESCE(NULLIF(thread_id, ''), message_id) AS root
+                  FROM mine
+                )
+                SELECT am.platform, am.workspace_id, am.channel_id, am.message_id,
+                       am.thread_id, am.sender_id, am.sender_name, am.text, am.ts,
+                       pin.role, i2.code AS context_issue_code,
+                       i2.id AS context_issue_id
+                FROM agent.messages am
+                JOIN roots r ON r.root IN (am.thread_id, am.message_id)
+                LEFT JOIN LATERAL (
+                  SELECT im2.issue_id, im2.role FROM {SCHEMA}.issue_messages im2
+                  WHERE im2.platform = am.platform
+                    AND im2.workspace_id = am.workspace_id
+                    AND im2.channel_id = am.channel_id
+                    AND im2.message_id = am.message_id
+                  ORDER BY im2.ts DESC NULLS LAST LIMIT 1
+                ) pin ON true
+                LEFT JOIN {SCHEMA}.issues i2 ON i2.id = pin.issue_id
+                WHERE am.platform = %s AND am.workspace_id = %s AND am.channel_id = %s
+                  AND NOT EXISTS (SELECT 1 FROM mine m WHERE m.message_id = am.message_id)
+                ORDER BY am.ts
+                LIMIT 500
+                """,
+                (issue_id, issue.get("customer_platform"),
+                 issue.get("customer_workspace_id"), issue.get("customer_channel_id")),
+            )
+            context_rows = _rows(cur)
+            for t in context_rows:
+                t["is_context"] = True
             cur.execute(
                 f"""SELECT field, old_value, new_value, actor_mxid, ts
                    FROM {SCHEMA}.issue_history WHERE issue_id = %s ORDER BY ts DESC""",
@@ -1595,10 +1644,14 @@ def dash_issue_transcript(issue_id: str) -> Any:
             names = _actor_names(cur, [h.get("actor_mxid") for h in history])
     # Deep link into the customer's original Slack/Discord conversation, anchored
     # to the issue's opening message. Transcript rows carry is_segment_start +
-    # message_id, so reuse them as the message list.
+    # message_id, so reuse them as the message list (context rows excluded —
+    # the anchor must be this issue's own opening).
     issue["chat_deeplink"] = _chat_deeplink(transcript, issue)
-    return {"issue": issue, "transcript": transcript, "history": history,
-            "actor_names": names, "transcript_count": len(transcript)}
+    merged = sorted(transcript + context_rows,
+                    key=lambda t: (t.get("ts") is None, t.get("ts")))
+    return {"issue": issue, "transcript": merged, "history": history,
+            "actor_names": names, "transcript_count": len(transcript),
+            "context_count": len(context_rows)}
 
 
 def _chat_deeplink(messages: list[dict], issue: dict) -> Optional[str]:

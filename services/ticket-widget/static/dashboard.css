@@ -368,6 +368,15 @@ input:focus, select:focus, textarea:focus {
 .turn.agent .role-badge { background: var(--green-soft); color: var(--green); }
 .turn.bot .role-badge, .turn.system .role-badge { background: var(--line-soft); color: var(--ink-3); }
 .turn.bot .who, .turn.system .who { color: var(--ink-3); }
+/* 线程上下文补全: thread messages that belong to another issue (or none) —
+   greyed, with a jump badge to wherever they were filed. */
+.turn.context { opacity: .55; background: var(--bg, #fafafa); }
+.turn.context .text { color: var(--ink-2, #555); }
+.turn .ctx-badge { display: inline-block; font-size: 10.5px; font-weight: 600;
+  padding: 0 7px; border-radius: 999px; margin-right: 8px; line-height: 17px;
+  background: var(--line-soft); color: var(--ink-3); cursor: pointer;
+  vertical-align: 1px; white-space: nowrap; }
+a.ctx-badge:hover { text-decoration: underline; }
 
 .day-divider { text-align: center; font-size: 10.5px; font-weight: 600;
   letter-spacing: 0.04em; color: var(--ink-3);

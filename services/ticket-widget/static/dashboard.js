@@ -845,9 +845,15 @@
     }
     if (actions.childNodes.length) detail.appendChild(actions);
 
-    // transcript
+    // transcript — pinned turns + greyed thread-context rows (messages of the
+    // same Slack/Discord thread that belong to another issue / no issue), so
+    // the drawer always shows the complete thread.
     const tx = el("div", { class: "transcript" });
-    tx.appendChild(el("h3", null, "聊天记录 (" + turns.length + " 条)"));
+    const ownCount = data.transcript_count != null
+      ? data.transcript_count : turns.filter((t) => !t.is_context).length;
+    const ctxCount = data.context_count || 0;
+    tx.appendChild(el("h3", null, "聊天记录 (" + ownCount + " 条" +
+      (ctxCount ? " · 含 " + ctxCount + " 条线程上下文" : "") + ")"));
     if (!turns.length) {
       tx.appendChild(el("div", { class: "turn" },
         el("span", { class: "text" }, "无证据消息")));
@@ -862,10 +868,19 @@
           lastDay = day;
         }
         const role = t.role || "system";
-        tx.appendChild(el("div", { class: "turn " + role },
+        const ctxBadge = t.is_context
+          ? (t.context_issue_code
+              ? el("a", { class: "ctx-badge",
+                          title: "这条消息按话题归入了另一个工单，点击查看",
+                          onclick: () => location.hash = "#/issues/" + t.context_issue_id },
+                  "→ 已归入 " + t.context_issue_code)
+              : el("span", { class: "ctx-badge" }, "线程上下文·未归档"))
+          : null;
+        tx.appendChild(el("div", { class: "turn " + role + (t.is_context ? " context" : "") },
           el("span", { class: "role-badge " + role }, ROLE_LABEL[role] || role),
           el("span", { class: "who" }, t.sender_name || t.sender_id || (t.role || "?")),
           el("span", { class: "when" }, t.ts ? fmtDate(t.ts) : "—"),
+          ctxBadge,
           el("span", { class: "text" }, t.text || "(无文本)")));
       }
     }
