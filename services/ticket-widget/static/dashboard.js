@@ -1276,9 +1276,12 @@
     const prog = document.getElementById("settle-prog");
     if (!prog) return;
     const total = items.length;
+    // Mirrors renderMark: closed (green) / escalated (amber) / judged-open (red)
+    // all count as a made decision.
     const done = items.filter(it =>
       it.lifecycle_state === "closed_confirmed" ||
-      (it.escalated_ticket_id && String(it.escalated_ticket_id).trim())).length;
+      (it.escalated_ticket_id && String(it.escalated_ticket_id).trim()) ||
+      (it.lifecycle_state !== "closed_confirmed" && it.review_state === "confirmed")).length;
     prog.textContent = "已处理 " + done + " / " + total;
   }
 
@@ -1313,6 +1316,12 @@
     if (it.lifecycle_state === "closed_confirmed") {
       mark.appendChild(el("span", { class: "mk green" }, "✓ 已确认闭环"));
     }
+    // 非闭环 judgment: reopen (and 确认为真问题) set review_state=confirmed on a
+    // still-open issue — that's a made decision, show it and count it as
+    // processed (previously invisible → the button felt dead).
+    if (it.lifecycle_state !== "closed_confirmed" && it.review_state === "confirmed") {
+      mark.appendChild(el("span", { class: "mk red" }, "✗ 已标记非闭环 · 跟进中"));
+    }
     if (it.escalated_ticket_id && String(it.escalated_ticket_id).trim()) {
       mark.appendChild(el("span", { class: "mk amber" },
         "⬆ 已升级SRE · " + it.escalated_ticket_id));
@@ -1340,9 +1349,9 @@
       return;
     }
     // reflect new state locally (avoid a full refetch)
-    if (action === "close") { it.lifecycle_state = "closed_confirmed"; }
-    else if (action === "reopen") { it.lifecycle_state = "awaiting_agent"; }
-    else if (action === "escalate") { it.escalated_ticket_id = body.escalated_ticket_id; }
+    if (action === "close") { it.lifecycle_state = "closed_confirmed"; setStatus("已标记闭环 · " + (it.code || ""), "ok"); }
+    else if (action === "reopen") { it.lifecycle_state = "awaiting_agent"; it.review_state = "confirmed"; setStatus("已标记非闭环 · " + (it.code || ""), "ok"); }
+    else if (action === "escalate") { it.escalated_ticket_id = body.escalated_ticket_id; setStatus("已升级 SRE · " + (it.code || ""), "ok"); }
     if (row) {
       row.classList.remove("busy");
       const fresh = settleRow(it);
@@ -1353,7 +1362,7 @@
     if (progEl) {
       const rows = document.querySelectorAll(".settle-item");
       const doneRows = Array.from(rows)
-        .filter(r => r.querySelector(".mk.green, .mk.amber")).length;
+        .filter(r => r.querySelector(".mk.green, .mk.amber, .mk.red")).length;
       progEl.textContent = "已处理 " + doneRows + " / " + rows.length;
     }
   }
