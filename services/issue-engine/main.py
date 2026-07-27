@@ -852,6 +852,7 @@ def dash_shift_workload_issues(
                 )
                 SELECT i.id, i.code, i.title, (i.metadata->>'summary_zh') AS summary_zh,
                        i.lifecycle_state, i.review_state, i.nonclosure_reason,
+                       (i.metadata->'internal_confirm') AS internal_confirm,
                        i.escalated_ticket_id, i.escalated_at, i.last_activity_at,
                        i.customer_platform, i.customer_workspace_id, i.customer_channel_id,
                        a.msgs AS my_msgs,
@@ -1782,8 +1783,10 @@ def review_issue(issue_id: str, body: ReviewBody, actor: str = Depends(require_a
                   set to confirmed so the closure_agent won't silently re-close
                   it — a human now owns the close.
     """
-    if body.action not in ("confirm", "reject", "dismiss", "close", "reopen", "escalate"):
-        raise HTTPException(400, "action must be confirm | reject | dismiss | close | reopen | escalate")
+    if body.action not in ("confirm", "reject", "dismiss", "close", "reopen",
+                           "escalate", "internal"):
+        raise HTTPException(400, "action must be confirm | reject | dismiss | close"
+                                 " | reopen | escalate | internal")
     if body.action == "escalate" and not (body.escalated_ticket_id or "").strip():
         raise HTTPException(400, "escalate requires escalated_ticket_id")
     with _PooledConn() as conn:
@@ -1854,6 +1857,27 @@ def review_issue(issue_id: str, body: ReviewBody, actor: str = Depends(require_a
                     _history(cur, issue_id, "escalated_sre",
                              {"escalated_ticket_id": issue.get("escalated_ticket_id")},
                              {"escalated_ticket_id": ticket, "note": body.note}, actor)
+                elif body.action == "internal":
+                    # 内部确认中: a MARKER like escalate — the problem is being
+                    # confirmed with an internal team (产品 etc.). Lifecycle is
+                    # UNCHANGED so the issue stays tracked; stored in metadata
+                    # (no DDL): {at, by, note}. Re-marking overwrites.
+                    cur.execute(
+                        f"""UPDATE {SCHEMA}.issues
+                           SET metadata = jsonb_set(COALESCE(metadata, '{{}}'::jsonb),
+                                   '{{internal_confirm}}',
+                                   jsonb_build_object(
+                                       'at', to_char(now() AT TIME ZONE 'UTC',
+                                                     'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+                                       'by', %s::text, 'note', %s::text)),
+                               reviewed_by_mxid=%s, reviewed_at=now()
+                           WHERE id=%s""",
+                        (actor, body.note, actor, issue_id),
+                    )
+                    _history(cur, issue_id, "internal_confirm",
+                             {"internal_confirm":
+                              (issue.get("metadata") or {}).get("internal_confirm")},
+                             {"note": body.note}, actor)
                 else:  # reject | dismiss
                     cur.execute(
                         f"""UPDATE {SCHEMA}.issues

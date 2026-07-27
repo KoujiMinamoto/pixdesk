@@ -156,6 +156,7 @@
   const FIELD_LABEL = {
     closure_confirmed: "确认闭环", review_confirmed: "确认为真问题",
     reopened_by_review: "重新打开", escalated_sre: "升级 SRE", dismissed: "忽略",
+    internal_confirm: "标记内部确认中",
   };
   const PLATFORM_LABEL = { discord: "Discord", slack: "Slack", gmail: "Gmail" };
 
@@ -1281,7 +1282,8 @@
     const done = items.filter(it =>
       it.lifecycle_state === "closed_confirmed" ||
       (it.escalated_ticket_id && String(it.escalated_ticket_id).trim()) ||
-      (it.lifecycle_state !== "closed_confirmed" && it.review_state === "confirmed")).length;
+      (it.lifecycle_state !== "closed_confirmed" &&
+       (it.review_state === "confirmed" || it.internal_confirm))).length;
     prog.textContent = "已处理 " + done + " / " + total;
   }
 
@@ -1296,7 +1298,8 @@
     const acts = el("div", { class: "settle-acts" },
       el("button", { class: "sbtn green", onclick: () => settleAct(it, "close") }, "闭环"),
       el("button", { class: "sbtn red", onclick: () => settleAct(it, "reopen") }, "非闭环"),
-      el("button", { class: "sbtn amber", onclick: () => settleAct(it, "escalate") }, "升级SRE"));
+      el("button", { class: "sbtn amber", onclick: () => settleAct(it, "escalate") }, "升级SRE"),
+      el("button", { class: "sbtn blue", onclick: () => settleAct(it, "internal") }, "内部确认中"));
     row.appendChild(el("div", { class: "settle-main" },
       el("span", { class: "pill " + it.lifecycle_state }, stateLabel),
       el("div", null,
@@ -1322,6 +1325,11 @@
     if (it.lifecycle_state !== "closed_confirmed" && it.review_state === "confirmed") {
       mark.appendChild(el("span", { class: "mk red" }, "✗ 已标记非闭环 · 跟进中"));
     }
+    if (it.lifecycle_state !== "closed_confirmed" && it.internal_confirm) {
+      mark.appendChild(el("span", { class: "mk blue" },
+        "🔄 内部确认中" +
+        (it.internal_confirm.note ? " · " + it.internal_confirm.note : "")));
+    }
     if (it.escalated_ticket_id && String(it.escalated_ticket_id).trim()) {
       mark.appendChild(el("span", { class: "mk amber" },
         "⬆ 已升级SRE · " + it.escalated_ticket_id));
@@ -1338,6 +1346,12 @@
       if (!t.trim()) { alert("工单号不能为空"); return; }
       body.escalated_ticket_id = t.trim();
     }
+    if (action === "internal") {
+      const n = prompt("内部确认中 — 备注（和谁确认/确认什么，可留空）：",
+        (it.internal_confirm && it.internal_confirm.note) || "");
+      if (n === null) return;               // cancelled
+      body.note = n.trim() || null;
+    }
     const row = document.getElementById("settle-" + it.id);
     if (row) row.classList.add("busy");
     try {
@@ -1352,6 +1366,7 @@
     if (action === "close") { it.lifecycle_state = "closed_confirmed"; setStatus("已标记闭环 · " + (it.code || ""), "ok"); }
     else if (action === "reopen") { it.lifecycle_state = "awaiting_agent"; it.review_state = "confirmed"; setStatus("已标记非闭环 · " + (it.code || ""), "ok"); }
     else if (action === "escalate") { it.escalated_ticket_id = body.escalated_ticket_id; setStatus("已升级 SRE · " + (it.code || ""), "ok"); }
+    else if (action === "internal") { it.internal_confirm = { note: body.note }; setStatus("已标记内部确认中 · " + (it.code || ""), "ok"); }
     if (row) {
       row.classList.remove("busy");
       const fresh = settleRow(it);
@@ -1362,7 +1377,7 @@
     if (progEl) {
       const rows = document.querySelectorAll(".settle-item");
       const doneRows = Array.from(rows)
-        .filter(r => r.querySelector(".mk.green, .mk.amber, .mk.red")).length;
+        .filter(r => r.querySelector(".mk.green, .mk.amber, .mk.red, .mk.blue")).length;
       progEl.textContent = "已处理 " + doneRows + " / " + rows.length;
     }
   }
