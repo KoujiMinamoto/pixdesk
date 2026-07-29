@@ -1160,6 +1160,14 @@ async def dash_metric_issues(request: Request, user: dict = Depends(require_dash
     return _passthrough(resp)
 
 
+@app.get("/api/v1/dashboard/ticket-report")
+async def dash_ticket_report(request: Request, user: dict = Depends(require_dash_approved)) -> Any:
+    """工单报表: per-责任人 counts/rates/durations + the window's tickets."""
+    params = dict(request.query_params)
+    resp = await _issue_proxy("GET", "/v1/dashboard/ticket-report", "@anon:dashboard", params=params)
+    return _passthrough(resp)
+
+
 # ---------------------------------------------------------------------------
 # Open ticket API gateway (官网工单系统): server-to-server, Bearer API key.
 # Keys live in TICKET_OPENAPI_KEYS (comma-separated, rotate by adding a new one

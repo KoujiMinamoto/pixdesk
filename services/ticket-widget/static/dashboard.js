@@ -32,6 +32,7 @@
     { key: "stale", label: "超7天待审批", hash: "#/stale" },
     { key: "shift", label: "班次复盘", hash: "#/shift" },
     { key: "tickets", label: "Ticket 记录", hash: "#/tickets" },
+    { key: "report", label: "工单报表", hash: "#/report" },
   ];
   function renderNav(active) {
     // Tabs stay visible on every view (detail pages pass active=null — no tab
@@ -699,6 +700,7 @@
         el("div", { class: "who" },
           (it.message_count || 0) + " 条消息" +
           (it.external_party_name ? " · " + it.external_party_name : "") +
+          (opts.showOwner && it.owner ? " · 责任人 " + it.owner : "") +
           (it.last_speaker ? " · 最后 " + (it.last_speaker === "customer" ? "客户" : "我方") : "") +
           (it.closed_by_name ? " · ✅ " + it.closed_by_name : "")
         )),
@@ -756,6 +758,8 @@
       platformPill(it.customer_platform),
       tierBadge(it.tier, it.key_sales),
       it.code ? el("span", { class: "meta-item code" }, it.code) : null,
+      it.owner ? el("span", { class: "meta-item",
+        title: "责任人：工单创建时刻的值班同事（按排班表）" }, "🧑‍💼 责任人 " + it.owner) : null,
       it.external_party_name ? el("span", { class: "meta-item" }, "👤 " + it.external_party_name) : null,
       el("span", { class: "meta-item" }, (it.message_count || turns.length) + " 条消息"),
       el("span", { class: "meta-item" }, "最后活动 " + fmtAge(it.last_activity_at)),
@@ -1383,6 +1387,144 @@
   }
 
   // -------------------------------------------------------------------------
+  // 工单报表: issues OPENED in a window, owned by whoever was on duty at
+  // creation time (责任人, via shift roster), with first-response / closure
+  // stats per person + overall, and the full ticket list for drill-back.
+  // -------------------------------------------------------------------------
+  const report = {
+    period: localStorage.getItem("rp_period") || "this_week",
+    start: localStorage.getItem("rp_start") || "",
+    end: localStorage.getItem("rp_end") || "",
+    person: null,          // client-side filter for the ticket list
+  };
+
+  function fmtDur(secs) {
+    if (secs == null) return "—";
+    if (secs < 60) return Math.round(secs) + " 秒";
+    if (secs < 3600) return Math.round(secs / 60) + " 分钟";
+    if (secs < 86400) return (secs / 3600).toFixed(1) + " 小时";
+    return (secs / 86400).toFixed(1) + " 天";
+  }
+
+  function reportQuery() {
+    if (report.period === "custom") {
+      const p = new URLSearchParams({ period: "custom" });
+      if (report.start) p.set("start", report.start);
+      if (report.end) p.set("end", report.end + "T23:59:59");
+      return "?" + p.toString();
+    }
+    return "?period=" + report.period;
+  }
+
+  async function renderTicketReport() {
+    $strip.style.display = "none";
+    renderNav("report");
+    $back.hidden = true;
+    $title.textContent = "工单报表";
+    $crumbs.innerHTML = "";
+    $crumbs.appendChild(el("a", { onclick: () => location.hash = "#/" }, "全部客户"));
+    $crumbs.appendChild(document.createTextNode(" / 工单报表"));
+    $view.innerHTML = "";
+
+    const sel = el("div", { class: "chip-row" },
+      el("span", { class: "chip-label" }, "时间范围"));
+    for (const [key, label] of PERIODS) {
+      sel.appendChild(el("button",
+        { class: "chip" + (report.period === key ? " active" : ""),
+          onclick: () => {
+            report.period = key; localStorage.setItem("rp_period", key);
+            renderTicketReport();
+          } }, label));
+    }
+    $view.appendChild(sel);
+    if (report.period === "custom") {
+      const mk = (val, on) => {
+        const i = el("input", { type: "date", class: "period-date", value: val || "" });
+        i.addEventListener("change", (e) => on(e.target.value));
+        return i;
+      };
+      $view.appendChild(el("div", { class: "chip-row" },
+        mk(report.start, (v) => { report.start = v; localStorage.setItem("rp_start", v); }),
+        el("span", { class: "period-sep" }, "至"),
+        mk(report.end, (v) => { report.end = v; localStorage.setItem("rp_end", v); }),
+        el("button", { class: "chip apply", onclick: () => {
+          if (!report.start || !report.end) { setStatus("请选择起止日期", "error"); return; }
+          renderTicketReport();
+        } }, "应用")));
+      if (!report.start || !report.end) return;
+    }
+
+    const body = el("div", null, el("div", { class: "loading" }, "加载中…"));
+    $view.appendChild(body);
+    let data;
+    try {
+      data = await api("/api/v1/dashboard/ticket-report" + reportQuery());
+    } catch (e) {
+      body.innerHTML = "";
+      body.appendChild(el("div", { class: "empty" }, String(e.message || e)));
+      return;
+    }
+    body.innerHTML = "";
+    if (data.win_start) {
+      body.appendChild(el("div", { class: "shift-since" },
+        "统计窗口：" + fmtDate(data.win_start) + " ~ " + fmtDate(data.win_end) +
+        "（按工单创建时间统计）"));
+    }
+    const o = data.overall || {};
+    body.appendChild(el("div", { class: "shift-strip report-strip" },
+      card("新建工单", o.tickets || 0, ""),
+      card("已解决(含疑似)", o.resolved || 0, "green"),
+      card("解决率", Math.round((o.resolve_rate || 0) * 100) + "%", "green"),
+      card("人工闭环率", Math.round((o.confirm_rate || 0) * 100) + "%", ""),
+      card("首响中位", fmtDur(o.first_response_median_secs), "amber"),
+      card("闭环时长中位", fmtDur(o.close_median_secs), "")));
+
+    const tbl = el("div", { class: "wl-table" });
+    tbl.appendChild(el("div", { class: "wl-row wl-head" },
+      el("span", { class: "wl-name" }, "责任人"),
+      el("span", { class: "wl-n" }, "工单数"),
+      el("span", { class: "wl-n" }, "已解决"),
+      el("span", { class: "wl-n" }, "解决率"),
+      el("span", { class: "wl-n" }, "人工闭环"),
+      el("span", { class: "wl-n" }, "闭环率"),
+      el("span", { class: "wl-n" }, "首响中位"),
+      el("span", { class: "wl-n" }, "闭环中位")));
+    for (const p of (data.people || [])) {
+      tbl.appendChild(el("div",
+        { class: "wl-row rp-row" + (report.person === p.person ? " active" : ""),
+          onclick: () => {
+            report.person = report.person === p.person ? null : p.person;
+            renderTicketReport();
+          } },
+        el("span", { class: "wl-name" }, p.person),
+        el("span", { class: "wl-n strong" }, String(p.tickets)),
+        el("span", { class: "wl-n green" }, String(p.resolved)),
+        el("span", { class: "wl-n" }, Math.round((p.resolve_rate || 0) * 100) + "%"),
+        el("span", { class: "wl-n" }, String(p.confirmed)),
+        el("span", { class: "wl-n" }, Math.round((p.confirm_rate || 0) * 100) + "%"),
+        el("span", { class: "wl-n amber" }, fmtDur(p.first_response_median_secs)),
+        el("span", { class: "wl-n" }, fmtDur(p.close_median_secs))));
+    }
+    body.appendChild(tbl);
+    body.appendChild(el("div", { class: "wl-note" },
+      "责任人 = 工单创建时刻的值班同事（support 为共号，按排班表归属）；已解决 = 人工闭环 + AI判定疑似闭环；"
+      + "人工闭环 = 点过「确认闭环」；首响 = 创建到我方首条回复；闭环时长 = 创建到闭环判定；时长为中位数。"
+      + "点击某行只看该同事的工单，再点取消。"));
+
+    const shown = (data.items || []).filter(
+      (it) => !report.person || (it.owner || "未排班") === report.person);
+    body.appendChild(el("div", { class: "list-subhead" },
+      (report.person ? report.person + " 的" : "") + "工单明细 (" + shown.length + ")"));
+    if (!shown.length) {
+      body.appendChild(el("div", { class: "empty" }, "该范围内无工单"));
+      return;
+    }
+    const list = el("div", { class: "issue-list" });
+    for (const it of shown) list.appendChild(issueRow(it, { showCustomer: true, showOwner: true }));
+    body.appendChild(list);
+  }
+
+  // -------------------------------------------------------------------------
   // Metric drill-down: the issue list behind one hero-strip card. Window
   // metrics follow the overview period selection; awaiting_us is live.
   // -------------------------------------------------------------------------
@@ -1724,6 +1866,8 @@
         await renderRoot();
       } else if (hash.startsWith("#/metric/")) {
         await renderMetricIssues(hash.slice("#/metric/".length));
+      } else if (hash === "#/report") {
+        await renderTicketReport();
       } else if (hash === "#/stale") {
         await renderStalePending();
       } else if (hash === "#/shift") {

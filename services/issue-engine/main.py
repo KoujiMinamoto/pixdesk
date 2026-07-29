@@ -1110,6 +1110,107 @@ def dash_tickets(
             "status": status, "limit": limit, "offset": offset}
 
 
+@app.get("/v1/dashboard/ticket-report", dependencies=[Depends(require_secret)])
+def dash_ticket_report(
+    period: str = Query("this_week"),
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+) -> Any:
+    """工单报表: issues OPENED in the window, each mapped to its 责任人 — the
+    person on duty (shift_roster) at opened_at, distinct from 经手人 (who
+    replied). Per ticket: first-response time (opened_at → first agent msg) and
+    closure time (opened_at → closure). Per person + overall: ticket count,
+    resolved (closed_confirmed + AI closed_inferred), 解决率, human-confirmed
+    闭环率, median first-response / closure durations. Items are returned in
+    full so the page can drill back to every ticket."""
+    win_start_sql, win_end_sql, params = _resolve_period(period, start, end)
+    with _PooledConn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                f"""
+                WITH bounds AS (
+                  SELECT {win_start_sql} AS win_start, {win_end_sql} AS win_end
+                )
+                SELECT i.id, i.code, i.title,
+                       (i.metadata->>'summary_zh') AS summary_zh,
+                       (i.metadata->>'summary')    AS summary,
+                       i.lifecycle_state, i.review_state, i.nonclosure_reason,
+                       i.last_speaker, i.message_count, i.opened_at,
+                       i.last_activity_at, i.external_party_name,
+                       i.customer_platform, i.customer_workspace_id, i.customer_channel_id,
+                       (i.metadata->'products') AS products,
+                       (SELECT ch.channel_name FROM agent.channels ch
+                          WHERE ch.platform = i.customer_platform
+                            AND ch.workspace_id = i.customer_workspace_id
+                            AND ch.channel_id = i.customer_channel_id LIMIT 1) AS channel_name,
+                       ro.person AS owner,
+                       CASE WHEN fr.first_agent_ts IS NOT NULL THEN
+                         GREATEST(0, EXTRACT(EPOCH FROM
+                           (fr.first_agent_ts - i.opened_at)))::bigint
+                       END AS first_response_secs,
+                       CASE WHEN i.lifecycle_state IN ('closed_confirmed','closed_inferred')
+                             AND COALESCE(i.closure_detected_at, i.closed_at) IS NOT NULL THEN
+                         GREATEST(0, EXTRACT(EPOCH FROM
+                           (COALESCE(i.closure_detected_at, i.closed_at) - i.opened_at)))::bigint
+                       END AS close_secs
+                FROM {SCHEMA}.issues i
+                LEFT JOIN LATERAL (
+                  SELECT r.person FROM agent.shift_roster r
+                  WHERE i.opened_at >= r.start_ts AND i.opened_at < r.end_ts
+                  ORDER BY r.start_ts DESC LIMIT 1
+                ) ro ON true
+                LEFT JOIN LATERAL (
+                  SELECT min(am.ts) AS first_agent_ts
+                  FROM {SCHEMA}.issue_messages im
+                  JOIN agent.messages am
+                    ON am.platform = im.platform AND am.workspace_id = im.workspace_id
+                   AND am.channel_id = im.channel_id AND am.message_id = im.message_id
+                  WHERE im.issue_id = i.id AND im.role = 'agent'
+                ) fr ON true
+                WHERE i.opened_at >= (SELECT win_start FROM bounds)
+                  AND i.opened_at < (SELECT win_end FROM bounds)
+                  AND i.lifecycle_state <> 'dismissed' AND i.review_state <> 'rejected'
+                  AND {_cust_chan_sql('i')}
+                ORDER BY i.opened_at DESC
+                """,
+                params,
+            )
+            items = _rows(cur)
+            cur.execute(f"SELECT {win_start_sql} AS ws, {win_end_sql} AS we", params)
+            b = cur.fetchone()
+
+    import statistics
+
+    def _agg(rows: list[dict]) -> dict:
+        resolved = [r for r in rows if r["lifecycle_state"]
+                    in ("closed_confirmed", "closed_inferred")]
+        confirmed = [r for r in rows if r["lifecycle_state"] == "closed_confirmed"]
+        frs = [r["first_response_secs"] for r in rows
+               if r.get("first_response_secs") is not None]
+        cls = [r["close_secs"] for r in rows if r.get("close_secs") is not None]
+        n = len(rows)
+        return {
+            "tickets": n,
+            "resolved": len(resolved),
+            "resolve_rate": round(len(resolved) / n, 3) if n else 0.0,
+            "confirmed": len(confirmed),
+            "confirm_rate": round(len(confirmed) / n, 3) if n else 0.0,
+            "first_response_median_secs":
+                round(statistics.median(frs)) if frs else None,
+            "close_median_secs": round(statistics.median(cls)) if cls else None,
+        }
+
+    by_owner: dict[str, list[dict]] = {}
+    for it in items:
+        by_owner.setdefault(it.get("owner") or "未排班", []).append(it)
+    people = [{"person": p, **_agg(rows)} for p, rows in by_owner.items()]
+    people.sort(key=lambda r: r["tickets"], reverse=True)
+    return {"period": period,
+            "win_start": b["ws"].isoformat() if b and b.get("ws") else None,
+            "win_end": b["we"].isoformat() if b and b.get("we") else None,
+            "overall": _agg(items), "people": people, "items": items}
+
+
 # ---------------------------------------------------------------------------
 # Open ticket API (官网工单系统): read-only, consumed by the Novita website
 # through the ticket-widget's /openapi/v1/* gateway (API-key auth there; the
@@ -1574,6 +1675,16 @@ def dash_issue_transcript(issue_id: str) -> Any:
                                  issue.get("customer_channel_id"))
             issue["tier"] = (tier or {}).get("tier")
             issue["key_sales"] = (tier or {}).get("key_sales")
+            # 责任人: whoever was on duty when the issue opened (shift roster),
+            # distinct from 经手人 (who actually replied).
+            cur.execute(
+                """SELECT person FROM agent.shift_roster
+                   WHERE %s >= start_ts AND %s < end_ts
+                   ORDER BY start_ts DESC LIMIT 1""",
+                (issue.get("opened_at"), issue.get("opened_at")),
+            )
+            orow = cur.fetchone()
+            issue["owner"] = orow["person"] if orow else None
             cur.execute(
                 f"""SELECT im.role, im.signal_kind, im.is_segment_start,
                           am.platform, am.workspace_id, am.channel_id, am.message_id,

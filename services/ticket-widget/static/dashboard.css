@@ -368,6 +368,16 @@ input:focus, select:focus, textarea:focus {
 .turn.agent .role-badge { background: var(--green-soft); color: var(--green); }
 .turn.bot .role-badge, .turn.system .role-badge { background: var(--line-soft); color: var(--ink-3); }
 .turn.bot .who, .turn.system .who { color: var(--ink-3); }
+/* 工单报表 */
+.report-strip { grid-template-columns: repeat(6, 1fr); margin: 12px 0 14px; }
+.wl-row.rp-row { cursor: pointer; }
+.wl-row.rp-row:hover { background: var(--accent-soft); }
+.wl-row.rp-row.active { background: var(--accent-soft);
+  border-left: 2px solid var(--accent); }
+@media (max-width: 1100px) {
+  .report-strip { grid-template-columns: repeat(3, 1fr); }
+}
+
 /* 线程上下文补全: thread messages that belong to another issue (or none) —
    greyed, with a jump badge to wherever they were filed. */
 .turn.context { opacity: .55; background: var(--bg, #fafafa); }
