@@ -4,7 +4,9 @@
 -- UUID is the CRM's stable id — future list updates align on it.
 
 CREATE TABLE IF NOT EXISTS issue_tc.key_accounts (
-    uuid        uuid PRIMARY KEY,
+    -- TEXT, not uuid: the website account system uses numeric ids like
+    -- '4361855174763120' alongside CRM-style UUID strings (widened 2026-07-28).
+    uuid        text PRIMARY KEY,
     company     text,                    -- may be blank in the CRM export
     level       text NOT NULL,           -- 'L5' | 'L6' | 'L7' (text sort = level sort)
     sales_cn    text,                    -- CRM 花名: 闻仲 / 罗杰斯
@@ -17,7 +19,7 @@ CREATE TABLE IF NOT EXISTS issue_tc.key_accounts (
 -- regenerated on every import; 'manual' rows survive re-imports — use them to
 -- fix a bad fuzzy match.
 CREATE TABLE IF NOT EXISTS issue_tc.key_account_channels (
-    uuid         uuid NOT NULL REFERENCES issue_tc.key_accounts(uuid) ON DELETE CASCADE,
+    uuid         text NOT NULL REFERENCES issue_tc.key_accounts(uuid) ON DELETE CASCADE,
     platform     text NOT NULL,
     workspace_id text NOT NULL,
     channel_id   text NOT NULL,

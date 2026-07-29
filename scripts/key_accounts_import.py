@@ -18,9 +18,10 @@ import sys
 # CRM 花名 → colleague. Extend when sales joins.
 SALES_MAP = {"闻仲": "Peter", "罗杰斯": "junyu"}
 
+# Account id: CRM-style UUID or the website's numeric id (e.g. 4361855174763120).
 LINE_RE = re.compile(
     r"^(?P<company>.*?)\s*(?P<level>L\d+)\s*(?P<sales>\S*?)\s*"
-    r"(?P<uuid>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\s*$",
+    r"(?P<uuid>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|\d{6,})\s*$",
     re.IGNORECASE)
 
 

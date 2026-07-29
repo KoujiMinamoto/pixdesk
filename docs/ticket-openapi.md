@@ -66,7 +66,7 @@
 | `escalated_ticket_id` | 升级 SRE 的外部工单号（未升级 → null） |
 | `customer.platform/workspace_id/channel_id/channel_name` | 来源聊天频道 |
 | `customer.contact_name` | 对话中的客户联系人名 |
-| `customer.account` | CRM 档案 `{ uuid, company, level, sales }`；频道未挂 CRM 客户时为 null |
+| `customer.account` | CRM 档案 `{ uuid, company, level, sales }`；频道未挂 CRM 客户时为 null。**`uuid` 是字符串**：可能是 CRM 式 UUID（`f09167dd-…`），也可能是官网账号体系的数字 ID（如 `4361855174763120`），对接时请按不透明字符串处理 |
 
 ## 示例
 

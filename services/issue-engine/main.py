@@ -1200,9 +1200,11 @@ def open_tickets(
         where.append("i.customer_platform = %s")
         args.append(platform)
     if customer_uuid:
+        # Account ids are TEXT: the website side uses numeric ids like
+        # '4361855174763120' alongside CRM-style UUIDs.
         where.append(
             f"""EXISTS (SELECT 1 FROM {SCHEMA}.key_account_channels kac
-                 WHERE kac.uuid = %s::uuid
+                 WHERE kac.uuid = %s
                    AND kac.platform = i.customer_platform
                    AND kac.workspace_id = i.customer_workspace_id
                    AND kac.channel_id = i.customer_channel_id)""")
