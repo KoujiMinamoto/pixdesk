@@ -779,9 +779,11 @@
     const closureEvt = it.lifecycle_state === "closed_confirmed"
       ? hist.find((h) => h.field === "closure_confirmed") : null;
     if (closureEvt) {
+      const closeNote = closureEvt.new_value && closureEvt.new_value.note;
       detail.appendChild(el("div", { class: "closed-by" },
         "✅ 闭环人：" + actorLabel(closureEvt.actor_mxid, names)
-          + (closureEvt.ts ? " · " + fmtDate(closureEvt.ts) : "")));
+          + (closureEvt.ts ? " · " + fmtDate(closureEvt.ts) : "")
+          + (closeNote ? " · 理由：" + closeNote : "")));
     }
 
     const prods = (it.metadata && it.metadata.products) || [];
@@ -904,9 +906,11 @@
       ul.appendChild(el("li", null,
         el("strong", null, "时间线 (" + hist.length + " 条)")));
       for (const h of hist) {
+        const hNote = h.new_value && h.new_value.note;
         ul.appendChild(el("li", null,
           fmtAge(h.ts) + " · " + (FIELD_LABEL[h.field] || h.field)
-            + " · " + actorLabel(h.actor_mxid, names)));
+            + " · " + actorLabel(h.actor_mxid, names)
+            + (hNote ? " ·「" + hNote + "」" : "")));
       }
       detail.appendChild(ul);
     }
@@ -919,10 +923,17 @@
     close: "已确认闭环", reopen: "已重新打开",
   };
   async function act(issueId, action) {
+    const body = { action };
+    if (action === "close") {
+      // 关闭理由可选：留空直接关，取消则不关。
+      const n = prompt("关闭理由（可选，留空直接关闭）：", "");
+      if (n === null) return;
+      if (n.trim()) body.note = n.trim();
+    }
     try {
       setStatus("提交中…");
       await api("/api/v1/dashboard/issues/" + issueId + "/review",
-        { method: "POST", json: { action } });
+        { method: "POST", json: body });
       setStatus(ACT_DONE[action] || "已提交", "ok");
       setTimeout(() => setStatus(""), 1500);
       // re-render current view
@@ -1356,6 +1367,11 @@
       if (n === null) return;               // cancelled
       body.note = n.trim() || null;
     }
+    if (action === "close") {
+      const n = prompt("关闭理由（可选，留空直接关闭）：", "");
+      if (n === null) return;               // cancelled
+      if (n.trim()) body.note = n.trim();
+    }
     const row = document.getElementById("settle-" + it.id);
     if (row) row.classList.add("busy");
     try {
@@ -1648,12 +1664,17 @@
   }
 
   async function staleClose(it) {
-    if (!confirm("确认「审批关闭」" + (it.code || "") + "「" + (it.title || "") + "」？")) return;
+    // One dialog doubles as confirm + optional reason: cancel = don't close,
+    // empty = close with the default note.
+    const reason = prompt("审批关闭 " + (it.code || "") + "「" + (it.title || "") + "」\n"
+      + "关闭理由（可选，留空直接关闭；取消则不关闭）：", "");
+    if (reason === null) return;
     const row = document.getElementById("stale-" + it.id);
     if (row) row.classList.add("busy");
     try {
       await api("/api/v1/dashboard/issues/" + it.id + "/review",
-        { method: "POST", json: { action: "close", note: "超7天人工审批关闭" } });
+        { method: "POST", json: { action: "close",
+          note: reason.trim() ? "超7天人工审批关闭：" + reason.trim() : "超7天人工审批关闭" } });
     } catch (e) {
       if (row) row.classList.remove("busy");
       alert("操作失败：" + (e.message || e));
