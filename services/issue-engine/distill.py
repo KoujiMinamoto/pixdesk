@@ -694,7 +694,13 @@ def _upsert_issue(conn, channel: dict[str, Any], item: dict[str, Any]) -> Option
                      closure_reason = %s, message_count = %s,
                      opened_at = LEAST(opened_at, %s),
                      last_activity_at = GREATEST(last_activity_at, %s),
-                     last_speaker = %s, last_customer_at = %s, last_agent_at = %s,
+                     -- COALESCE: a distill window with no customer/agent msg must
+                     -- NOT blank the existing timestamps — a NULL last_customer_at
+                     -- with nonclosure='unanswered_customer' hides the issue from
+                     -- SLA alerts/handoff/stale queue (5 issues leaked this way).
+                     last_speaker = COALESCE(%s, last_speaker),
+                     last_customer_at = COALESCE(%s, last_customer_at),
+                     last_agent_at = COALESCE(%s, last_agent_at),
                      closure_detected_at = CASE
                        WHEN %s = 'closed_inferred' AND closure_detected_at IS NULL THEN now()
                        WHEN %s <> 'closed_inferred' THEN NULL
