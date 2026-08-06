@@ -7,7 +7,9 @@ CREATE TABLE IF NOT EXISTS issue_tc.channel_class (
     platform     text NOT NULL,
     workspace_id text NOT NULL,
     channel_id   text NOT NULL,
-    class        text NOT NULL CHECK (class IN ('customer','supplier','internal','ignore')),
+    -- 'test' = API-联调 sandbox: hidden from internal surfaces like the rest,
+    -- but still served by the open ticket API.
+    class        text NOT NULL CHECK (class IN ('customer','supplier','internal','ignore','test')),
     note         text,
     marked_by    text,                 -- actor mxid of whoever set it
     updated_at   timestamptz NOT NULL DEFAULT now(),

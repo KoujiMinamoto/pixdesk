@@ -230,6 +230,7 @@
   // customer-facing views; only admins can change the class, on the customer page).
   const CHANNEL_CLASS_LABEL = {
     customer: "客户", supplier: "供应商", internal: "内部", ignore: "忽略",
+    test: "测试(仅官网API可见)",
   };
 
   // 重点客户徽章 — L7 白金 / L6 金 / L5 银, with the level text on the badge.

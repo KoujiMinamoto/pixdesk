@@ -43,10 +43,12 @@ TIME_FLOOR_ALIAS = f"i.last_activity_at >= '{TIME_FLOOR}'" if TIME_FLOOR else "T
 TIME_FLOOR_ALIAS_A = f"a.last_activity_at >= '{TIME_FLOOR}'" if TIME_FLOOR else "TRUE"
 
 # Channel classification (标记系统): a channel marked anything other than
-# 'customer' in issue_tc.channel_class (supplier 供应商 / internal / ignore) is
-# excluded from every customer-facing surface — rollup, summary, metric lists,
-# stale queue, shift stats, tickets, SLA alerts. No row = customer (default).
-CHANNEL_CLASSES = ("customer", "supplier", "internal", "ignore")
+# 'customer' in issue_tc.channel_class (supplier 供应商 / internal / ignore /
+# test) is excluded from every customer-facing surface — rollup, summary,
+# metric lists, stale queue, shift stats, tickets, SLA alerts. No row =
+# customer (default). 'test' is the API-联调 sandbox: hidden internally like
+# the others, but still served by the open ticket API (see _open_chan_sql).
+CHANNEL_CLASSES = ("customer", "supplier", "internal", "ignore", "test")
 
 
 def _cust_chan_sql(alias: str = "i") -> str:
@@ -55,6 +57,16 @@ def _cust_chan_sql(alias: str = "i") -> str:
             f" AND cx.workspace_id = {alias}.customer_workspace_id"
             f" AND cx.channel_id = {alias}.customer_channel_id"
             f" AND cx.class <> 'customer')")
+
+
+def _open_chan_sql(alias: str = "i") -> str:
+    """Open-API variant: suppliers/internal/ignore stay hidden, but 'test'
+    sandbox channels ARE served — the website integrates against them."""
+    return (f"NOT EXISTS (SELECT 1 FROM {SCHEMA}.channel_class cx"
+            f" WHERE cx.platform = {alias}.customer_platform"
+            f" AND cx.workspace_id = {alias}.customer_workspace_id"
+            f" AND cx.channel_id = {alias}.customer_channel_id"
+            f" AND cx.class IN ('supplier','internal','ignore'))")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("issue-engine")
@@ -1291,7 +1303,7 @@ def open_tickets(
     """Ticket list for the website. Newest-activity-first; `updated_after`
     enables incremental sync (last_activity_at strictly greater)."""
     where = ["i.lifecycle_state <> 'dismissed'", "i.review_state <> 'rejected'",
-             TIME_FLOOR_ALIAS, _cust_chan_sql("i")]
+             TIME_FLOOR_ALIAS, _open_chan_sql("i")]
     args: list[Any] = []
     if status == "open":
         where.append("i.lifecycle_state NOT IN ('closed_confirmed','closed_inferred')")
@@ -1385,7 +1397,7 @@ def open_customers() -> Any:
                        {_OPEN_ACCOUNT_SQL.format(schema=SCHEMA)}
                 FROM {SCHEMA}.issues i
                 WHERE i.lifecycle_state <> 'dismissed' AND i.review_state <> 'rejected'
-                  AND {TIME_FLOOR_ALIAS} AND {_cust_chan_sql('i')}
+                  AND {TIME_FLOOR_ALIAS} AND {_open_chan_sql('i')}
                 GROUP BY i.customer_platform, i.customer_workspace_id, i.customer_channel_id
                 ORDER BY last_activity_at DESC
                 """)
