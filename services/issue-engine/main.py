@@ -1275,9 +1275,15 @@ def _open_ticket_select() -> str:
 
 
 def _open_ticket_polish(cur, items: list[dict]) -> list[dict]:
-    """Resolve closed_by 花名 and fold channel fields into a customer object."""
+    """Resolve closed_by 花名 and fold channel fields into a customer object.
+    Per the website team's request (2026-08): `id` carries the SAME value as
+    `code` (the ISS-xxxx number) so their side keys on one identifier; the raw
+    uuid stays available as `uuid`, and the detail/transcript paths accept
+    either form."""
     names = _actor_names(cur, [it.get("closed_by_mxid") for it in items])
     for it in items:
+        it["uuid"] = str(it.get("id"))
+        it["id"] = it.get("code")
         it["closed_by"] = names.get(it.get("closed_by_mxid"))
         it.pop("closed_by_mxid", None)
         it["customer"] = {
@@ -1342,9 +1348,12 @@ def open_tickets(
 
 @app.get("/v1/open/tickets/{ticket_id}", dependencies=[Depends(require_secret)])
 def open_ticket_detail(ticket_id: str) -> Any:
+    # Path accepts the ISS-xxxx code (the website's `id`) or the raw uuid.
     with _PooledConn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(_open_ticket_select() + " WHERE i.id = %s::uuid", (ticket_id,))
+            cur.execute(
+                _open_ticket_select() + " WHERE i.code = %s OR i.id::text = lower(%s)",
+                (ticket_id, ticket_id))
             items = _open_ticket_polish(cur, _rows(cur))
     if not items:
         raise HTTPException(404, "ticket not found")
@@ -1353,11 +1362,16 @@ def open_ticket_detail(ticket_id: str) -> Any:
 
 @app.get("/v1/open/tickets/{ticket_id}/transcript", dependencies=[Depends(require_secret)])
 def open_ticket_transcript(ticket_id: str) -> Any:
-    """Chronological chat transcript of one ticket (role customer/agent)."""
+    """Chronological chat transcript of one ticket (role customer/agent).
+    Path accepts the ISS-xxxx code (the website's `id`) or the raw uuid."""
     with _PooledConn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(f"SELECT 1 FROM {SCHEMA}.issues WHERE id = %s::uuid", (ticket_id,))
-            if cur.fetchone() is None:
+            cur.execute(
+                f"""SELECT id, code FROM {SCHEMA}.issues
+                    WHERE code = %s OR id::text = lower(%s)""",
+                (ticket_id, ticket_id))
+            row = cur.fetchone()
+            if row is None:
                 raise HTTPException(404, "ticket not found")
             cur.execute(
                 f"""SELECT am.ts, im.role, am.sender_name, am.text
@@ -1365,11 +1379,12 @@ def open_ticket_transcript(ticket_id: str) -> Any:
                     LEFT JOIN agent.messages am
                       ON am.platform = im.platform AND am.workspace_id = im.workspace_id
                      AND am.channel_id = im.channel_id AND am.message_id = im.message_id
-                    WHERE im.issue_id = %s::uuid
+                    WHERE im.issue_id = %s
                     ORDER BY am.ts NULLS LAST""",
-                (ticket_id,))
+                (row["id"],))
             msgs = _rows(cur)
-    return {"ticket_id": ticket_id, "messages": msgs, "count": len(msgs)}
+    return {"ticket_id": row["code"], "uuid": str(row["id"]),
+            "messages": msgs, "count": len(msgs)}
 
 
 @app.get("/v1/open/customers", dependencies=[Depends(require_secret)])

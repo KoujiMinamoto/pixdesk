@@ -31,7 +31,8 @@
 
 ### 2. `GET /tickets/{id}` — 单条工单
 
-`id` 为工单 uuid（`items[].id`）。响应为单个 Ticket 对象；不存在 → 404。
+`id` 为工单编号（`items[].id`，如 `ISS-91294`；也兼容内部 uuid）。响应为单个
+Ticket 对象；不存在 → 404。
 
 ### 3. `GET /tickets/{id}/transcript` — 工单聊天记录
 
@@ -51,8 +52,9 @@
 
 | 字段 | 说明 |
 |---|---|
-| `id` | 工单 uuid（稳定主键） |
-| `code` | 展示编号，如 `ISS-91294` |
+| `id` | **与 `code` 同值**（应官网侧要求）：即 `ISS-91294` 这样的工单编号，作为对外主键 |
+| `code` | 工单编号，如 `ISS-91294`（与 `id` 相同） |
+| `uuid` | 内部 uuid（一般用不到；详情/记录接口的路径参数编号和 uuid 都认） |
 | `title` / `summary` / `summary_zh` | 标题 / 英文摘要 / 中文摘要 |
 | `next_action_zh` | 系统建议的下一步（中文，可能为空） |
 | `status` | 简化状态：`open` / `closed` |
@@ -82,7 +84,7 @@ curl -s -H "Authorization: Bearer $KEY" \
 
 ```json
 {
-  "id": "e4d0dd8c-…", "code": "ISS-91294",
+  "id": "ISS-91294", "code": "ISS-91294", "uuid": "e4d0dd8c-…",
   "title": "Token/request count discrepancy vs Novita billing",
   "summary_zh": "客户提供了…询问这些请求被收取了多少费用…",
   "status": "open", "lifecycle_state": "awaiting_agent",
