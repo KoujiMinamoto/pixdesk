@@ -1280,11 +1280,12 @@ def _open_ticket_polish(cur, items: list[dict]) -> list[dict]:
     `code` (the ISS-xxxx number) so their side keys on one identifier; the raw
     uuid stays available as `uuid`, and the detail/transcript paths accept
     either form."""
-    names = _actor_names(cur, [it.get("closed_by_mxid") for it in items])
     for it in items:
         it["uuid"] = str(it.get("id"))
         it["id"] = it.get("code")
-        it["closed_by"] = names.get(it.get("closed_by_mxid"))
+        # Customer-facing: never expose internal 花名. Any human closure reads
+        # as the team; AI/none stays null.
+        it["closed_by"] = "Novita Support" if it.get("closed_by_mxid") else None
         it.pop("closed_by_mxid", None)
         it["customer"] = {
             "platform": it.pop("customer_platform", None),

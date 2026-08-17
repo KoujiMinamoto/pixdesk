@@ -64,7 +64,7 @@ Ticket 对象；不存在 → 404。
 | `opened_at` / `last_activity_at` / `closed_at` | 开单 / 最近活动 / 闭环时间 |
 | `last_speaker` / `last_customer_at` / `last_agent_at` | 最后发言方及双方最后发言时间 |
 | `message_count` / `reopened_count` | 消息数 / 重开次数 |
-| `closed_by` | 确认闭环的支持同事花名（人工闭环时有值） |
+| `closed_by` | 人工确认闭环时为 `"Novita Support"`（不暴露内部人员），AI 判定闭环或未闭环 → null |
 | `escalated_ticket_id` | 升级 SRE 的外部工单号（未升级 → null） |
 | `customer.platform/workspace_id/channel_id/channel_name` | 来源聊天频道 |
 | `customer.contact_name` | 对话中的客户联系人名 |
