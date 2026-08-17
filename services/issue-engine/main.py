@@ -1276,15 +1276,14 @@ def _open_ticket_select() -> str:
 
 def _open_ticket_polish(cur, items: list[dict]) -> list[dict]:
     """Resolve closed_by 花名 and fold channel fields into a customer object.
-    Website contract (settled 2026-08-14): their backend validates ticket id as
-    a UUID, so `id` stays the uuid and `code` carries the SAME uuid value
-    (code == id, one identifier to key on). The human-readable ISS-xxxx number
-    lives in `display_code`; detail/transcript paths accept uuid OR ISS code."""
+    Per the website team's request (2026-08): `id` carries the SAME value as
+    `code` (the ISS-xxxx number) so their side keys on one identifier; the raw
+    uuid stays available as `uuid`, and the detail/transcript paths accept
+    either form."""
     names = _actor_names(cur, [it.get("closed_by_mxid") for it in items])
     for it in items:
-        it["display_code"] = it.get("code")
-        it["code"] = str(it.get("id"))
         it["uuid"] = str(it.get("id"))
+        it["id"] = it.get("code")
         it["closed_by"] = names.get(it.get("closed_by_mxid"))
         it.pop("closed_by_mxid", None)
         it["customer"] = {
@@ -1384,7 +1383,7 @@ def open_ticket_transcript(ticket_id: str) -> Any:
                     ORDER BY am.ts NULLS LAST""",
                 (row["id"],))
             msgs = _rows(cur)
-    return {"ticket_id": str(row["id"]), "display_code": row["code"],
+    return {"ticket_id": row["code"], "uuid": str(row["id"]),
             "messages": msgs, "count": len(msgs)}
 
 
