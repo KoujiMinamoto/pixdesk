@@ -383,7 +383,7 @@ def _account_tier(cur, platform, workspace_id, channel_id) -> Optional[dict]:
     if not (platform and channel_id):
         return None
     cur.execute(
-        f"""SELECT ka.level AS tier, ka.sales_name AS key_sales
+        f"""SELECT ka.level AS tier, ka.sales_name AS key_sales, ka.uuid AS key_uuid
             FROM {SCHEMA}.key_account_channels kac
             JOIN {SCHEMA}.key_accounts ka ON ka.uuid = kac.uuid
             WHERE kac.platform = %s AND kac.workspace_id = %s AND kac.channel_id = %s
@@ -867,6 +867,12 @@ def dash_shift_workload_issues(
                        (i.metadata->'internal_confirm') AS internal_confirm,
                        i.escalated_ticket_id, i.escalated_at, i.last_activity_at,
                        i.customer_platform, i.customer_workspace_id, i.customer_channel_id,
+                       (SELECT ka.uuid FROM {SCHEMA}.key_account_channels kac
+                          JOIN {SCHEMA}.key_accounts ka ON ka.uuid = kac.uuid
+                         WHERE kac.platform = i.customer_platform
+                           AND kac.workspace_id = i.customer_workspace_id
+                           AND kac.channel_id = i.customer_channel_id
+                         ORDER BY ka.level DESC LIMIT 1) AS key_uuid,
                        a.msgs AS my_msgs,
                        (SELECT ch.channel_name FROM agent.channels ch
                           WHERE ch.platform=i.customer_platform
@@ -1499,6 +1505,7 @@ def dash_customer_issues(
             "channel": dict(chrow) if chrow else None,
             "tier": (tier or {}).get("tier"),
             "key_sales": (tier or {}).get("key_sales"),
+            "key_uuid": (tier or {}).get("key_uuid"),
             "channel_class": clrow["class"] if clrow else "customer",
             "channel_class_note": clrow["note"] if clrow else None}
 
@@ -1556,6 +1563,12 @@ def dash_stale_pending(days: Optional[int] = Query(None)) -> Any:
                        i.last_speaker, i.last_customer_at, i.last_activity_at,
                        i.message_count, i.external_party_name,
                        i.customer_platform, i.customer_workspace_id, i.customer_channel_id,
+                       (SELECT ka.uuid FROM {SCHEMA}.key_account_channels kac
+                          JOIN {SCHEMA}.key_accounts ka ON ka.uuid = kac.uuid
+                         WHERE kac.platform = i.customer_platform
+                           AND kac.workspace_id = i.customer_workspace_id
+                           AND kac.channel_id = i.customer_channel_id
+                         ORDER BY ka.level DESC LIMIT 1) AS key_uuid,
                        EXTRACT(EPOCH FROM (now() - i.last_customer_at)) / 86400.0 AS wait_days,
                        (SELECT ch.channel_name FROM agent.channels ch
                           WHERE ch.platform = i.customer_platform
@@ -1703,6 +1716,7 @@ def dash_issue_transcript(issue_id: str) -> Any:
                                  issue.get("customer_channel_id"))
             issue["tier"] = (tier or {}).get("tier")
             issue["key_sales"] = (tier or {}).get("key_sales")
+            issue["key_uuid"] = (tier or {}).get("key_uuid")
             # 责任人: whoever was on duty when the issue opened (shift roster),
             # distinct from 经手人 (who actually replied).
             cur.execute(

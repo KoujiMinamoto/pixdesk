@@ -233,6 +233,38 @@
     test: "测试(仅官网API可见)",
   };
 
+  // 官网工单链接: customers bound to a website account (key_uuid) can see
+  // their tickets on novita.ai; support must send this link and get the
+  // customer's confirmation before closing.
+  const PORTAL_BASE = "https://novita.ai/tickets/";
+  function portalLink(it) { return it && it.code ? PORTAL_BASE + it.code : null; }
+  function isPortalBound(it) { return !!(it && it.key_uuid); }
+  async function copyText(t) {
+    try { await navigator.clipboard.writeText(t); return true; }
+    catch (e) {
+      try { const ta = document.createElement("textarea"); ta.value = t;
+        document.body.appendChild(ta); ta.select(); document.execCommand("copy");
+        ta.remove(); return true; } catch (e2) { return false; }
+    }
+  }
+  // Gate shown before any close of a portal-bound ticket. Copies the link, asks
+  // whether the customer has confirmed. Returns true to proceed with the close.
+  async function portalCloseGate(it) {
+    if (!isPortalBound(it)) return true;
+    const link = portalLink(it);
+    const copied = await copyText(link);
+    return confirm(
+      "该客户已接入官网工单，请先把链接发给客户、由客户在官网确认后再关闭：\n\n" +
+      link + (copied ? "\n（链接已复制到剪贴板）" : "") +
+      "\n\n客户是否已确认关闭？\n「确定」= 已确认，继续关闭　「取消」= 稍后再关");
+  }
+  // Small badge for list rows: this ticket is visible on the website.
+  function portalMark(it) {
+    return isPortalBound(it)
+      ? el("span", { class: "portal-mark", title: "官网可见工单：关闭前需客户在官网确认" }, "🌐")
+      : null;
+  }
+
   // 重点客户徽章 — L7 白金 / L6 金 / L5 银, with the level text on the badge.
   const TIER_CLASS = { L7: "platinum", L6: "gold", L5: "silver" };
   const TIER_NAME = { L7: "白金", L6: "金", L5: "银" };
@@ -696,7 +728,7 @@
       el("span", { class: "pill " + it.lifecycle_state }, stateLabel),
       el("div", null,
         custChip ? el("div", { class: "cust-line" }, custChip) : null,
-        el("div", { class: "title" }, it.title || "(无标题)"),
+        el("div", { class: "title" }, portalMark(it), it.title || "(无标题)"),
         summary ? el("div", { class: "summary" }, summary) : null,
         el("div", { class: "who" },
           (it.message_count || 0) + " 条消息" +
@@ -774,6 +806,22 @@
         : null);
     detail.appendChild(meta);
 
+    // 官网确认链接条 (portal-bound customers only): visible throughout, so the
+    // link is at hand long before the close moment.
+    if (isPortalBound(it)) {
+      const link = portalLink(it);
+      const copyBtn = el("button", { class: "portal-copy", onclick: async (e) => {
+        e.stopPropagation();
+        const ok = await copyText(link);
+        setStatus(ok ? "已复制客户确认链接" : "复制失败，请手动复制", ok ? "ok" : "error");
+      } }, "复制");
+      detail.appendChild(el("div", { class: "portal-bar" },
+        el("span", { class: "portal-label" }, "🔗 客户确认链接"),
+        el("a", { class: "portal-link", href: link, target: "_blank", rel: "noopener" }, link),
+        copyBtn,
+        el("span", { class: "portal-hint" }, "关闭前请将此链接发给客户，由客户在官网确认后再关单")));
+    }
+
     // 谁点了闭环: authoritative source is the latest closure_confirmed history
     // event (issues.reviewed_by_mxid can be overwritten by later system actions).
     // hist is ts-DESC, so find() returns the most recent closure.
@@ -835,8 +883,8 @@
     // approved viewers see the issue read-only (backend also enforces this).
     const actions = el("div", { class: "actions" });
     const btn = (label, action, cls) =>
-      el("button", cls ? { class: cls, onclick: () => act(issueId, action) }
-                        : { onclick: () => act(issueId, action) }, label);
+      el("button", cls ? { class: cls, onclick: () => act(issueId, action, it) }
+                        : { onclick: () => act(issueId, action, it) }, label);
     const st = it.lifecycle_state;
     if (!canWrite()) {
       // no action buttons for non-roster viewers
@@ -923,13 +971,17 @@
     confirm: "已确认", reject: "已忽略", dismiss: "已忽略",
     close: "已确认闭环", reopen: "已重新打开",
   };
-  async function act(issueId, action) {
+  async function act(issueId, action, it) {
     const body = { action };
     if (action === "close") {
+      // Portal-bound customer: gate on customer confirmation first.
+      if (!(await portalCloseGate(it))) return;
       // 关闭理由可选：留空直接关，取消则不关。
       const n = prompt("关闭理由（可选，留空直接关闭）：", "");
       if (n === null) return;
-      if (n.trim()) body.note = n.trim();
+      const reason = n.trim();
+      const pfx = isPortalBound(it) ? "[客户已确认]" : "";
+      if (reason || pfx) body.note = (pfx + " " + reason).trim();
     }
     try {
       setStatus("提交中…");
@@ -1323,7 +1375,7 @@
           el("span", { class: "cust-chip" }, it.channel_name || it.customer_workspace_id || "?"),
           it.code ? el("span", { class: "ticket-code" }, it.code) : null),
         el("div", { class: "title", onclick: () => location.hash = "#/issues/" + it.id },
-          it.title || "(无标题)"),
+          portalMark(it), it.title || "(无标题)"),
         summary ? el("div", { class: "summary" }, summary) : null,
         mark)));
     row.appendChild(acts);
@@ -1369,9 +1421,12 @@
       body.note = n.trim() || null;
     }
     if (action === "close") {
+      if (!(await portalCloseGate(it))) return;   // portal-bound: customer confirm first
       const n = prompt("关闭理由（可选，留空直接关闭）：", "");
       if (n === null) return;               // cancelled
-      if (n.trim()) body.note = n.trim();
+      const reason = n.trim();
+      const pfx = isPortalBound(it) ? "[客户已确认]" : "";
+      if (reason || pfx) body.note = (pfx + " " + reason).trim();
     }
     const row = document.getElementById("settle-" + it.id);
     if (row) row.classList.add("busy");
@@ -1650,7 +1705,7 @@
       el("div", null,
         el("div", { class: "cust-line" }, custChip,
           it.code ? el("span", { class: "ticket-code" }, it.code) : null),
-        el("div", { class: "title" }, it.title || "(无标题)"),
+        el("div", { class: "title" }, portalMark(it), it.title || "(无标题)"),
         summary ? el("div", { class: "summary" }, summary) : null,
         el("div", { class: "who" },
           (it.message_count || 0) + " 条消息"
@@ -1665,6 +1720,7 @@
   }
 
   async function staleClose(it) {
+    if (!(await portalCloseGate(it))) return;   // portal-bound: customer confirm first
     // One dialog doubles as confirm + optional reason: cancel = don't close,
     // empty = close with the default note.
     const reason = prompt("审批关闭 " + (it.code || "") + "「" + (it.title || "") + "」\n"
@@ -1675,7 +1731,8 @@
     try {
       await api("/api/v1/dashboard/issues/" + it.id + "/review",
         { method: "POST", json: { action: "close",
-          note: reason.trim() ? "超7天人工审批关闭：" + reason.trim() : "超7天人工审批关闭" } });
+          note: (isPortalBound(it) ? "[客户已确认] " : "")
+              + (reason.trim() ? "超7天人工审批关闭：" + reason.trim() : "超7天人工审批关闭") } });
     } catch (e) {
       if (row) row.classList.remove("busy");
       alert("操作失败：" + (e.message || e));
