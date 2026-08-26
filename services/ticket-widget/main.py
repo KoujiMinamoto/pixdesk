@@ -1160,6 +1160,14 @@ async def dash_metric_issues(request: Request, user: dict = Depends(require_dash
     return _passthrough(resp)
 
 
+@app.get("/api/v1/dashboard/customer-usage")
+async def dash_customer_usage(request: Request, user: dict = Depends(require_dash_approved)) -> Any:
+    """Key-account last-7d model usage + revenue windows (?uuid=)."""
+    params = dict(request.query_params)
+    resp = await _issue_proxy("GET", "/v1/dashboard/customer-usage", "@anon:dashboard", params=params)
+    return _passthrough(resp)
+
+
 @app.get("/api/v1/dashboard/ticket-report")
 async def dash_ticket_report(request: Request, user: dict = Depends(require_dash_approved)) -> Any:
     """工单报表: per-责任人 counts/rates/durations + the window's tickets."""

@@ -1541,6 +1541,31 @@ def set_channel_class(body: ChannelClassBody, actor: str = Depends(require_actor
     return {"ok": True, "channel_class": body.channel_class}
 
 
+@app.get("/v1/dashboard/customer-usage", dependencies=[Depends(require_secret)])
+def dash_customer_usage(uuid: str = Query(...)) -> Any:
+    """Key-account usage panel: last-7d per-model usage (aggregated hourly from
+    the SLA Doris by the ppio sync job into nova.customer_model_usage) plus the
+    Nova Brain revenue windows (latest 1d/7d/30d rows) for that account uuid."""
+    with _PooledConn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """SELECT model_name, requests, input_tokens, output_tokens,
+                          last_active_at, synced_at
+                   FROM nova.customer_model_usage
+                   WHERE uuid = %s ORDER BY requests DESC""", (uuid,))
+            models = _rows(cur)
+            cur.execute(
+                """SELECT DISTINCT ON (window_period)
+                          window_period, rank, revenue_usd, gross_margin_rate,
+                          fetched_at
+                   FROM nova.customer_revenue
+                   WHERE uuid = %s
+                   ORDER BY window_period, fetched_at DESC""", (uuid,))
+            revenue = {r["window_period"]: r for r in _rows(cur)}
+    return {"uuid": uuid, "models": models, "revenue": revenue,
+            "synced_at": models[0]["synced_at"] if models else None}
+
+
 @app.get("/v1/dashboard/stale-pending", dependencies=[Depends(require_secret)])
 def dash_stale_pending(days: Optional[int] = Query(None)) -> Any:
     """The >N-day backlog (default ALERT_MAX_WAIT_DAYS): open issues where the

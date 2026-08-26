@@ -627,6 +627,79 @@
   // View 2: customer issue list
   // -------------------------------------------------------------------------
 
+  function fmtTok(n) {
+    n = +n || 0;
+    if (n >= 1e9) return (n / 1e9).toFixed(1) + "B";
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+    if (n >= 1e3) return (n / 1e3).toFixed(1) + "K";
+    return String(n);
+  }
+
+  // 近7天用量: per-model usage (hourly sync from SLA Doris) + revenue windows.
+  async function fillUsagePanel(uuid) {
+    const panel = document.getElementById("usage-panel");
+    if (!panel) return;
+    let d;
+    try {
+      d = await api("/api/v1/dashboard/customer-usage?uuid=" + encodeURIComponent(uuid));
+    } catch (e) {
+      panel.innerHTML = "";
+      panel.appendChild(el("div", { class: "empty sm" }, "用量数据加载失败：" + (e.message || e)));
+      return;
+    }
+    panel.innerHTML = "";
+    panel.appendChild(el("div", { class: "usage-title" }, "📊 近7天 · 模型用量与收入"));
+
+    const rev = d.revenue || {};
+    if (Object.keys(rev).length) {
+      const line = [];
+      const w7 = rev["7d"], w30 = rev["30d"], w1 = rev["1d"];
+      const pct = (r) => Math.round((r.gross_margin_rate || 0) * 100) + "%";
+      const seg = (label, r) => {
+        if (!r) return null;
+        const neg = (r.gross_margin_rate || 0) < 0;
+        return el("span", { class: "usage-rev" },
+          label + " $" + Math.round(r.revenue_usd || 0).toLocaleString() + " · 毛利 ",
+          el("b", { class: neg ? "neg" : "pos" }, pct(r)),
+          r.rank ? " · 排名#" + r.rank : "");
+      };
+      for (const x of [seg("近1天", w1), seg("近7天", w7), seg("近30天", w30)]) {
+        if (x) line.push(x);
+      }
+      panel.appendChild(el("div", { class: "usage-revline" }, ...line));
+    }
+
+    const models = d.models || [];
+    if (!models.length) {
+      panel.appendChild(el("div", { class: "empty sm" }, "近7天无 API 调用记录"));
+      return;
+    }
+    const tbl = el("div", { class: "usage-table" });
+    tbl.appendChild(el("div", { class: "usage-row usage-head" },
+      el("span", { class: "u-model" }, "模型"),
+      el("span", { class: "u-n" }, "请求数"),
+      el("span", { class: "u-n" }, "输入tok"),
+      el("span", { class: "u-n" }, "输出tok"),
+      el("span", { class: "u-n" }, "最后活跃")));
+    for (const m of models.slice(0, 12)) {
+      tbl.appendChild(el("div", { class: "usage-row" },
+        el("span", { class: "u-model", title: m.model_name }, m.model_name),
+        el("span", { class: "u-n strong" }, (+m.requests).toLocaleString()),
+        el("span", { class: "u-n" }, fmtTok(m.input_tokens)),
+        el("span", { class: "u-n" }, fmtTok(m.output_tokens)),
+        el("span", { class: "u-n muted" }, fmtAge(m.last_active_at))));
+    }
+    panel.appendChild(tbl);
+    if (models.length > 12) {
+      panel.appendChild(el("div", { class: "usage-note" },
+        "…另有 " + (models.length - 12) + " 个低频模型"));
+    }
+    if (d.synced_at) {
+      panel.appendChild(el("div", { class: "usage-note" },
+        "用量每小时同步（上次 " + fmtAge(d.synced_at) + "）· 收入来自 Nova Brain 日更"));
+    }
+  }
+
   async function renderCustomer(key) {
     const { platform, workspace_id, channel_id } = parseCustomerKey(key);
     $strip.style.display = "none";
@@ -682,6 +755,14 @@
           } }, label));
       }
       $view.appendChild(selRow);
+    }
+
+    // 近7天用量面板 (key-account only): models + revenue, async-filled.
+    if (data.key_uuid) {
+      const up = el("div", { class: "usage-panel", id: "usage-panel" },
+        el("div", { class: "loading sm" }, "加载近7天用量…"));
+      $view.appendChild(up);
+      fillUsagePanel(data.key_uuid);
     }
 
     if (!items.length) {
