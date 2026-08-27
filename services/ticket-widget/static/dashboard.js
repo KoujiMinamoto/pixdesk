@@ -829,6 +829,20 @@
   // View 3: issue detail with transcript
   // -------------------------------------------------------------------------
 
+  // Bridged Slack/Discord text flattens @mentions into bare names
+  // ("dohko 请看下…"). Restore the @ for any known participant name so the
+  // transcript reads as the mention it was. Longest names first; already-@'d
+  // and word-embedded latin occurrences are left alone.
+  function mentionize(text, names) {
+    let out = text;
+    for (const n of names) {
+      const esc = n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const re = new RegExp("(^|[^@A-Za-z0-9_])(" + esc + ")(?![A-Za-z0-9_@])", "g");
+      out = out.replace(re, "$1@$2");
+    }
+    return out;
+  }
+
   async function renderIssue(issueId) {
     $strip.style.display = "none";
     renderNav(null);
@@ -985,6 +999,8 @@
     // transcript — pinned turns + greyed thread-context rows (messages of the
     // same Slack/Discord thread that belong to another issue / no issue), so
     // the drawer always shows the complete thread.
+    const mentionNames = [...new Set(turns.map((t) => (t.sender_name || "").trim())
+      .filter((n) => n.length >= 2))].sort((a, b) => b.length - a.length);
     const tx = el("div", { class: "transcript" });
     const ownCount = data.transcript_count != null
       ? data.transcript_count : turns.filter((t) => !t.is_context).length;
@@ -1018,7 +1034,8 @@
           el("span", { class: "who" }, t.sender_name || t.sender_id || (t.role || "?")),
           el("span", { class: "when" }, t.ts ? fmtDate(t.ts) : "—"),
           ctxBadge,
-          el("span", { class: "text" }, t.text || "(无文本)")));
+          el("span", { class: "text" },
+            t.text ? mentionize(t.text, mentionNames) : "(无文本)")));
       }
     }
     detail.appendChild(tx);
