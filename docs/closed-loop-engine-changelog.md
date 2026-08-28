@@ -1,0 +1,297 @@
+# Closed-Loop Engine + Dashboard — Change Log (2026-06)
+
+Covers the work after the P0–P9 commits: distill robustness, dashboard role/
+product/Chinese-summary features, Feishu auth, weekly metrics, and the Nova
+Brain API sync. Deployment is the **Tencent host** (`124.221.98.230`,
+`/opt/pixdesk-issue`, schema `issue_tc`), engine LLM = Claude Sonnet 4.6 via
+the paigod proxy. Deploy = scp changed files + `docker compose build/up`.
+
+## 1. Distill: role + product + Chinese summary
+
+- **Content-based role judgement.** distill's LLM now decides each message's
+  role (customer/agent/bot) from conversation *content*; `ISSUE_AGENT_SENDERS`
+  is a hint only. Added a CHANNEL CONTEXT block (`_customer_label` derived from
+  the channel name) + an "address rule" so mixed channels (customer staff +
+  our support both present) don't mislabel. Roles stored on
+  `issue_messages.role`; `last_speaker`/`last_*_at` computed LLM-first with the
+  name-list as fallback.
+- **Product tags.** Each issue classified into `config.PRODUCT_TAGS`
+  (env `ISSUE_PRODUCT_TAGS`, default LLM/GPU/Sandbox/Image-Video/Billing/
+  Account/API/Other), stored in `issues.metadata.products`.
+- **Chinese summary.** distill emits `summary_zh` (≤80 字) → stored in
+  `issues.metadata.summary_zh`. No DDL change.
+
+## 2. Distill: robustness fixes (root-caused the hard way)
+
+- **Watermark safety.** If every window of a run fails at the LLM (proxy 503),
+  do NOT advance `last_distilled_ts` — retry next pass. Partial-failure: hold
+  the watermark just before the first failed window so unread messages aren't
+  skipped.
+- **Incremental MUST open new issues.** Rule 5b: new problems in new messages
+  get fresh issues even if memory didn't mention them (fixed June problems
+  being silently swallowed into old issues).
+- **Delta output (Rule 5c).** Output only issues the current window creates or
+  changes — never re-emit the whole backlog. This fixed the paigod proxy's
+  ~21KB response-body truncation that destroyed big-channel issues
+  (e.g. openrouter once dropped 543→199). Keep `ISSUE_DISTILL_WINDOW_CHARS`
+  at 10000 (6000 over-fragments huge channels into 800+ windows).
+- **Per-window memory re-render** so a problem spanning a window boundary
+  isn't duplicated/dropped.
+- `max_tokens` for distill calls raised to 32768.
+
+## 3. Auto-discovery of new customer channels
+
+- `distill.discover_channels`: channels with ≥`ISSUE_DISCOVER_MIN_CUSTOMER_MSGS`
+  (default 2) customer messages and no `channel_memory` row get bootstrapped
+  each pass. Two gates: `_is_customer_channel` name filter
+  (`ISSUE_DISCOVER_REQUIRE_CUSTOMER_NAME=1` — keeps ext-*/`<>`/novita/support,
+  drops #general/#announcements/internal-*/bare-name DMs) and a TIME_FLOOR
+  recency gate (skip channels with no customer msg since 2026-06-01).
+- detector.py also got the name gate so the heuristic detector stops flooding
+  noise channels with issues distill would never adopt.
+
+## 4. Dashboard (ticket-widget) — Feishu auth + approval flow
+
+- **Feishu OAuth login** gates the cross-customer dashboard (closed the
+  prior public-no-auth hole on all `/api/v1/dashboard/*` reads). Config:
+  `FEISHU_APP_ID` / `FEISHU_APP_SECRET` / `FEISHU_ADMIN_EMAILS`.
+- **Approval flow** in `nova`-style table `issue_tc.dashboard_users`
+  (feishu_user_id PK, status pending/approved/rejected, role reviewer/admin).
+  First login becomes admin (bootstrap), or emails in `FEISHU_ADMIN_EMAILS`.
+  Non-admins land on an "申请访问" screen; admins approve via the `#/admin`
+  page. Feishu may not return email → identity keyed on open_id.
+- Write actions (review/merge/promote) now record the Feishu user as actor
+  (`@<email>:feishu`) into issue_history.
+- ⚠️ Feishu app "可用范围" must be opened to staff or they're blocked before
+  reaching our approval screen.
+
+## 5. Dashboard UI fixes
+
+- **Back button** fixed (was a `history` var shadowing `window.history` →
+  silent throw); now navigates to the parent customer view explicitly.
+- Customer cards drop raw workspace IDs; show platform + product chips.
+- Issue list **grouped** 待处理/进行中 vs 已闭环.
+- **Customer search box** on the home filter bar.
+- Issue-detail **meta row** restructured (chips, not " · " text).
+- Transcript **day dividers** for long threads; dual-color customer/agent.
+- Mobile layout fixes for the issue rows.
+
+## 6. Weekly summary strip
+
+- `/v1/dashboard/summary` rewritten to "this week" = since last Friday 00:00
+  (SQL-computed, auto-rolling). 6 cards: 本周活跃客户 / 本周新增问题 /
+  本周活跃问题 / 本周新增对话 (from `agent.conversations`, customer channels
+  only) / 本周新闭环 / 待我方回复 (always-current).
+
+## 7. Refresh cadence
+
+- `ISSUE_DISTILL_INTERVAL_SECONDS` 12h → **1h**. distill is incremental
+  (watermark per channel): idle channels are skipped at zero cost; only
+  channels with new messages spend an LLM call on just the new turns. So
+  dashboard now reflects customer activity within ~1h.
+
+## 8. Nova Brain API sync (new)
+
+- Mirrors Novita's internal read-only API into Tencent `nova.*` schema
+  (`sql/nova_schema.sql`: customer_revenue / sla_model / pricing_model /
+  or_intel_snapshot). Script `scripts/nova-sync.py` runs on 185 hourly via
+  `deploy/systemd/nova-sync.{service,timer}`, reaching Tencent through the
+  existing SSH-out trust (185→Tencent `docker exec psql`; direct 5432 is
+  firewalled). Key in `/etc/nova-sync.env` (mode 600). Dedupes rows by PK
+  (API returns duplicate model/product names). Two base URLs (.190 main,
+  .123 or-intel). Contains customer PII — internal only.
+
+## 9. Shift-review panel (8h handoff)
+
+Support runs **3 rotating 8-hour shifts**; reviewers need an end-of-shift
+"what moved on my watch" view. Added a dedicated panel reachable from the
+header ("班次复盘", `#/shift`).
+
+- **Engine** `/v1/dashboard/shift?hours=8` (default 8, 1–72). Returns the
+  issues in a rolling N-hour window split into three **mutually-exclusive**
+  buckets, each a full issue list (+ `channel_name` so cross-customer rows are
+  legible):
+  - `closed` — closure detected in-window (terminal state wins priority),
+  - `new` — opened in-window and still open,
+  - `active` — opened earlier but had activity in-window (still open).
+  Plus a `counts` summary and the window's `since` timestamp.
+- **Widget** proxies it at `/api/v1/dashboard/shift` behind the same
+  `require_dash_approved` gate as the rest of the dashboard.
+- **Frontend** `renderShift()`: a 3-card count strip (新增/活跃/已闭环) over
+  three issue sections, a window selector (8 / 12 / 24 小时), and a header
+  link. Issue rows in this view carry a clickable customer chip
+  (`issueRow(it, {showCustomer:true})`) that jumps to that customer's page.
+
+## 10. Closure actions, top-level nav, and the ticket archive
+
+A reviewer needs to act on a 疑似闭环, and every issue needs an archival
+"ticket" record with handler attribution. Three linked changes:
+
+### 10a. Human closure actions (确认闭环 / 未闭环)
+`/v1/issues/{id}/review` gains two actions on top of confirm/reject/dismiss:
+- **`close`** (确认闭环) — sets `lifecycle_state=closed_confirmed` (the
+  human-only terminal state the closure_agent is forbidden from setting),
+  `review_state=confirmed`, fills `closed_at`/`closure_detected_at`. This is
+  how a 疑似闭环 is promoted to a real closure and archived as a finished
+  ticket.
+- **`reopen`** (未闭环) — the auto-closure was wrong. Lifecycle returns to an
+  open state derived from who spoke last (我方 last → `awaiting_customer`;
+  else `awaiting_agent` + `unanswered_customer`), bumps `reopened_count`, and
+  sets `review_state=confirmed` so the closure_agent won't silently re-close it
+  — a human now owns the close.
+
+Issue-detail buttons are now state-aware: 疑似闭环 shows 确认闭环 / 未闭环 /
+忽略; 已闭环 shows 重新打开; open issues show 确认为真问题 / 标记已闭环 /
+忽略.
+
+### 10b. Top-level nav (总览 / 班次复盘 / Ticket 记录)
+A tab bar under the header switches between the three top-level views
+(`#/`, `#/shift`, `#/tickets`); hidden on drilldowns and gate screens. (The
+old per-link header shortcut for 班次复盘 was removed in favour of the tabs.)
+
+### 10c. Ticket archive page + handler attribution
+`/v1/dashboard/tickets` returns every issue as a flat "ticket record"
+(status/q/platform/product filters, paginated, default newest-closed-first).
+Because **`support` is a shared on-duty login**, the real handler can't come
+from the auth identity — so each ticket derives `last_handler` and
+`handler_count` from the distinct **我方 senders** in the chat itself. The
+issue-detail page shows the full 经手同学 chip list (derived client-side from
+the transcript roles). This is the hook a future **support shift-roster** will
+use to attribute who worked/resolved each issue by time. Frontend
+`renderTickets()` is a searchable, status-tabbed list → existing issue detail.
+
+## 11. Per-issue suggested next action (建议 TODO)
+
+distill now emits a `next_action_zh` per issue — a single actionable Chinese
+next-step for our support staff, derived from what the conversation is actually
+missing (rule 13 in `SYSTEM_DISTILL`; stored in `issues.metadata.next_action_zh`,
+≤300 chars; empty string when the issue is genuinely closed/no-action). The
+issue-detail page renders it as an amber "建议 TODO" callout next to the summary
+**and** again at the bottom (so a reviewer who scrolled the whole transcript
+sees the recommendation without scrolling back up).
+
+Existing open issues were backfilled in one pass (a small `llm._ask` over each
+issue's title + `summary_zh`, written via `metadata = metadata || …`) — 100
+open issues, all populated. New/changed issues get it inline from distill.
+
+## 12. Memory for the Feishu bot (openclaw `pixdesk-memory` skill)
+
+The Tencent host already runs **openclaw** — a self-hosted multi-channel agent
+platform — whose `feishu-claw` agent has been the Feishu bot for months. Rather
+than stand up a second agent runtime (Claude Agent SDK), we feed openclaw the
+knowledge pixdesk already distills, via one drop-in skill.
+
+- **Writer (engine):** `sql/memory_schema.sql` adds `pg_trgm` + an
+  `issue_tc.customer_profile` table (rolling per-customer 画像: products / scale /
+  recurring problems / demands / sensitivities) + trigram indexes on issue
+  title/summary. `distill.refresh_customer_profile()` regenerates a channel's
+  profile after it's distilled (throttled to once / 12h), wired into the distill
+  loop. All 44 active customers backfilled in one pass.
+- **Reader (openclaw):** `integrations/openclaw/skills/pixdesk-memory/`
+  (`SKILL.md` + `query.py`) deployed into feishu-claw's workspace. Three
+  commands: `search` (复现历史解法 — trigram over title + zh **and** en summary, so
+  an English query matches a Chinese-summarised issue), `profile` (客户画像 +
+  current open issues), `customers` (消歧). Reads the pixdesk Postgres directly.
+- **v1 is embedding-free** — no API embedding source was available (ppio out of
+  budget; paigod is chat-only). Cross-lingual paraphrase recall (sandbox↔沙箱
+  beyond shared English tokens) is the v2 upgrade: add a vector column + cosine,
+  skill interface unchanged.
+
+## 13. Source connection-status bar (Slack / Discord)
+
+A small data-source status bar on the overview shows whether each source
+platform is still flowing. The dashboard runs on the Tencent mirror and can't
+ping the mautrix bridges directly, so status is **inferred from data freshness**
+— the newest message per platform (`/v1/dashboard/sources`: `max(ts)`,
+`age_seconds`, `channels_24h`). Health dot: 🟢 ≤1h (flowing) / 🟡 ≤6h
+(lagging/quiet) / 🔴 >6h (likely disconnected); the chip also shows the actual
+"最近 X 前" time + active-channel count. Windows are generous because busy
+multi-channel platforms have natural gaps — it's a flow proxy, not a bridge
+ping (a genuinely quiet period also ages the dot; tooltip says so).
+
+## 14. Real bridge connection status (not just message freshness)
+
+§13's source bar inferred status from message freshness — which can't tell
+"bridge disconnected" from "channel just quiet" (Discord keeps a heartbeating
+websocket with zero business messages for hours). Now the **real** mautrix
+bridge connection state drives it:
+
+- **Probe (185):** `scripts/bridge-status-sync.py` parses the mautrix-discord /
+  mautrix-slack container logs for gateway/RTM connection lifecycle. Discord
+  logs explicit `Connected/Disconnected/resumed` lines; Slack (mautrix
+  bridgev2) streams RTM/event-loop activity instead, so the probe reconciles
+  the newest lifecycle marker against the newest RTM activity (traffic newer
+  than a stale `Disconnected` ⇒ socket recovered). Pushes `connected` /
+  `last_event` / `last_event_at` / `reconnects_24h` to Tencent
+  `agent.bridge_status` via the existing 185→Tencent SSH-out trust (same
+  plumbing as nova-sync). systemd `bridge-status-sync.{service,timer}`, every
+  3 min.
+- **Engine:** `/v1/dashboard/sources` returns the bridge row when the probe
+  reported within 15 min (authoritative), else falls back to message-freshness;
+  each row carries `status_source` (`bridge` | `freshness`).
+- **Frontend:** bridge mode shows 已连接 / 桥接断开 + last-event age + 24h
+  reconnect count; freshness mode unchanged. Tooltip says which signal it is.
+
+## 15. Overview time-window picker
+
+The hero strip was hard-wired to "this week". Added a time-range picker above
+it: 今日 / 昨日 / 本周 / 上周 / 本月 / 上月 / 自定义 (two date inputs).
+
+- **Engine** `/v1/dashboard/summary?period=…` (+ `start`/`end` for `custom`).
+  All windows are half-open `[win_start, win_end)` computed in SQL relative to
+  `now()` (weeks Mon→Mon, months 1st→1st); current-period presets end at now,
+  past presets end at the boundary. The dashboard's global `TIME_FLOOR`
+  (2026-06-01) is widened with `LEAST(win_start, TIME_FLOOR)` so a past window
+  like 上月 (May) isn't blanked by the floor. `awaiting_us` (待我方回复) is a
+  separate TIME_FLOOR-pinned subquery — it stays the same live total under every
+  period (it's a "right now" backlog, not a window metric).
+- **Frontend** preset chips + custom date range; the chosen window persists in
+  `localStorage`; metric-card labels follow the period (本周→今日/上月/区间…);
+  changing the window refetches just the summary and repaints the strip.
+
+## 16. Shift-review: per-colleague workload via the duty roster
+
+The shift-review page now answers "谁在某个时间段做了多少". support is a
+**shared login**, so the real handler can't come from the message sender — it
+comes from the duty roster.
+
+- **Roster (`agent.shift_roster`):** `scripts/roster_expand.py` expands the
+  两张表 (排班表 shift-letter×weekday×slot + 轮班表 4-week rotation) into 768
+  absolute on-duty intervals (Asia/Shanghai → UTC) for 2026-06-15 .. 2027-01-24.
+  凌晨班 reads "morning-of" (the letter in 周W covers W-1 23:01→W 07:00);
+  weekends are the C(night)/A(day) pair. `--sql` mode emits DDL + INSERTs;
+  loaded into Tencent. DDL also in `sql/shift_roster_schema.sql`. Verified
+  against the source sheet (rotation blocks, cross-midnight, weekend, coverage).
+- **Engine `/v1/dashboard/shift-workload?period=…`:** joins each agent-side
+  message's `ts` into the roster interval containing it, aggregates per person:
+  `handled_issues` (distinct issues they replied in — main sort), `agent_msgs`
+  (our reply count), `closed_issues` (closures detected during their shift).
+  Same period presets as /summary (extracted into a shared `_resolve_period`).
+- **Frontend:** a 值班同事工作量 panel atop the shift-review page — its own
+  period selector + a per-person bar chart (经手问题) with 回复/闭环 columns;
+  the rolling-window issue detail stays below. Note explains the attribution.
+
+## 17. Shift-workload: per-person status breakdown + drilldown
+
+§16 counted "closures detected on the clock", which didn't tie to the issues a
+person actually handled (温迪 经手32 but 闭环107). Recut so the closure columns
+are the **current status of that person's handled issues**:
+
+- **Engine `/v1/dashboard/shift-workload`** now returns, per person:
+  `handled_issues`, `agent_msgs`, and the live status split of those issues —
+  `confirmed` (人工已确认闭环), `inferred` (疑似闭环/待确认), `open_n` (进行中) —
+  plus `close_rate` = (confirmed + inferred) / handled (inferred counts as
+  resolved-pending, since nobody clicks 确认闭环 yet; otherwise it'd read 0%).
+- **Drilldown `/v1/dashboard/shift-workload/issues?person=&period=&bucket=`**
+  (bucket = all/confirmed/inferred/open) lists the actual issues that person
+  handled in the window, with current state + zh summary + their reply count.
+- **Frontend:** the workload table now has 同事 / 经手 / 已闭环 / 待确认 / 进行中
+  / 回复 / 闭环率 columns; each status number is clickable → an inline list of
+  those issues under the row, each linking to the issue detail.
+
+## Known follow-ups
+- Auto-discovery runs once per distill pass; detector can still create a few
+  redundant heuristic issues in distill-owned channels (cleaned via
+  `DELETE ... detector='heuristic-v1' AND channel has channel_memory`).
+- Residual heuristic issues outside the dashboard window (pre-June / non-
+  customer channels) are harmless but present.

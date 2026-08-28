@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>客户问题闭环看板</title>
+  <link rel="stylesheet" href="/widget/style.css" />
+  <link rel="stylesheet" href="/widget/dashboard.css" />
+</head>
+<body>
+  <div id="app">
+    <header class="dash-header">
+      <div class="brand">
+        <button class="back-btn" id="back-btn" hidden>← 返回</button>
+        <h1 id="page-title">客户问题闭环看板</h1>
+      </div>
+      <div id="crumbs" class="crumbs"></div>
+      <div id="status" class="status"></div>
+    </header>
+
+    <nav id="main-nav" class="main-nav" hidden></nav>
+    <div id="source-bar" class="source-bar" hidden></div>
+    <div id="period-bar" class="period-bar" hidden></div>
+    <section id="summary-strip" class="summary-strip"></section>
+    <main id="view"></main>
+  </div>
+  <script src="/widget/dashboard.js"></script>
+</body>
+</html>
