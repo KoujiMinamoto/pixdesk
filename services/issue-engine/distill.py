@@ -65,14 +65,21 @@ SYSTEM_DISTILL = (
     "RULES (strict, follow ALL):\n"
     "1. ONE problem per real underlying issue. A multi-day back-and-forth on "
     "the same topic = ONE problem, not many. Do not split by day or by speaker.\n"
-    "2. Status is one of: \"open\" (still ongoing or no resolution stated) or "
-    "\"closed\" (someone — customer OR agent — explicitly stated the problem "
-    "is fixed, resolved, working, deployed, or the customer thanked confirming "
-    "it works).\n"
+    "2. Status is one of: \"open\" (still ongoing or no resolution stated), "
+    "\"resolved\" (OUR side stated it is fixed/deployed/should work, but the "
+    "customer has NOT yet confirmed or thanked — e.g. agent says 'should be "
+    "working now' and the customer's last word was still the problem), or "
+    "\"closed\" (the CUSTOMER confirmed it works / thanked after the fix). "
+    "An agent's own claim alone NEVER makes a problem closed — that is "
+    "\"resolved\".\n"
     "3. SILENCE alone NEVER closes a problem. If the last activity is the "
     "customer asking and nobody answered, status is \"open\".\n"
     "4. Greetings, social chatter, scheduling pings, generic check-ins, and "
-    "FYIs that don't ask for anything are NOT problems — omit them.\n"
+    "FYIs that don't ask for anything are NOT problems — omit them. "
+    "Announcements/notifications OUR side posts (maintenance notices, price "
+    "updates, new-model rollouts) are NOT problems either — but a customer "
+    "REPLY under such a notification that asks something or reports trouble "
+    "IS a problem (a NEW one, anchored on the customer's reply).\n"
     "5. external_id MUST be a stable string identifying this problem. If the "
     "memory section already has an entry for this problem, REUSE its "
     "external_id. Otherwise generate one as `p-<first-evidence-msg-id>`.\n"
@@ -114,7 +121,7 @@ SYSTEM_DISTILL = (
     "or more values ONLY from the PRODUCTS list given below; never invent new "
     "ones. Use \"Other\" if none fit.\n"
     "9. Output strictly valid JSON, nothing else, matching this shape exactly:\n"
-    "   {\"issues\":[{\"external_id\":str,\"title\":str,\"status\":\"open\"|\"closed\","
+    "   {\"issues\":[{\"external_id\":str,\"title\":str,\"status\":\"open\"|\"resolved\"|\"closed\","
     "\"summary\":str,\"summary_zh\":str,\"next_action_zh\":str,\"closure_reason\":str|null,"
     "\"products\":[str,...],"
     "\"roles\":{\"<msg_id>\":\"customer\"|\"agent\"|\"bot\"},"
@@ -123,7 +130,7 @@ SYSTEM_DISTILL = (
     "summary is in English; summary_zh is the SAME summary in Simplified "
     "Chinese (简体中文, <=80 字), faithful to summary — not a translation of the "
     "title, a real one-sentence problem summary.\n"
-    "11. closure_reason is null when status=open. When closed, set it to "
+    "11. closure_reason is null when status=open or resolved. When closed, set it to "
     "\"customer_confirmed\" / \"agent_confirmed\" / \"resolution_proposed\" "
     "based on what actually happened in the messages.\n"
     "12. roles MUST cover every msg_id in evidence_msg_ids, keyed by the "
@@ -641,6 +648,12 @@ def _upsert_issue(conn, channel: dict[str, Any], item: dict[str, Any]) -> Option
         new_state = "closed_inferred"
         nc = None
         cr = closure_reason or "distilled_closed"
+    elif status == "resolved":
+        # Support said it's fixed; customer hasn't confirmed. Visible as
+        # 已解决·待确认, never counted as closed.
+        new_state = "resolution_proposed"
+        nc = None
+        cr = None
     else:
         # Open issue: who has the ball depends on who spoke last. If the
         # customer spoke last, it's on us (awaiting_agent + unanswered flag);

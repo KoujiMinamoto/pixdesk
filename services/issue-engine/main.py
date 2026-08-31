@@ -527,7 +527,7 @@ def rollup(
                                           AND i.review_state <> 'rejected') AS unclosed,
                        count(*) FILTER (WHERE i.lifecycle_state = 'closed_inferred'
                                           AND i.review_state <> 'rejected') AS suggested_closed,
-                       count(*) FILTER (WHERE i.lifecycle_state IN ('closed_confirmed','closed_inferred')) AS closed,
+                       count(*) FILTER (WHERE i.lifecycle_state = 'closed_confirmed') AS closed,
                        count(*) FILTER (WHERE i.lifecycle_state NOT IN ('dismissed')
                                           AND NOT (i.review_state='rejected')) AS total,
                        min(i.last_activity_at) FILTER (WHERE i.nonclosure_reason IS NOT NULL
@@ -1051,8 +1051,14 @@ def dash_tickets(
     auth identity — so we derive the handler(s) from the chat itself: the
     distinct agent-side senders on the issue, plus the most recent one as the
     `last_handler`. A future shift-roster can then attribute work by time."""
-    where = ["i.lifecycle_state <> 'dismissed'", "i.review_state <> 'rejected'",
-             TIME_FLOOR_ALIAS, _cust_chan_sql("i")]
+    if status == "ignored":
+        # 忽略列表: everything a human or the engine dismissed/rejected —
+        # reviewable so a wrong 忽略 can be found and reopened.
+        where = ["(i.lifecycle_state = 'dismissed' OR i.review_state = 'rejected')",
+                 TIME_FLOOR_ALIAS, _cust_chan_sql("i")]
+    else:
+        where = ["i.lifecycle_state <> 'dismissed'", "i.review_state <> 'rejected'",
+                 TIME_FLOOR_ALIAS, _cust_chan_sql("i")]
     args: list[Any] = []
     if status == "open":
         where.append("i.lifecycle_state NOT IN ('closed_confirmed','closed_inferred')")
@@ -1964,9 +1970,9 @@ def review_issue(issue_id: str, body: ReviewBody, actor: str = Depends(require_a
                   it — a human now owns the close.
     """
     if body.action not in ("confirm", "reject", "dismiss", "close", "reopen",
-                           "escalate", "internal"):
+                           "escalate", "internal", "resolve"):
         raise HTTPException(400, "action must be confirm | reject | dismiss | close"
-                                 " | reopen | escalate | internal")
+                                 " | reopen | escalate | internal | resolve")
     if body.action == "escalate" and not (body.escalated_ticket_id or "").strip():
         raise HTTPException(400, "escalate requires escalated_ticket_id")
     with _PooledConn() as conn:
@@ -2037,6 +2043,23 @@ def review_issue(issue_id: str, body: ReviewBody, actor: str = Depends(require_a
                     _history(cur, issue_id, "escalated_sre",
                              {"escalated_ticket_id": issue.get("escalated_ticket_id")},
                              {"escalated_ticket_id": ticket, "note": body.note}, actor)
+                elif body.action == "resolve":
+                    # Support-side 已解决: we've answered/fixed; waiting on the
+                    # customer to confirm. NOT a closure — stays out of closed
+                    # counts; the closure agent may promote it once the
+                    # customer confirms.
+                    cur.execute(
+                        f"""UPDATE {SCHEMA}.issues
+                           SET lifecycle_state='resolution_proposed',
+                               review_state='confirmed', nonclosure_reason=NULL,
+                               reviewed_by_mxid=%s, reviewed_at=now()
+                           WHERE id=%s""",
+                        (actor, issue_id),
+                    )
+                    _history(cur, issue_id, "resolved_by_support",
+                             {"lifecycle_state": old_life},
+                             {"lifecycle_state": "resolution_proposed",
+                              "note": body.note}, actor)
                 elif body.action == "internal":
                     # 内部确认中: a MARKER like escalate — the problem is being
                     # confirmed with an internal team (产品 etc.). Lifecycle is

@@ -144,7 +144,7 @@
 
   const STATE_LABEL = {
     awaiting_agent: "待我方", active: "进行中", awaiting_customer: "等客户",
-    resolution_proposed: "已答待确认", closed_inferred: "疑似闭环",
+    resolution_proposed: "已解决·待确认", closed_inferred: "疑似闭环",
     closed_confirmed: "已闭环", reopened: "已重开", detected: "新发现",
     dismissed: "已忽略",
   };
@@ -157,7 +157,7 @@
   const FIELD_LABEL = {
     closure_confirmed: "确认闭环", review_confirmed: "确认为真问题",
     reopened_by_review: "重新打开", escalated_sre: "升级 SRE", dismissed: "忽略",
-    internal_confirm: "标记内部确认中",
+    internal_confirm: "标记内部确认中", resolved_by_support: "标记已解决",
   };
   const PLATFORM_LABEL = { discord: "Discord", slack: "Slack", gmail: "Gmail" };
 
@@ -991,6 +991,7 @@
       actions.appendChild(btn("↩ 重新打开", "reopen", "warn"));
     } else {
       actions.appendChild(btn("✓ 确认为真问题", "confirm"));
+      actions.appendChild(btn("✔ 已解决(待客户确认)", "resolve"));
       actions.appendChild(btn("✓ 标记已闭环", "close"));
       actions.appendChild(btn("✕ 忽略", "reject", "danger"));
     }
@@ -1067,7 +1068,7 @@
 
   const ACT_DONE = {
     confirm: "已确认", reject: "已忽略", dismiss: "已忽略",
-    close: "已确认闭环", reopen: "已重新打开",
+    close: "已确认闭环", reopen: "已重新打开", resolve: "已标记已解决",
   };
   async function act(issueId, action, it) {
     const body = { action };
@@ -1087,6 +1088,11 @@
         { method: "POST", json: body });
       setStatus(ACT_DONE[action] || "已提交", "ok");
       setTimeout(() => setStatus(""), 1500);
+      if (action === "reject" || action === "dismiss") {
+        // 忽略后回到上一页（来路），不停留在已被忽略的详情上。
+        goBack("#/");
+        return;
+      }
       // re-render current view
       route();
     } catch (e) { setStatus(String(e.message || e), "error"); }
@@ -1464,6 +1470,7 @@
     const acts = el("div", { class: "settle-acts" },
       el("button", { class: "sbtn green", onclick: () => settleAct(it, "close") }, "闭环"),
       el("button", { class: "sbtn red", onclick: () => settleAct(it, "reopen") }, "非闭环"),
+      el("button", { class: "sbtn blue", onclick: () => settleAct(it, "resolve") }, "已解决"),
       el("button", { class: "sbtn amber", onclick: () => settleAct(it, "escalate") }, "升级SRE"),
       el("button", { class: "sbtn blue", onclick: () => settleAct(it, "internal") }, "内部确认中"));
     row.appendChild(el("div", { class: "settle-main" },
@@ -1488,7 +1495,9 @@
     // 非闭环 judgment: reopen (and 确认为真问题) set review_state=confirmed on a
     // still-open issue — that's a made decision, show it and count it as
     // processed (previously invisible → the button felt dead).
-    if (it.lifecycle_state !== "closed_confirmed" && it.review_state === "confirmed") {
+    if (it.lifecycle_state === "resolution_proposed") {
+      mark.appendChild(el("span", { class: "mk blue" }, "✔ 已解决 · 待客户确认"));
+    } else if (it.lifecycle_state !== "closed_confirmed" && it.review_state === "confirmed") {
       mark.appendChild(el("span", { class: "mk red" }, "✗ 已标记非闭环 · 跟进中"));
     }
     if (it.lifecycle_state !== "closed_confirmed" && it.internal_confirm) {
@@ -1541,6 +1550,7 @@
     else if (action === "reopen") { it.lifecycle_state = "awaiting_agent"; it.review_state = "confirmed"; setStatus("已标记非闭环 · " + (it.code || ""), "ok"); }
     else if (action === "escalate") { it.escalated_ticket_id = body.escalated_ticket_id; setStatus("已升级 SRE · " + (it.code || ""), "ok"); }
     else if (action === "internal") { it.internal_confirm = { note: body.note }; setStatus("已标记内部确认中 · " + (it.code || ""), "ok"); }
+    else if (action === "resolve") { it.lifecycle_state = "resolution_proposed"; it.review_state = "confirmed"; setStatus("已标记已解决 · " + (it.code || ""), "ok"); }
     if (row) {
       row.classList.remove("busy");
       const fresh = settleRow(it);
@@ -1922,6 +1932,7 @@
     { key: "all", label: "全部" },
     { key: "open", label: "进行中" },
     { key: "closed", label: "已闭环" },
+    { key: "ignored", label: "已忽略" },
   ];
 
   function ticketRow(it) {
